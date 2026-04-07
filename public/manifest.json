@@ -1,0 +1,22 @@
+{
+  "name": "PUPSJ HUB",
+  "short_name": "PUPSJ HUB",
+  "description": "PUP San Juan Campus Hub - Announcements, Events, Lost & Found, Schedules",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#800000",
+  "theme_color": "#800000",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

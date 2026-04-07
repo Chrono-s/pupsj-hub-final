@@ -1,0 +1,29 @@
+{
+  "name": "pupsj-hub",
+  "version": "1.0.0",
+  "description": "PUPSJ HUB - PUP San Juan Campus Progressive Web Application",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node seed.js"
+  },
+  "keywords": [
+    "pupsj",
+    "pwa",
+    "campus"
+  ],
+  "author": "PUPSJ HUB Team",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.1.1",
+    "pg": "^8.20.0"
+  }
+}
