@@ -1,4 +1,4 @@
-const CACHE_NAME = 'pupsj-hub-v3';
+const CACHE_NAME = 'pupsj-hub-v7';
 const STATIC_ASSETS = [
   '/',
   '/css/app.css',

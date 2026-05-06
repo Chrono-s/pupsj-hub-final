@@ -2,38 +2,60 @@ const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
 
+// Map MIME type → safe extension (never trust the user-supplied filename extension)
+const MIME_TO_EXT = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+  'application/msword': '.doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.ms-excel': '.xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.ms-powerpoint': '.ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'text/plain': '.txt',
+};
+
 function createStorage(subfolder) {
   return multer.diskStorage({
     destination: path.join(__dirname, '..', '..', 'public', 'uploads', subfolder),
     filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname);
+      // Derive extension from validated MIME type, NOT from user-supplied filename
+      const ext = MIME_TO_EXT[file.mimetype] || '';
+      if (!ext) {
+        return cb(new Error('Unrecognized file type'), false);
+      }
       cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
     }
   });
 }
 
+const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
 function fileFilter(req, file, cb) {
-  const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-  if (allowed.includes(file.mimetype)) {
+  if (ALLOWED_IMAGE_MIMES.includes(file.mimetype)) {
     cb(null, true);
   } else {
     cb(new Error('Only image files (JPEG, PNG, GIF, WebP) are allowed'), false);
   }
 }
 
+const ALLOWED_DOC_MIMES = [
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/plain',
+  ...ALLOWED_IMAGE_MIMES,
+];
+
 function documentFileFilter(req, file, cb) {
-  const allowed = [
-    'application/pdf',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-excel',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'application/vnd.ms-powerpoint',
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    'text/plain',
-    'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-  ];
-  if (allowed.includes(file.mimetype)) {
+  if (ALLOWED_DOC_MIMES.includes(file.mimetype)) {
     cb(null, true);
   } else {
     cb(new Error('File type not allowed. Accepted: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX, TXT, and images.'), false);
@@ -58,6 +80,6 @@ function csvFileFilter(req, file, cb) {
   if (ok) cb(null, true);
   else cb(new Error('Only CSV files are allowed. Save your Excel sheet as CSV (File → Save As → CSV).'), false);
 }
-const uploadCsv = multer({ storage: multer.memoryStorage(), fileFilter: csvFileFilter, limits: { fileSize: 2 * 1024 * 1024 } }); // 2MB plenty for a schedule
+const uploadCsv = multer({ storage: multer.memoryStorage(), fileFilter: csvFileFilter, limits: { fileSize: 2 * 1024 * 1024 } }); // 2MB
 
 module.exports = { uploadAnnouncement, uploadLostFound, uploadEvent, uploadFeedback, uploadDocument, uploadCsv, uploadProfile };

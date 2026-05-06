@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadCsv } = require('../middleware/upload');
+const VALID_YEAR_LEVELS = ['1st', '2nd', '3rd', '4th'];
 
 // ──────────────────────────────────────────────
 //  CSV parsing helpers (zero-dependency)
@@ -80,23 +81,91 @@ function normalizeTime(raw) {
   return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:00`;
 }
 
-// Download a CSV template
+function normalizeYearLevel(raw) {
+  const year = String(raw || '').trim();
+  return VALID_YEAR_LEVELS.includes(year) ? year : null;
+}
+
+// ── PUP official schedule format helpers ─────────────────────
+// Parses times like "07:30AM" or "01:30PM"
+function parseAmPmTime(raw) {
+  if (!raw) return null;
+  const m = String(raw).trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return null;
+  let hours = parseInt(m[1], 10);
+  const mins = parseInt(m[2], 10);
+  const period = m[3].toUpperCase();
+  if (isNaN(hours) || isNaN(mins) || mins > 59) return null;
+  if (period === 'PM' && hours !== 12) hours += 12;
+  if (period === 'AM' && hours === 12) hours = 0;
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:00`;
+}
+
+// Maps PUP day abbreviations → full names
+// SUN/TH must come before T/S to avoid prefix collisions in regex
+const PUP_DAY_MAP = {
+  'SUN': 'Sunday',
+  'TH':  'Thursday',
+  'MON': 'Monday',  'M': 'Monday',
+  'TUE': 'Tuesday', 'T': 'Tuesday',
+  'WED': 'Wednesday', 'W': 'Wednesday',
+  'FRI': 'Friday',  'F': 'Friday',
+  'SAT': 'Saturday', 'S': 'Saturday',
+};
+
+// Parses "W 07:30AM-12:30PM" or "TH 07:30AM-12:30PM" → { day, start, end }
+function parseScheduleString(raw) {
+  if (!raw || !raw.trim()) return null;
+  const m = String(raw).trim().match(
+    /^(SUN|MON|TUE|WED|THU|FRI|SAT|TH|M|T|W|F|S)\s+(\d{1,2}:\d{2}\s*(?:AM|PM))-(\d{1,2}:\d{2}\s*(?:AM|PM))$/i
+  );
+  if (!m) return null;
+  const day   = PUP_DAY_MAP[m[1].toUpperCase()];
+  const start = parseAmPmTime(m[2]);
+  const end   = parseAmPmTime(m[3]);
+  if (!day || !start || !end) return null;
+  return { day, start, end };
+}
+
+// Returns true when the CSV looks like a PUP official schedule export
+function isPupFormat(headers) {
+  return headers.includes('schedule') && headers.includes('description');
+}
+
+// Download a CSV template (generic format — PUP official export also works directly)
 router.get('/template', authenticateToken, requireRole('faculty', 'admin'), (req, res) => {
-  const csv =
-    'subject_code,subject_name,day_of_week,start_time,end_time,room,section\n' +
-    'CS101,Introduction to Computing,Monday,08:00,10:00,Room 201,BSIT-1A\n' +
-    'CS101,Introduction to Computing,Wednesday,08:00,10:00,Room 201,BSIT-1A\n' +
-    'MATH201,Discrete Mathematics,Tuesday,1:00 PM,2:30 PM,Room 305,BSIT-2B\n';
+  const isAdmin = req.user.role === 'admin';
+  let csv = 'subject_code,subject_name,day_of_week,start_time,end_time,room,section,year_level';
+  if (isAdmin) {
+    csv += ',faculty_email,faculty_name';
+  }
+  csv += '\n';
+  
+  if (isAdmin) {
+    csv += 'COMP003,Computer Programming 2,Wednesday,07:30 AM,12:30 PM,SJ-COMLAB2,BSIT-SJ 1-1,1st,prof1@gmail.com,"PAGALILAWAN, ALFRED M."\n' +
+           'COMP004,Discrete Structures 1,Tuesday,01:30 PM,04:30 PM,SJ-MB202,BSIT-SJ 1-1,1st,prof2@gmail.com,"SAGUINDAN, IAN JOSEPH"\n';
+  } else {
+    csv += 'COMP003,Computer Programming 2,Wednesday,07:30 AM,12:30 PM,SJ-COMLAB2,BSIT-SJ 1-1,1st\n' +
+           'COMP004,Discrete Structures 1,Tuesday,01:30 PM,04:30 PM,SJ-MB202,BSIT-SJ 1-1,1st\n';
+  }
+  
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="teaching-schedule-template.csv"');
   res.send(csv);
+
 });
 
 // Upload CSV — replaces the faculty's existing schedule (or admin can replace for a specific faculty)
+// Supports both PUP official format and generic format
 router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploadCsv.single('file'), async (req, res) => {
   const client = await pool.connect();
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const uploadDept = (req.body.department || '').trim() || null;
+    const uploadYearLevel = normalizeYearLevel(req.body.year_level);
+    if (!uploadYearLevel) {
+      return res.status(400).json({ error: 'Valid year_level is required' });
+    }
 
     const text = req.file.buffer.toString('utf8');
     const rows = parseCsv(text);
@@ -104,66 +173,144 @@ router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploa
       return res.status(400).json({ error: 'CSV is empty or missing a header row' });
     }
 
-    // Required headers
-    const required = ['subject_code', 'subject_name', 'day_of_week', 'start_time', 'end_time'];
-    const missingHeaders = required.filter(h => !(h in rows[0]));
-    if (missingHeaders.length) {
-      return res.status(400).json({
-        error: `Missing required columns: ${missingHeaders.join(', ')}. Expected: ${required.join(', ')} (and optional: room, section${req.user.role === 'admin' ? ', faculty_email' : ''})`
+    const headers = Object.keys(rows[0]);
+    const pup = isPupFormat(headers);
+    const isAdmin = req.user.role === 'admin';
+
+    if (!pup) {
+      // ── Generic format: require explicit columns ──
+      const required = ['subject_code', 'subject_name', 'day_of_week', 'start_time', 'end_time'];
+      const missing = required.filter(h => !(h in rows[0]));
+      if (missing.length) {
+        return res.status(400).json({
+          error: `Unrecognized CSV format. Use the PUP official teaching schedule export, or a CSV with columns: ${required.join(', ')}` +
+                 (isAdmin ? ' (and optional: room, section, faculty_email)' : ' (and optional: room, section)')
+        });
+      }
+    }
+
+    // Resolve batch faculty lookup (email or name)
+    const facultyLookup = new Map();
+    if (isAdmin) {
+      // Fetch all active faculty/admin users for lookup
+      const lookup = await client.query(
+        `SELECT id, LOWER(email) AS email, LOWER(first_name) AS first_name, LOWER(last_name) AS last_name FROM users WHERE role IN ('faculty','admin') AND is_active = TRUE`
+      );
+      lookup.rows.forEach(u => {
+        if (u.email) facultyLookup.set('email:' + u.email, u.id);
+        facultyLookup.set('name_rev:' + u.last_name + ', ' + u.first_name, u.id);
+        facultyLookup.set('name_fwd:' + u.first_name + ' ' + u.last_name, u.id);
       });
     }
 
-    // Resolve admin-uploaded faculty_email → faculty_id lookup cache
-    const isAdmin = req.user.role === 'admin';
-    const emailToId = new Map();
-    if (isAdmin && 'faculty_email' in rows[0]) {
-      const emails = [...new Set(rows.map(r => (r.faculty_email || '').trim().toLowerCase()).filter(Boolean))];
-      if (emails.length) {
-        const lookup = await client.query(
-          `SELECT id, LOWER(email) AS email FROM users WHERE LOWER(email) = ANY($1) AND role IN ('faculty','admin')`,
-          [emails]
-        );
-        lookup.rows.forEach(r => emailToId.set(r.email, r.id));
-      }
-    }
-
-    // Validate rows
     const valid = [];
     const errors = [];
+
     rows.forEach((r, idx) => {
-      const line = idx + 2; // +1 for header, +1 for 1-based
-      const rowErrors = [];
+      const line = idx + 2;
+      const errs = [];
 
-      const subject_code = (r.subject_code || '').trim();
-      const subject_name = (r.subject_name || '').trim();
-      const day = normalizeDay(r.day_of_week);
-      const start = normalizeTime(r.start_time);
-      const end = normalizeTime(r.end_time);
-      const room = (r.room || '').trim() || null;
-      const section = (r.section || '').trim() || null;
+      if (pup) {
+        // ── PUP official format ──────────────────────────────
+        const subject_code = (r.subject_code || '').trim();
+        const subject_name = (r.description || '').trim();
 
-      if (!subject_code) rowErrors.push('subject_code required');
-      if (!subject_name) rowErrors.push('subject_name required');
-      if (!day) rowErrors.push(`invalid day_of_week "${r.day_of_week}"`);
-      if (!start) rowErrors.push(`invalid start_time "${r.start_time}"`);
-      if (!end) rowErrors.push(`invalid end_time "${r.end_time}"`);
-      if (start && end && start >= end) rowErrors.push('start_time must be before end_time');
+        // Skip TOTAL rows and blank rows
+        if (subject_code.toUpperCase() === 'TOTAL' || !subject_code) return;
 
-      // Figure out target faculty
-      let targetFaculty = req.user.id;
-      if (isAdmin && 'faculty_email' in r && (r.faculty_email || '').trim()) {
-        const key = r.faculty_email.trim().toLowerCase();
-        if (emailToId.has(key)) {
-          targetFaculty = emailToId.get(key);
-        } else {
-          rowErrors.push(`faculty_email "${r.faculty_email}" not found`);
+        const room     = (r['room_no.'] || r.room_no || '').trim() || null;
+        const section  = (r.section || '').trim() || null;
+        const yearLevel = normalizeYearLevel(r.year_level) || uploadYearLevel;
+        const schedRaw = (r.schedule || '').trim();
+
+        if (!subject_code) errs.push('Subject Code is empty');
+        if (!subject_name) errs.push('Description is empty');
+
+        const parsed = parseScheduleString(schedRaw);
+        if (!parsed) {
+          errs.push(`Cannot parse Schedule "${schedRaw}" — expected format: W 07:30AM-12:30PM`);
         }
-      }
 
-      if (rowErrors.length) {
-        errors.push({ line, errors: rowErrors });
+        if (errs.length) {
+          errors.push({ line, subject: subject_code, errors: errs });
+        } else {
+          const { day, start, end } = parsed;
+          // Faculty targeting: Admin can specify professor, otherwise defaults to self
+          let targetFaculty = req.user.id;
+          const professorName = (r.professor || '').trim().toLowerCase();
+          if (isAdmin && professorName) {
+            // Try matching "LAST, FIRST" or "FIRST LAST"
+            targetFaculty = facultyLookup.get('name_rev:' + professorName) || 
+                            facultyLookup.get('name_fwd:' + professorName) || 
+                            null;
+            
+            if (!targetFaculty) {
+               // Try matching by checking if the professor string starts with the last name (since PUP often adds middle initials)
+               const lastName = professorName.split(',')[0].trim();
+               for (const [key, id] of facultyLookup) {
+                 if (key.startsWith('name_rev:' + lastName + ',')) {
+                   targetFaculty = id; break;
+                 }
+               }
+            }
+
+            if (!targetFaculty) {
+              errs.push(`Professor "${r.professor}" account not found. Make sure they are registered.`);
+            }
+          }
+
+          if (errs.length) {
+            errors.push({ line, subject: subject_code, errors: errs });
+          } else {
+            valid.push({ targetFaculty, subject_code, subject_name, day, start, end, room, section, year_level: yearLevel, department: uploadDept });
+          }
+        }
+
       } else {
-        valid.push({ targetFaculty, subject_code, subject_name, day, start, end, room, section });
+        // ── Generic format ───────────────────────────────────
+        const subject_code = (r.subject_code || '').trim();
+        const subject_name = (r.subject_name || '').trim();
+        const day          = normalizeDay(r.day_of_week);
+        const start        = normalizeTime(r.start_time);
+        const end          = normalizeTime(r.end_time);
+        const room         = (r.room || '').trim() || null;
+        const section      = (r.section || '').trim() || null;
+        const yearLevel    = normalizeYearLevel(r.year_level) || uploadYearLevel;
+
+        if (!subject_code) errs.push('subject_code required');
+        if (!subject_name) errs.push('subject_name required');
+        if (!day)          errs.push(`invalid day_of_week "${r.day_of_week}"`);
+        if (!start)        errs.push(`invalid start_time "${r.start_time}"`);
+        if (!end)          errs.push(`invalid end_time "${r.end_time}"`);
+        if (start && end && start >= end) errs.push('start_time must be before end_time');
+        if (!yearLevel)    errs.push('year_level required (1st/2nd/3rd/4th)');
+
+        // Admin may target another faculty via faculty_email or faculty_name
+        let targetFaculty = req.user.id;
+        if (isAdmin) {
+          const emailKey = (r.faculty_email || '').trim().toLowerCase();
+          const nameKey = (r.faculty_name || '').trim().toLowerCase();
+          
+          if (emailKey && facultyLookup.has('email:' + emailKey)) {
+            targetFaculty = facultyLookup.get('email:' + emailKey);
+          } else if (nameKey) {
+            targetFaculty = facultyLookup.get('name_rev:' + nameKey) || 
+                            facultyLookup.get('name_fwd:' + nameKey) || 
+                            null;
+            
+            if (!targetFaculty) {
+              errs.push(`Faculty "${nameKey}" not found`);
+            }
+          } else if (emailKey) {
+            errs.push(`Faculty email "${emailKey}" not found`);
+          }
+        }
+
+        if (errs.length) {
+          errors.push({ line, errors: errs });
+        } else {
+          valid.push({ targetFaculty, subject_code, subject_name, day, start, end, room, section, year_level: yearLevel, department: uploadDept });
+        }
       }
     });
 
@@ -180,15 +327,16 @@ router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploa
     );
     for (const v of valid) {
       await client.query(
-        `INSERT INTO faculty_schedules (faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [v.targetFaculty, v.subject_code, v.subject_name, v.day, v.start, v.end, v.room, v.section]
+        `INSERT INTO faculty_schedules (faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, year_level)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [v.targetFaculty, v.subject_code, v.subject_name, v.day, v.start, v.end, v.room, v.section, v.department, v.year_level]
       );
     }
     await client.query('COMMIT');
 
+    const formatLabel = pup ? 'PUP schedule format' : 'standard format';
     res.json({
-      message: `Uploaded ${valid.length} class${valid.length === 1 ? '' : 'es'}${errors.length ? ` (${errors.length} row${errors.length === 1 ? '' : 's'} skipped)` : ''}`,
+      message: `Uploaded ${valid.length} class${valid.length === 1 ? '' : 'es'} (${formatLabel})${errors.length ? ` — ${errors.length} row(s) skipped` : ''}`,
       inserted: valid.length,
       skipped: errors.length,
       affected_faculty: affectedFaculty.length,
@@ -203,21 +351,55 @@ router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploa
   }
 });
 
-// Get teaching schedule — faculty sees their own, admin can view any via ?faculty_id
+// Get teaching schedule — faculty sees their own, admin can view any via ?faculty_id, filter by ?department
 router.get('/', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
   try {
     const facultyId = (req.user.role === 'admin' && req.query.faculty_id) ? req.query.faculty_id : req.user.id;
-    const result = await pool.query(
-      `SELECT fs.*, u.first_name || ' ' || u.last_name as faculty_name
-       FROM faculty_schedules fs
+    
+    // Fetch target faculty name to match against unlinked class_schedules
+    const targetUser = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [facultyId]);
+    if (targetUser.rows.length === 0) return res.status(404).json({ error: 'Faculty not found' });
+    const { first_name, last_name } = targetUser.rows[0];
+    
+    let subquery = `
+      SELECT id, faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, year_level, FALSE as from_class_schedule
+      FROM faculty_schedules 
+      WHERE faculty_id = $1
+      
+      UNION ALL
+      
+      SELECT id, $1::uuid as faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, year_level, TRUE as from_class_schedule
+      FROM class_schedules
+      WHERE faculty_user_id = $1 
+         OR (
+           instructor IS NOT NULL 
+           AND instructor ILIKE '%' || $2 || '%' 
+           AND instructor ILIKE '%' || $3 || '%'
+         )
+    `;
+
+    let query = `SELECT fs.*, u.first_name || ' ' || u.last_name as faculty_name
+       FROM (${subquery}) fs
        LEFT JOIN users u ON fs.faculty_id = u.id
-       WHERE fs.faculty_id = $1
-       ORDER BY CASE fs.day_of_week
+       WHERE 1=1`;
+    const params = [facultyId, last_name, first_name];
+
+    if (req.query.department && req.query.department !== 'All') {
+      params.push(req.query.department);
+      query += ` AND fs.department = $${params.length}`;
+    }
+    const yearLevel = normalizeYearLevel(req.query.year_level);
+    if (yearLevel) {
+      params.push(yearLevel);
+      query += ` AND fs.year_level = $${params.length}`;
+    }
+
+    query += ` ORDER BY CASE fs.day_of_week
          WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3
          WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6
-         WHEN 'Sunday' THEN 7 END, fs.start_time ASC`,
-      [facultyId]
-    );
+         WHEN 'Sunday' THEN 7 END, fs.start_time ASC`;
+
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (err) {
     console.error('Get faculty schedules error:', err);
@@ -228,17 +410,18 @@ router.get('/', authenticateToken, requireRole('faculty', 'admin'), async (req, 
 // Add a teaching class
 router.post('/', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
   try {
-    const { subject_code, subject_name, day_of_week, start_time, end_time, room, section, faculty_id } = req.body;
-    if (!subject_code || !subject_name || !day_of_week || !start_time || !end_time) {
+    const { subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, faculty_id } = req.body;
+    const year_level = normalizeYearLevel(req.body.year_level);
+    if (!subject_code || !subject_name || !day_of_week || !start_time || !end_time || !department || !year_level) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     // Admin can assign to any faculty via faculty_id; faculty can only add their own
     const targetFaculty = (req.user.role === 'admin' && faculty_id) ? faculty_id : req.user.id;
 
     const result = await pool.query(
-      `INSERT INTO faculty_schedules (faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [targetFaculty, subject_code, subject_name, day_of_week, start_time, end_time, room || null, section || null]
+      `INSERT INTO faculty_schedules (faculty_id, subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, year_level)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [targetFaculty, subject_code, subject_name, day_of_week, start_time, end_time, room || null, section || null, department || null, year_level]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -256,13 +439,18 @@ router.patch('/:id', authenticateToken, requireRole('faculty', 'admin'), async (
     if (req.user.role !== 'admin' && check.rows[0].faculty_id !== req.user.id) {
       return res.status(403).json({ error: 'Not authorized' });
     }
-    const { subject_code, subject_name, day_of_week, start_time, end_time, room, section } = req.body;
+    const { subject_code, subject_name, day_of_week, start_time, end_time, room, section, department, faculty_id } = req.body;
+    const year_level = normalizeYearLevel(req.body.year_level);
+    if (!subject_code || !subject_name || !day_of_week || !start_time || !end_time || !department || !year_level) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    const targetFaculty = (req.user.role === 'admin' && faculty_id) ? faculty_id : check.rows[0].faculty_id;
     const result = await pool.query(
       `UPDATE faculty_schedules
          SET subject_code = $1, subject_name = $2, day_of_week = $3,
-             start_time = $4, end_time = $5, room = $6, section = $7, updated_at = NOW()
-       WHERE id = $8 RETURNING *`,
-      [subject_code, subject_name, day_of_week, start_time, end_time, room || null, section || null, id]
+             start_time = $4, end_time = $5, room = $6, section = $7, department = $8, year_level = $9, faculty_id = $10, updated_at = NOW()
+       WHERE id = $11 RETURNING *`,
+      [subject_code, subject_name, day_of_week, start_time, end_time, room || null, section || null, department || null, year_level, targetFaculty, id]
     );
     res.json(result.rows[0]);
   } catch (err) {

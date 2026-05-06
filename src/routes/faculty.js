@@ -3,7 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
-// List all active faculty users (for the "Add Class" dropdown)
+// List all active faculty users
 router.get('/list', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -19,59 +19,44 @@ router.get('/list', authenticateToken, async (req, res) => {
   }
 });
 
-// Real-time faculty locations — returns every active faculty with current status (In Class / Available)
-// Uses Asia/Manila timezone (PHT) for all comparisons.
+// Professor Locator — manual status (Option B).
+// Each faculty member sets their own status (in_class, in_office, available, unavailable),
+// optional room, optional note, optional "until" timestamp after which status auto-expires
+// back to 'unavailable' for display purposes.
 router.get('/locations', authenticateToken, async (req, res) => {
   try {
-    // Compute current day + time in Manila timezone directly in SQL so the server
-    // timezone doesn't matter. to_char with 'FMDay' returns "Monday", "Tuesday", etc.
-    // Pull active classes from BOTH faculty_schedules (faculty's own teaching schedule)
-    // AND class_schedules linked to a faculty via faculty_user_id, so updates from
-    // either page reflect in the locator. Day-name compare is case-insensitive to
-    // tolerate mixed casing in the database.
     const result = await pool.query(`
-      WITH now_manila AS (
-        SELECT
-          LOWER(TRIM(to_char((NOW() AT TIME ZONE 'Asia/Manila'), 'FMDay'))) AS day_name,
-          (NOW() AT TIME ZONE 'Asia/Manila')::time AS time_now
-      ),
-      active AS (
-        SELECT fs.faculty_id, fs.subject_code, fs.subject_name, fs.room, fs.start_time, fs.end_time
-        FROM faculty_schedules fs CROSS JOIN now_manila nm
-        WHERE LOWER(TRIM(fs.day_of_week)) = nm.day_name
-          AND nm.time_now >= fs.start_time
-          AND nm.time_now <  fs.end_time
-        UNION ALL
-        SELECT cs.faculty_user_id AS faculty_id, cs.subject_code, cs.subject_name, cs.room, cs.start_time, cs.end_time
-        FROM class_schedules cs CROSS JOIN now_manila nm
-        WHERE cs.faculty_user_id IS NOT NULL
-          AND LOWER(TRIM(cs.day_of_week)) = nm.day_name
-          AND nm.time_now >= cs.start_time
-          AND nm.time_now <  cs.end_time
-      )
       SELECT
         u.id AS faculty_id,
         u.first_name,
         u.last_name,
         u.department,
         u.role,
-        a.subject_code,
-        a.subject_name,
-        a.room,
-        a.start_time,
-        a.end_time,
-        CASE WHEN a.faculty_id IS NOT NULL THEN 'in_class' ELSE 'available' END AS status
+        u.profile_image,
+        CASE
+          WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW()
+            THEN 'unavailable'
+          ELSE COALESCE(u.faculty_status, 'unavailable')
+        END AS status,
+        u.faculty_status_room AS room,
+        u.faculty_status_note AS note,
+        u.faculty_status_until AS until_time,
+        u.faculty_status_updated_at AS updated_at
       FROM users u
-      LEFT JOIN LATERAL (
-        SELECT * FROM active WHERE active.faculty_id = u.id LIMIT 1
-      ) a ON TRUE
       WHERE u.role IN ('faculty', 'admin')
         AND u.is_active = TRUE
         AND u.is_verified = TRUE
-      ORDER BY (a.faculty_id IS NOT NULL) DESC, u.last_name ASC, u.first_name ASC
+      ORDER BY
+        CASE
+          WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW() THEN 3
+          WHEN u.faculty_status = 'in_class' THEN 0
+          WHEN u.faculty_status = 'in_office' THEN 1
+          WHEN u.faculty_status = 'available' THEN 2
+          ELSE 3
+        END,
+        u.last_name ASC, u.first_name ASC
     `);
 
-    // Also return server-computed Manila time for client "Updated at" display
     const timeResult = await pool.query(`SELECT (NOW() AT TIME ZONE 'Asia/Manila')::text AS now_manila`);
 
     res.json({

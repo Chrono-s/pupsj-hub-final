@@ -3,7 +3,250 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
-// PUPBot knowledge base (based on PUPSJ Student Handbook)
+const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8000';
+
+// ── AI sidecar call ───────────────────────────────────────────────────────────
+async function askAI(message, history = [], doc_context = [], live_data = {}) {
+  const res = await fetch(`${AI_SIDECAR_URL}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, history, doc_context, live_data }),
+    signal: AbortSignal.timeout(45000),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Sidecar HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Module query detectors ────────────────────────────────────────────────────
+const MODULE_RE = {
+  documents:     /\b(file|template|form|document|download|proposal|docx?|pdf|find.*file|find.*form|find.*template)\b/i,
+  events:        /\b(event|calendar|activity|activities|seminar|workshop|symposium|competition|orientation|when is|upcoming|it week|intramurals)\b/i,
+  announcements: /\b(announcement|news|update|notice|bulletin|latest|recent|what('s| is) (new|happening)|any news|memo)\b/i,
+  lostfound:     /\b(lost (and|&) found|lost item|found item|missing item|report.*lost|search.*item|lost.*belong|looking for.*item|someone found|i found a|report a found)\b/i,
+  faculty:       /\b(professor|prof\b|faculty|teacher|instructor|sir\b|ma'?am|where is.*prof|is.*available|in class|in office|locator|availability)\b/i,
+};
+
+// ── Helper: extract keywords from message ─────────────────────────────────────
+function extractKeywords(message, stopWords) {
+  return message.replace(/[?!.,;:]/g, '').split(/\s+/)
+    .filter(w => w.length >= 3 && !stopWords.has(w.toLowerCase()));
+}
+
+function formatTime(t) {
+  if (!t) return '';
+  const [h, m] = t.split(':');
+  const hour = parseInt(h);
+  return `${hour % 12 || 12}:${m} ${hour >= 12 ? 'PM' : 'AM'}`;
+}
+
+// ── Context fetchers (one per module) ─────────────────────────────────────────
+async function fetchDocuments(message) {
+  const sw = new Set(['where','find','this','file','form','that','what','which','from','have','with','about','how','can','template','document','download']);
+  const kw = extractKeywords(message, sw);
+  try {
+    let rows = [];
+    if (kw.length > 0) {
+      const cond = kw.map((_, i) => `(dt.title ILIKE $${i+1} OR dt.file_name ILIKE $${i+1})`).join(' OR ');
+      const r = await pool.query(
+        `SELECT dt.title, dt.file_name, dc.name as category
+         FROM document_templates dt
+         LEFT JOIN document_categories dc ON dc.id = dt.category_id
+         WHERE dt.status = 'active' AND (${cond}) ORDER BY dt.title ASC LIMIT 5`,
+        kw.map(w => `%${w}%`)
+      );
+      rows = r.rows;
+    }
+    if (rows.length === 0) {
+      const r = await pool.query(
+        `SELECT dt.title, dt.file_name, dc.name as category
+         FROM document_templates dt
+         LEFT JOIN document_categories dc ON dc.id = dt.category_id
+         WHERE dt.status = 'active' ORDER BY dc.name ASC, dt.title ASC`
+      );
+      rows = r.rows;
+    }
+    return rows;
+  } catch (e) { console.error('[ctx:docs]', e.message); return []; }
+}
+
+async function fetchEvents(message) {
+  const sw = new Set(['when','what','where','which','the','event','events','that','this','for','about','happening','upcoming','schedule','is','are','any']);
+  const kw = extractKeywords(message, sw);
+  try {
+    let rows = [];
+    if (kw.length > 0) {
+      const cond = kw.map((_, i) => `(e.title ILIKE $${i+1} OR e.description ILIKE $${i+1} OR e.location ILIKE $${i+1})`).join(' OR ');
+      const r = await pool.query(
+        `SELECT e.title, e.description, e.location, e.event_date, e.start_time, e.end_time, e.department
+         FROM events e WHERE e.status != 'deleted' AND (${cond})
+         ORDER BY ABS(EXTRACT(EPOCH FROM (e.event_date - CURRENT_DATE))) ASC LIMIT 5`,
+        kw.map(w => `%${w}%`)
+      );
+      rows = r.rows;
+    }
+    if (rows.length === 0) {
+      const r = await pool.query(
+        `SELECT title, description, location, event_date, start_time, end_time, department
+         FROM events WHERE status != 'deleted' AND event_date >= CURRENT_DATE
+         ORDER BY event_date ASC LIMIT 5`
+      );
+      rows = r.rows;
+    }
+    return rows;
+  } catch (e) { console.error('[ctx:events]', e.message); return []; }
+}
+
+async function fetchAnnouncements() {
+  try {
+    const r = await pool.query(
+      `SELECT title, content, department, created_at
+       FROM announcements WHERE status = 'active'
+       ORDER BY is_pinned DESC, created_at DESC LIMIT 5`
+    );
+    return r.rows;
+  } catch (e) { console.error('[ctx:announcements]', e.message); return []; }
+}
+
+async function fetchLostFound(message) {
+  const sw = new Set(['lost','found','missing','item','where','what','about','report','any','the','was','been','someone','looking','for']);
+  const kw = extractKeywords(message, sw);
+  try {
+    let rows = [];
+    if (kw.length > 0) {
+      const cond = kw.map((_, i) => `(lf.item_name ILIKE $${i+1} OR lf.description ILIKE $${i+1} OR lf.category ILIKE $${i+1})`).join(' OR ');
+      const r = await pool.query(
+        `SELECT lf.type, lf.item_name, lf.description, lf.category, lf.location_found, lf.date_reported, lf.contact_info
+         FROM lost_found lf WHERE lf.status = 'open' AND (${cond})
+         ORDER BY lf.date_reported DESC LIMIT 5`,
+        kw.map(w => `%${w}%`)
+      );
+      rows = r.rows;
+    }
+    if (rows.length === 0) {
+      const r = await pool.query(
+        `SELECT type, item_name, description, category, location_found, date_reported
+         FROM lost_found WHERE status = 'open' ORDER BY date_reported DESC LIMIT 5`
+      );
+      rows = r.rows;
+    }
+    return rows;
+  } catch (e) { console.error('[ctx:lostfound]', e.message); return []; }
+}
+
+async function fetchFaculty(message) {
+  const sw = new Set(['where','what','who','when','professor','faculty','teacher','instructor','the','sir','maam','available','status','room','office','is','are']);
+  const kw = extractKeywords(message, sw);
+  try {
+    let rows = [];
+    if (kw.length > 0) {
+      const cond = kw.map((_, i) => `(u.first_name ILIKE $${i+1} OR u.last_name ILIKE $${i+1})`).join(' OR ');
+      const r = await pool.query(
+        `SELECT u.first_name, u.last_name, u.department, u.position,
+           u.faculty_status, u.faculty_status_room, u.faculty_status_note, u.faculty_status_updated_at
+         FROM users u WHERE u.role = 'faculty' AND u.is_active = true AND (${cond})
+         ORDER BY u.last_name ASC LIMIT 5`,
+        kw.map(w => `%${w}%`)
+      );
+      rows = r.rows;
+    }
+    if (rows.length === 0) {
+      const r = await pool.query(
+        `SELECT first_name, last_name, department, position,
+           faculty_status, faculty_status_room, faculty_status_note
+         FROM users WHERE role = 'faculty' AND is_active = true ORDER BY last_name ASC LIMIT 10`
+      );
+      rows = r.rows;
+    }
+    return rows;
+  } catch (e) { console.error('[ctx:faculty]', e.message); return []; }
+}
+
+// ── Unified context fetcher ───────────────────────────────────────────────────
+async function getAllModuleContexts(message) {
+  const tasks = [];
+  if (MODULE_RE.documents.test(message))     tasks.push(['documents',     fetchDocuments(message)]);
+  if (MODULE_RE.events.test(message))        tasks.push(['events',        fetchEvents(message)]);
+  if (MODULE_RE.announcements.test(message)) tasks.push(['announcements', fetchAnnouncements()]);
+  if (MODULE_RE.lostfound.test(message))     tasks.push(['lostfound',     fetchLostFound(message)]);
+  if (MODULE_RE.faculty.test(message))       tasks.push(['faculty',       fetchFaculty(message)]);
+
+  const settled = await Promise.all(tasks.map(([k, p]) => p.then(r => [k, r])));
+  const doc_context = [], live_data = {};
+  settled.forEach(([key, data]) => {
+    if (!data.length) return;
+    if (key === 'documents') doc_context.push(...data);
+    else live_data[key] = data;
+  });
+  return { doc_context, live_data };
+}
+
+// ── Direct answer builder (bypasses AI for well-known lookups) ────────────────
+function buildDirectAnswer(message, doc_context, live_data) {
+  const msgUp = message.toUpperCase();
+  const msgLo = message.toLowerCase();
+
+  // 1. Exact document name match
+  if (doc_context.length) {
+    const hits = doc_context.filter(d =>
+      msgUp.includes(d.title.toUpperCase()) ||
+      (d.file_name && msgUp.includes(d.file_name.replace(/\.[^.]+$/, '').toUpperCase()))
+    );
+    if (hits.length) {
+      const cat = hits[0].category;
+      const list = hits.map(d => `• **${d.title}**${d.category ? ` — ${d.category}` : ''}`).join('\n');
+      return `You can find it in the **Document Templates** section.\n\nNavigation: sidebar ☰ → **"Document Templates"**${cat ? ` → **"${cat}"** category` : ''}.\n\n${list}\n\nClick the download (↓) button next to the file.`;
+    }
+  }
+
+  // 2. Exact event name match
+  if (live_data.events?.length) {
+    const hit = live_data.events.find(e => msgLo.includes(e.title.toLowerCase()));
+    if (hit) {
+      const d = new Date(hit.event_date);
+      const dateStr = d.toLocaleDateString('en-PH', { weekday:'long', month:'long', day:'numeric', year:'numeric' });
+      const timeStr = hit.start_time ? `${formatTime(hit.start_time)}${hit.end_time ? ' – ' + formatTime(hit.end_time) : ''}` : '';
+      return `**${hit.title}**\n\n📅 ${dateStr}${timeStr ? '\n⏰ ' + timeStr : ''}${hit.location ? '\n📍 ' + hit.location : ''}${hit.department ? '\n🏫 ' + hit.department : ''}${hit.description ? '\n\n' + hit.description.slice(0, 200) : ''}\n\nFind it on **Event Calendar** (sidebar ☰ → Event Calendar).`;
+    }
+  }
+
+  // 3. Specific lost/found item keyword match
+  if (live_data.lostfound?.length) {
+    const words = msgLo.split(/\s+/).filter(w => w.length > 3);
+    const hits = live_data.lostfound.filter(lf =>
+      words.some(w => lf.item_name.toLowerCase().includes(w))
+    );
+    if (hits.length) {
+      const list = hits.map(lf =>
+        `• [**${lf.type.toUpperCase()}**] **${lf.item_name}**${lf.location_found ? ' — ' + lf.location_found : ''}${lf.description ? '\n  ' + lf.description.slice(0, 80) : ''}`
+      ).join('\n');
+      return `Matching reports in **Lost & Found**:\n\n${list}\n\nGo to sidebar ☰ → **"Lost & Found"** for full details and contact info.`;
+    }
+  }
+
+  // 4. Faculty name or status query
+  if (live_data.faculty?.length) {
+    const hits = live_data.faculty.filter(f =>
+      msgLo.includes(f.first_name.toLowerCase()) || msgLo.includes(f.last_name.toLowerCase())
+    );
+    if (hits.length) {
+      const list = hits.map(f => {
+        const s = f.faculty_status;
+        const icon = s === 'in_class' ? '🔴 In Class' : s === 'in_office' ? '🔵 In Office' : s === 'available' ? '🟢 Available' : '⚪ Unavailable';
+        const room = f.faculty_status_room ? ` — Room ${f.faculty_status_room}` : '';
+        const note = f.faculty_status_note ? ` (${f.faculty_status_note})` : '';
+        return `• **${f.first_name} ${f.last_name}** (${f.department || 'Faculty'}) — ${icon}${room}${note}`;
+      }).join('\n');
+      return `Real-time status from the **Professor Locator**:\n\n${list}\n\nCheck the live locator on the **Announcements** page (sidebar ☰ → Announcements → Professor Locator widget at the top).`;
+    }
+  }
+
+  return null; // No direct answer — let AI handle it
+}
+
+// ── Keyword fallback (used when AI sidecar is unavailable) ───────────────────
 const knowledgeBase = [
   {
     keywords: ['enroll', 'enrollment', 'register', 'registration', 'how to enroll'],
@@ -78,20 +321,13 @@ function findBestMatch(message) {
   const lower = message.toLowerCase();
   let bestMatch = null;
   let bestScore = 0;
-
   for (const entry of knowledgeBase) {
     let score = 0;
     for (const keyword of entry.keywords) {
-      if (lower.includes(keyword)) {
-        score += keyword.split(' ').length;
-      }
+      if (lower.includes(keyword)) score += keyword.split(' ').length;
     }
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = entry;
-    }
+    if (score > bestScore) { bestScore = score; bestMatch = entry; }
   }
-
   return bestScore > 0 ? bestMatch : null;
 }
 
@@ -100,40 +336,31 @@ async function getDynamicContent(type) {
     if (type === 'announcements') {
       const result = await pool.query(`
         SELECT a.title, a.content, a.department, a.created_at,
-          COALESCE(
-            json_agg(json_build_object('image_url', ai.image_url)) FILTER (WHERE ai.id IS NOT NULL), '[]'
-          ) as images
+          COALESCE(json_agg(json_build_object('image_url', ai.image_url)) FILTER (WHERE ai.id IS NOT NULL), '[]') as images
         FROM announcements a
         LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
         WHERE a.status = 'active'
-        GROUP BY a.id
-        ORDER BY a.created_at DESC LIMIT 2
+        GROUP BY a.id ORDER BY a.created_at DESC LIMIT 2
       `);
       return result.rows;
     } else if (type === 'events') {
       const result = await pool.query(`
         SELECT e.title, e.description, e.event_date, e.location,
-          COALESCE(
-            json_agg(json_build_object('image_url', ei.image_url)) FILTER (WHERE ei.id IS NOT NULL), '[]'
-          ) as images
+          COALESCE(json_agg(json_build_object('image_url', ei.image_url)) FILTER (WHERE ei.id IS NOT NULL), '[]') as images
         FROM events e
         LEFT JOIN event_images ei ON ei.event_id = e.id
         WHERE e.status != 'deleted' AND e.event_date >= CURRENT_DATE
-        GROUP BY e.id
-        ORDER BY e.event_date ASC LIMIT 2
+        GROUP BY e.id ORDER BY e.event_date ASC LIMIT 2
       `);
       return result.rows;
     } else if (type === 'lostfound') {
       const result = await pool.query(`
         SELECT lf.item_name, lf.type, lf.description, lf.location_found,
-          COALESCE(
-            json_agg(json_build_object('image_url', lfi.image_url)) FILTER (WHERE lfi.id IS NOT NULL), '[]'
-          ) as images
+          COALESCE(json_agg(json_build_object('image_url', lfi.image_url)) FILTER (WHERE lfi.id IS NOT NULL), '[]') as images
         FROM lost_found lf
         LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
         WHERE lf.status = 'open'
-        GROUP BY lf.id
-        ORDER BY lf.created_at DESC LIMIT 2
+        GROUP BY lf.id ORDER BY lf.created_at DESC LIMIT 2
       `);
       return result.rows;
     }
@@ -143,57 +370,161 @@ async function getDynamicContent(type) {
   return [];
 }
 
-// Chat endpoint
+function _officeRedirect(message) {
+  const m = message.toLowerCase();
+  if (/\b(id|identification|student id|replace|lost id)\b/.test(m))
+    return "**Office of Student Affairs (OSA)** — for student ID concerns (new ID, replacement, lost ID).";
+  if (/\b(enroll|enrollment|register|registration|tor|transcript|certificate|clearance|grade|transfer)\b/.test(m))
+    return "**Registrar's Office** — for enrollment, grades, TOR, certificates, and clearance.";
+  if (/\b(tuition|fee|payment|bayad|cashier|refund|receipt)\b/.test(m))
+    return "**Accounting / Cashier's Office** — for tuition fees, payments, and receipts.";
+  if (/\b(wifi|internet|network|computer lab|technical|system access)\b/.test(m))
+    return "**IT Department** — for Wi-Fi, computer lab, and technical issues.";
+  if (/\b(book|borrow|library|fine|overdue)\b/.test(m))
+    return "**Library** — for borrowing books, library cards, and research resources.";
+  if (/\b(counsel|mental health|guidance|personal concern|career)\b/.test(m))
+    return "**Guidance Office** — for counseling, mental health support, and career guidance.";
+  if (/\b(nstp|cwts|lts|national service)\b/.test(m))
+    return "**NSTP / CWTS Office** — for NSTP enrollment, requirements, and clearance.";
+  if (/\b(overload|petition|dean|academic concern|program)\b/.test(m))
+    return "**Dean's Office** — for academic concerns, overload, and petition letters.";
+  if (/\b(medical|health|certificate|first aid|sick)\b/.test(m))
+    return "**Health Services** — for medical certificates, first aid, and health concerns.";
+  return (
+    "This specific information isn't in my handbook. Please visit the relevant campus office:\n\n" +
+    "• **Registrar's Office** — enrollment, grades, TOR, certificates, clearance\n" +
+    "• **OSA** — student ID, organizations, scholarships, discipline\n" +
+    "• **Accounting** — tuition fees, payments\n" +
+    "• **IT Department** — Wi-Fi, computer lab, technical issues\n" +
+    "• **Guidance Office** — counseling, personal concerns\n" +
+    "• **Dean's Office** — academic concerns, overload, petitions"
+  );
+}
+
+async function keywordFallback(message) {
+  const match = findBestMatch(message);
+  let text = match
+    ? match.response
+    : `I don't have specific information about that in my handbook or system.\n\n${_officeRedirect(message)}`;
+
+  let images = [];
+  if (match?.dynamic) {
+    const items = await getDynamicContent(match.dynamic);
+    if (items.length > 0) {
+      if (match.dynamic === 'announcements') {
+        text += '\n\nHere are the latest announcements:';
+        items.forEach(a => { text += `\n- "${a.title}" (${a.department})`; });
+        items.forEach(a => a.images?.forEach(img => { if (img.image_url) images.push(img.image_url); }));
+      } else if (match.dynamic === 'events') {
+        text += '\n\nUpcoming events:';
+        items.forEach(e => {
+          const d = new Date(e.event_date).toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
+          text += `\n- "${e.title}" on ${d}${e.location ? ' at ' + e.location : ''}`;
+        });
+        items.forEach(e => e.images?.forEach(img => { if (img.image_url) images.push(img.image_url); }));
+      } else if (match.dynamic === 'lostfound') {
+        text += '\n\nRecent open reports:';
+        items.forEach(lf => { text += `\n- [${lf.type.toUpperCase()}] ${lf.item_name}${lf.location_found ? ' near ' + lf.location_found : ''}`; });
+        items.forEach(lf => lf.images?.forEach(img => { if (img.image_url) images.push(img.image_url); }));
+      }
+    }
+  }
+  return { text, images };
+}
+
+// ── Layer 1: Jailbreak & off-topic pre-filter (runs before ANY AI call) ────────
+const _JAILBREAK_RE = [
+  /remove\s+(your\s+)?restrictions?/i,
+  /ignore\s+(your\s+)?(instructions?|rules?|guidelines?|system\s*(prompt)?)/i,
+  /pretend\s+(you\s+are|to\s+be)\s+(?!a?\s*(student|faculty|admin|pupbot))/i,
+  /act\s+as\s+(if\s+(you\s+were?\s+)?)?(?!pupbot|a\s*(helpful|campus|pup))/i,
+  /forget\s+(you\s+are|that\s+you\s+(are|were?))/i,
+  /you\s+are\s+now\s+(?!(pup|the))/i,
+  /override\s+(your\s+)?(system|instructions?|prompt|rules?|filter)/i,
+  /bypass\s+(your\s+)?(restrictions?|filters?|rules?|guidelines?)/i,
+  /jailbreak/i,
+  /\bDAN\b/,
+  /do\s+anything\s+now/i,
+  /no\s+(restrictions?|limits?|rules?|guidelines?)\s+anymore/i,
+  /roleplay\s+as\s+(?!a\s*(student|teacher|faculty))/i,
+  /you\s+have\s+no\s+(restrictions?|limits?|rules?)/i,
+  /disregard\s+(all\s+)?(previous\s+)?(instructions?|rules?)/i,
+  /new\s+persona/i,
+  /evil\s+(mode|bot|ai)/i,
+];
+
+const _OFF_TOPIC_RE = [
+  /\b(recipe|how\s+to\s+(cook|bake|fry|boil|grill|roast|steam)|ingredients?\s+for|cooking\s+(time|method|tip))\b/i,
+  /\b(chocolate\s+cake|pasta\s+recipe|fried\s+chicken\s+recipe|pizza\s+recipe|dessert\s+recipe)\b/i,
+  /\b(netflix|spotify|tiktok\s+trend|viral\s+video|youtube\s+channel)\b/i,
+  /\b(stock\s+market|crypto|bitcoin|investment\s+tip|forex)\b/i,
+  /write\s+(me\s+)?(a\s+)?(love\s+(poem|letter|story)|fiction|novel|screenplay)/i,
+  /\b(sports?\s+score|basketball\s+game|football\s+match|nba|pba\s+score)\b/i,
+  /\b(horoscope|zodiac|fortune\s+tell|tarot)\b/i,
+  /\b(weather\s+forecast|will\s+it\s+rain)\b/i,
+  /\b(hack|hacking|cracking\s+password|sql\s+injection\s+tutorial|malware)\b/i,
+];
+
+const _JAILBREAK_REPLY =
+  "I'm PUPBot — I only answer questions about PUP San Juan campus, the student handbook, and the PUPSJ HUB app. I cannot change my role or override my guidelines.";
+
+const _OFF_TOPIC_REPLY =
+  "I can only answer questions about PUP San Juan campus, the student handbook, and the PUPSJ HUB app. For other topics, please use a general search engine.";
+
+function _isJailbreak(msg) {
+  return _JAILBREAK_RE.some(re => re.test(msg));
+}
+function _isOffTopic(msg) {
+  return _OFF_TOPIC_RE.some(re => re.test(msg));
+}
+
+// ── Chat endpoint ─────────────────────────────────────────────────────────────
 router.post('/message', authenticateToken, async (req, res) => {
   try {
-    const { message } = req.body;
-    if (!message || message.trim().length === 0) {
+    const { message, history = [] } = req.body;
+    if (!message || !message.trim()) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const match = findBestMatch(message);
-    let botResponse = match
-      ? match.response
-      : "I'm not sure about that yet. I'm currently trained on basic campus information from the PUPSJ Student Handbook. Try asking about enrollment, schedules, events, lost & found, or campus policies. You can also visit the Office of Student Affairs for more assistance.";
+    // ── Layer 1 gate: refuse jailbreak / off-topic before any AI work ──────
+    if (_isJailbreak(message)) {
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, _JAILBREAK_REPLY]
+      );
+      return res.json({ response: _JAILBREAK_REPLY, images: [] });
+    }
+    if (_isOffTopic(message)) {
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, _OFF_TOPIC_REPLY]
+      );
+      return res.json({ response: _OFF_TOPIC_REPLY, images: [] });
+    }
 
-    let images = [];
+    let botResponse, images = [];
 
-    // Fetch dynamic content with images if applicable
-    if (match && match.dynamic) {
-      const items = await getDynamicContent(match.dynamic);
-      if (items.length > 0) {
-        if (match.dynamic === 'announcements') {
-          botResponse += '\n\nHere are the latest announcements:';
-          items.forEach(a => {
-            botResponse += `\n- "${a.title}" (${a.department})`;
-          });
-          items.forEach(a => {
-            if (a.images) a.images.forEach(img => { if (img.image_url) images.push(img.image_url); });
-          });
-        } else if (match.dynamic === 'events') {
-          botResponse += '\n\nUpcoming events:';
-          items.forEach(e => {
-            const d = new Date(e.event_date).toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
-            botResponse += `\n- "${e.title}" on ${d}${e.location ? ' at ' + e.location : ''}`;
-          });
-          items.forEach(e => {
-            if (e.images) e.images.forEach(img => { if (img.image_url) images.push(img.image_url); });
-          });
-        } else if (match.dynamic === 'lostfound') {
-          botResponse += '\n\nRecent open reports:';
-          items.forEach(lf => {
-            botResponse += `\n- [${lf.type.toUpperCase()}] ${lf.item_name}${lf.location_found ? ' near ' + lf.location_found : ''}`;
-          });
-          items.forEach(lf => {
-            if (lf.images) lf.images.forEach(img => { if (img.image_url) images.push(img.image_url); });
-          });
-        }
+    // Fetch real DB context for all relevant modules in parallel
+    const { doc_context, live_data } = await getAllModuleContexts(message);
+
+    // Try deterministic direct answer first (exact name/keyword match → no AI needed)
+    const directAnswer = buildDirectAnswer(message, doc_context, live_data);
+    if (directAnswer) {
+      botResponse = directAnswer;
+    } else {
+      try {
+        const data = await askAI(message, history, doc_context, live_data);
+        botResponse = data.response;
+      } catch (aiErr) {
+        console.warn('[Chatbot] AI sidecar unavailable, using keyword fallback:', aiErr.message);
+        const fallback = await keywordFallback(message);
+        botResponse = fallback.text;
+        images = fallback.images;
       }
     }
 
-    // Log conversation
     await pool.query(
-      `INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)`,
+      'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
       [req.user.id, message, botResponse]
     );
 
@@ -204,11 +535,11 @@ router.post('/message', authenticateToken, async (req, res) => {
   }
 });
 
-// Get chat history
+// ── Chat history ──────────────────────────────────────────────────────────────
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM chatbot_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      'SELECT * FROM chatbot_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
       [req.user.id]
     );
     res.json(result.rows.reverse());
