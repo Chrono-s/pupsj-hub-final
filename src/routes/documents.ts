@@ -1,0 +1,246 @@
+import express, { Response } from 'express';
+import pool from '../config/database';
+import { authenticateToken, requireRole } from '../middleware/auth';
+import { uploadDocument } from '../middleware/upload';
+import fs from 'fs';
+import path from 'path';
+import { AuthRequest } from '../types';
+
+const router = express.Router();
+
+// ── CATEGORIES ──
+
+// Get all categories
+router.get('/categories', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const result = await pool.query(
+      `SELECT dc.*, u.first_name || ' ' || u.last_name as created_by_name,
+        (SELECT COUNT(*) FROM document_templates dt WHERE dt.category_id = dc.id AND dt.status = 'active') as file_count
+       FROM document_categories dc
+       LEFT JOIN users u ON dc.created_by = u.id
+       WHERE dc.status = 'active'
+       ORDER BY dc.name ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get categories error:', err);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Create category (admin/faculty only)
+router.post('/categories', authenticateToken, requireRole('admin', 'faculty'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { name, description } = req.body;
+    if (!name || !name.trim()) { res.status(400).json({ error: 'Category name is required' }); return; }
+
+    const result = await pool.query(
+      `INSERT INTO document_categories (name, description, created_by)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [name.trim(), description?.trim() || null, req.user!.id]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Create category error:', err);
+    res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
+// Update category (admin/faculty only)
+router.patch('/categories/:id', authenticateToken, requireRole('admin', 'faculty'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { name, description } = req.body;
+    if (!name || !name.trim()) { res.status(400).json({ error: 'Category name is required' }); return; }
+
+    const result = await pool.query(
+      `UPDATE document_categories SET name = $1, description = $2, updated_at = NOW()
+       WHERE id = $3 AND status = 'active' RETURNING *`,
+      [name.trim(), description?.trim() || null, id]
+    );
+    if (result.rows.length === 0) { res.status(404).json({ error: 'Category not found' }); return; }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Update category error:', err);
+    res.status(500).json({ error: 'Failed to update category' });
+  }
+});
+
+// Delete category (admin/faculty only) - soft delete
+router.delete('/categories/:id', authenticateToken, requireRole('admin', 'faculty'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    await pool.query("UPDATE document_categories SET status = 'deleted', updated_at = NOW() WHERE id = $1", [id]);
+    // Also soft-delete all documents in this category
+    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE category_id = $1", [id]);
+    res.json({ message: 'Category deleted' });
+  } catch (err) {
+    console.error('Delete category error:', err);
+    res.status(500).json({ error: 'Failed to delete category' });
+  }
+});
+
+// ── DOCUMENTS ──
+
+// Get documents
+// - Admin sees all.
+// - Faculty sees only files whose department matches their own (plus 'General').
+// - Students see only files whose department matches their own (plus 'General').
+router.get('/', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { category_id, search, department: filterDept, page = 1, limit = 50 } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    const params: unknown[] = [];
+    let query = `
+      SELECT dt.*, dc.name as category_name,
+        u.first_name || ' ' || u.last_name as uploaded_by_name
+      FROM document_templates dt
+      LEFT JOIN document_categories dc ON dt.category_id = dc.id
+      LEFT JOIN users u ON dt.uploaded_by = u.id
+      WHERE dt.status = 'active'
+    `;
+
+    const isAdmin = req.user!.role === 'admin';
+    if (!isAdmin) {
+      params.push(req.user!.department || '');
+      query += ` AND (dt.department = 'General' OR dt.department = $${params.length})`;
+    } else if (filterDept && filterDept !== 'All') {
+      params.push(filterDept);
+      query += ` AND dt.department = $${params.length}`;
+    }
+
+    if (category_id) {
+      params.push(category_id);
+      query += ` AND dt.category_id = $${params.length}`;
+    }
+
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (dt.title ILIKE $${params.length} OR dt.description ILIKE $${params.length} OR dt.file_name ILIKE $${params.length})`;
+    }
+
+    query += ` ORDER BY dt.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit as string), parseInt(String(offset)));
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Get documents error:', err);
+    res.status(500).json({ error: 'Failed to fetch documents' });
+  }
+});
+
+// Upload document (admin/faculty only)
+// Faculty uploads are scoped to their own department by default; admin can pick any.
+router.post('/', authenticateToken, requireRole('admin', 'faculty'), uploadDocument.single('file'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { title, description, category_id } = req.body;
+    let { department } = req.body;
+    if (!title || !title.trim()) { res.status(400).json({ error: 'Title is required' }); return; }
+    if (!req.file) { res.status(400).json({ error: 'File is required' }); return; }
+    if (!category_id) { res.status(400).json({ error: 'Category is required' }); return; }
+
+    const catCheck = await pool.query("SELECT id FROM document_categories WHERE id = $1 AND status = 'active'", [category_id]);
+    if (catCheck.rows.length === 0) { res.status(400).json({ error: 'Category not found' }); return; }
+
+    // Scope rules: faculty can only post to their own department (or General);
+    // admin may post to any department.
+    if (req.user!.role === 'faculty') {
+      const facDept = req.user!.department || 'General';
+      if (department && department !== facDept && department !== 'General') {
+        res.status(403).json({ error: `Faculty can only upload to ${facDept} or General.` });
+        return;
+      }
+      department = department || facDept;
+    } else {
+      department = department || 'General';
+    }
+
+    const fileUrl = `/uploads/documents/${req.file.filename}`;
+    const result = await pool.query(
+      `INSERT INTO document_templates (category_id, uploaded_by, title, description, department, file_url, file_name, file_size, file_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [category_id, req.user!.id, title.trim(), description?.trim() || null, department, fileUrl, req.file.originalname, req.file.size, req.file.mimetype]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Upload document error:', err);
+    res.status(500).json({ error: 'Failed to upload document' });
+  }
+});
+
+// Update document metadata (admin/faculty only)
+router.patch('/:id', authenticateToken, requireRole('admin', 'faculty'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { title, description, category_id, department } = req.body;
+    if (!title || !title.trim()) { res.status(400).json({ error: 'Title is required' }); return; }
+
+    const check = await pool.query(
+      "SELECT uploaded_by FROM document_templates WHERE id = $1 AND status = 'active'", [id]
+    );
+    if (check.rows.length === 0) { res.status(404).json({ error: 'Document not found' }); return; }
+    if (req.user!.role === 'faculty' && check.rows[0].uploaded_by !== req.user!.id) {
+      res.status(403).json({ error: 'Not authorized to edit this document' });
+      return;
+    }
+
+    // Faculty cannot re-scope docs outside their own department or General.
+    let deptToSet = department || null;
+    if (req.user!.role === 'faculty' && deptToSet) {
+      const facDept = req.user!.department || 'General';
+      if (deptToSet !== facDept && deptToSet !== 'General') {
+        res.status(403).json({ error: `Faculty can only assign ${facDept} or General.` });
+        return;
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE document_templates
+         SET title = $1,
+             description = $2,
+             category_id = $3,
+             department = COALESCE($4, department),
+             updated_at = NOW()
+       WHERE id = $5 AND status = 'active' RETURNING *`,
+      [title.trim(), description?.trim() || null, category_id, deptToSet, id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Update document error:', err);
+    res.status(500).json({ error: 'Failed to update document' });
+  }
+});
+
+// Delete document (admin/faculty only) - soft delete
+router.delete('/:id', authenticateToken, requireRole('admin', 'faculty'), async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const check = await pool.query(
+      "SELECT uploaded_by FROM document_templates WHERE id = $1 AND status = 'active'", [id]
+    );
+    if (check.rows.length === 0) { res.status(404).json({ error: 'Document not found' }); return; }
+    if (req.user!.role === 'faculty' && check.rows[0].uploaded_by !== req.user!.id) {
+      res.status(403).json({ error: 'Not authorized to delete this document' });
+      return;
+    }
+    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE id = $1", [id]);
+    res.json({ message: 'Document deleted' });
+  } catch (err) {
+    console.error('Delete document error:', err);
+    res.status(500).json({ error: 'Failed to delete document' });
+  }
+});
+
+// Track download
+router.post('/:id/download', authenticateToken, async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    await pool.query('UPDATE document_templates SET download_count = download_count + 1 WHERE id = $1', [id]);
+    res.json({ message: 'Download tracked' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to track download' });
+  }
+});
+
+export default router;

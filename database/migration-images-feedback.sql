@@ -1,5 +1,4 @@
 -- Migration: Add event_images and feedback_images tables
--- Run this on existing databases that already have the base schema
 
 CREATE TABLE IF NOT EXISTS event_images (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

@@ -115,10 +115,10 @@ Go to: **http://localhost:3000**
 
 | Module             | Description |
 |--------------------|-------------|
-| **Announcements**  | Post/view announcements with department filtering, anonymous posting, image attachments |
-| **Event Calendar** | Interactive monthly calendar with event creation (faculty/admin) |
-| **Lost & Found**   | Report lost/found items with category, location, and contact info (AI-matching ready) |
-| **Class Schedule** | Personal weekly timetable management |
+| **Announcements**  | Post/view announcements with department + Campus filtering, admin approval workflow, image attachments |
+| **Event Calendar** | Interactive monthly calendar with event creation (faculty/admin) and admin approval |
+| **Lost & Found**   | Report lost/found items with category, location, and contact information (AI-matching ready) |
+| **Class Schedule** | Personal schedule via embedded link (Google/Canva/Microsoft) |
 | **PUPBot**         | AI-ready chatbot with PUPSJ handbook knowledge base |
 | **Admin Dashboard**| User management, stats overview, verify/deactivate accounts |
 

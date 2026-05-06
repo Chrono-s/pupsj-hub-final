@@ -8,6 +8,12 @@ async function seed() {
     console.log('🔄 Running database schema...');
     const schema = fs.readFileSync(path.join(__dirname, 'database', 'schema.sql'), 'utf8');
     await pool.query(schema);
+    // Run allowed registrations migration
+    const allowedRegMigration = fs.readFileSync(path.join(__dirname, 'database', 'migration-allowed-registrations.sql'), 'utf8');
+    await pool.query(allowedRegMigration);
+    // Run lostfound image fingerprints migration
+    const lostfoundFingerprintsMigration = fs.readFileSync(path.join(__dirname, 'database', 'migration-lostfound-image-fingerprints.sql'), 'utf8');
+    await pool.query(lostfoundFingerprintsMigration);
     console.log('✅ Schema created');
 
     // Create admin user
