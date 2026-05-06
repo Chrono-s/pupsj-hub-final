@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
-const { authenticateToken, requireRole } = require('../middleware/auth');
+const { authenticateToken } = require('../middleware/auth');
 const { uploadCsv } = require('../middleware/upload');
 const VALID_YEAR_LEVELS = ['1st', '2nd', '3rd', '4th'];
 const VALID_SECTIONS = ['1-1','1-2','1-3','2-1','2-2','2-3','3-1','3-2','3-3','4-1','4-2','4-3'];
@@ -232,209 +232,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
 
 
-// ══════════════════════════════════════════════════════════════
-//  GOOGLE SHEETS → JSON PROXY
-//  Fetches the public CSV export of a Google Sheet server-side
-//  so students never need a Google account to view schedules.
-// ══════════════════════════════════════════════════════════════
-
-router.get('/fetch-sheet', authenticateToken, async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ error: 'url query param required' });
-
-  // Extract sheet ID from any Google Sheets URL variant
-  const idMatch = url.match(/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
-  if (!idMatch) {
-    return res.status(400).json({ error: 'Not a valid Google Sheets URL' });
-  }
-  const sheetId = idMatch[1];
-  const gidMatch = url.match(/[#&?]gid=(\d+)/);
-  const gid = gidMatch ? gidMatch[1] : '0';
-
-  // Use the export endpoint — works for any sheet shared as "Anyone with link can view"
-  const csvUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`;
-
-  try {
-    const response = await fetch(csvUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      redirect: 'follow',
-    });
-
-    if (!response.ok) {
-      return res.status(400).json({
-        error: 'Could not fetch the sheet. Make sure it is shared with "Anyone with the link can view".',
-      });
-    }
-
-    const csvText = await response.text();
-
-    // Basic check: if Google returned an HTML login page instead of CSV
-    if (csvText.trimStart().startsWith('<!')) {
-      return res.status(400).json({
-        error: 'Sheet requires sign-in. Share it with "Anyone with the link can view" first.',
-      });
-    }
-
-    const rows = parseCsv(csvText);
-    if (rows.length === 0) {
-      return res.status(400).json({ error: 'Sheet appears to be empty.' });
-    }
-
-    res.json({ rows, sheetId, gid });
-  } catch (err) {
-    console.error('[fetch-sheet] error:', err);
-    res.status(500).json({ error: 'Failed to fetch sheet data: ' + err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
-//  SECTION SCHEDULE EMBEDS
-//  Faculty/Admin post an embed URL for a Dept + Year + Section.
-//  Students whose profile matches see the embedded schedule.
-// ══════════════════════════════════════════════════════════════
-
-// GET /api/schedules/embeds
-router.get('/embeds', authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role === 'student') {
-      const userRes = await pool.query(
-        'SELECT department, year_level, section FROM users WHERE id = $1',
-        [req.user.id]
-      );
-      const u = userRes.rows[0] || {};
-      const dept    = (u.department  || '').trim();
-      const year    = (u.year_level  || '').trim();
-      const section = (u.section     || '').trim();
-
-      if (!dept || !year || !section) {
-        return res.json([]);
-      }
-
-      const result = await pool.query(
-        `SELECT se.*, u.first_name || ' ' || u.last_name AS posted_by_name
-         FROM section_schedule_embeds se
-         LEFT JOIN users u ON se.posted_by = u.id
-         WHERE LOWER(TRIM(se.department)) = LOWER($1)
-           AND LOWER(TRIM(se.year_level)) = LOWER($2)
-           AND REPLACE(LOWER(TRIM(se.section)), '-', '') = REPLACE(LOWER($3), '-', '')
-         ORDER BY se.created_at DESC`,
-        [dept, year, section]
-      );
-      return res.json(result.rows);
-    }
-
-    // Faculty / Admin — return filtered list
-    const { department, year_level, section } = req.query;
-    const params = [];
-    let query = `
-      SELECT se.*, u.first_name || ' ' || u.last_name AS posted_by_name
-      FROM section_schedule_embeds se
-      LEFT JOIN users u ON se.posted_by = u.id
-      WHERE 1=1`;
-
-    // Faculty can only see their own postings
-    if (req.user.role === 'faculty') {
-      params.push(req.user.id);
-      query += ` AND se.posted_by = $${params.length}`;
-    }
-    if (department && department !== 'All') {
-      params.push(department);
-      query += ` AND se.department = $${params.length}`;
-    }
-    if (year_level) {
-      params.push(year_level);
-      query += ` AND se.year_level = $${params.length}`;
-    }
-    if (section) {
-      params.push(section);
-      query += ` AND se.section = $${params.length}`;
-    }
-    query += ' ORDER BY se.department, se.year_level, se.section, se.created_at DESC';
-
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('[Embeds] GET error:', err);
-    res.status(500).json({ error: 'Failed to load schedule embeds' });
-  }
-});
-
-// POST /api/schedules/embeds
-router.post('/embeds', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
-  try {
-    const { department, title, embed_url } = req.body;
-    const year_level = normalizeYearLevel(req.body.year_level);
-    const section    = normalizeSection(req.body.section);
-
-    if (!department || !year_level || !section || !embed_url) {
-      return res.status(400).json({ error: 'Department, year level, section and embed URL are required.' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO section_schedule_embeds (department, year_level, section, title, embed_url, posted_by)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [department, year_level, section, title || null, embed_url.trim(), req.user.id]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (err) {
-    console.error('[Embeds] POST error:', err);
-    res.status(500).json({ error: 'Failed to post schedule embed' });
-  }
-});
-
-// PATCH /api/schedules/embeds/:id
-router.patch('/embeds/:id', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
-  try {
-    const check = await pool.query(
-      'SELECT posted_by FROM section_schedule_embeds WHERE id = $1', [req.params.id]
-    );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (req.user.role !== 'admin' && check.rows[0].posted_by !== req.user.id) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const { department, title, embed_url } = req.body;
-    const year_level = normalizeYearLevel(req.body.year_level);
-    const section    = normalizeSection(req.body.section);
-
-    if (!department || !year_level || !section || !embed_url) {
-      return res.status(400).json({ error: 'Department, year level, section and embed URL are required.' });
-    }
-
-    const result = await pool.query(
-      `UPDATE section_schedule_embeds
-          SET department = $1, year_level = $2, section = $3, title = $4, embed_url = $5, updated_at = NOW()
-        WHERE id = $6 RETURNING *`,
-      [department, year_level, section, title || null, embed_url.trim(), req.params.id]
-    );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error('[Embeds] PATCH error:', err);
-    res.status(500).json({ error: 'Failed to update schedule embed' });
-  }
-});
-
-// DELETE /api/schedules/embeds/:id
-router.delete('/embeds/:id', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
-  try {
-    const check = await pool.query(
-      'SELECT posted_by FROM section_schedule_embeds WHERE id = $1', [req.params.id]
-    );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (req.user.role !== 'admin' && check.rows[0].posted_by !== req.user.id) {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-    await pool.query('DELETE FROM section_schedule_embeds WHERE id = $1', [req.params.id]);
-    res.json({ message: 'Schedule embed deleted' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to delete schedule embed' });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
-
-// Add a class (faculty/admin only — students view schedules posted by faculty/admin)
-router.post('/', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
+// Add a class
+router.post('/', authenticateToken, async (req, res) => {
   try {
     const { subject_code, subject_name, day_of_week, start_time, end_time, room, instructor, faculty_user_id, department } = req.body;
     const section = normalizeSection(req.body.section);
@@ -466,8 +265,10 @@ router.get('/template', authenticateToken, (req, res) => {
   res.send(csv);
 });
 
-// Upload CSV (faculty/admin only)
-router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploadCsv.single('file'), async (req, res) => {
+// Upload CSV — replaces user's existing class schedule
+// Supports both PUP official format and generic format
+// Accepts optional department and section via form fields
+router.post('/upload', authenticateToken, uploadCsv.single('file'), async (req, res) => {
   const client = await pool.connect();
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -625,8 +426,8 @@ router.post('/upload', authenticateToken, requireRole('faculty', 'admin'), uploa
   }
 });
 
-// Update a class (faculty/admin only)
-router.patch('/:id', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
+// Update a class
+router.patch('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { subject_code, subject_name, day_of_week, start_time, end_time, room, instructor, faculty_user_id, department } = req.body;
@@ -653,8 +454,8 @@ router.patch('/:id', authenticateToken, requireRole('faculty', 'admin'), async (
   }
 });
 
-// Delete a class (faculty/admin only)
-router.delete('/:id', authenticateToken, requireRole('faculty', 'admin'), async (req, res) => {
+// Delete a class
+router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     if (req.user.role === 'admin') {
       await pool.query('DELETE FROM class_schedules WHERE id = $1', [req.params.id]);
@@ -667,4 +468,4 @@ router.delete('/:id', authenticateToken, requireRole('faculty', 'admin'), async 
   }
 });
 
-module.exports = router;
+module.exports = router;  
