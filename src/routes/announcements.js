@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadAnnouncement } = require('../middleware/upload');
+const { notifyAdmins, notifyAudience, notifyUser, safeNotify } = require('../services/notifications');
 
 // Valid post scopes that every user can see regardless of department.
 const GLOBAL_SCOPES = ['General', 'Campus'];
@@ -123,6 +124,10 @@ function ownIdParamOrSelf(params, userId) {
   return params.length;
 }
 
+function actorName(user) {
+  return [user?.first_name, user?.last_name].filter(Boolean).join(' ').trim() || 'A user';
+}
+
 // Create announcement (with image upload)
 // Admin-authored posts auto-approve; faculty/student posts enter the pending queue.
 router.post('/', authenticateToken, uploadAnnouncement.array('images', 5), async (req, res) => {
@@ -162,6 +167,33 @@ router.post('/', authenticateToken, uploadAnnouncement.array('images', 5), async
         );
       }
     }
+
+    await safeNotify('announcement create', async () => {
+      if (status === 'pending') {
+        await notifyAdmins(
+          pool,
+          {
+            title: 'Announcement awaiting review',
+            message: `${actorName(req.user)} submitted "${title}" for approval.`,
+            type: 'announcement',
+            link: 'page:admin-dashboard',
+          },
+          [req.user.id]
+        );
+        return;
+      }
+
+      await notifyAudience(
+        pool,
+        { department: scope, excludeUserIds: [req.user.id] },
+        {
+          title: 'New announcement',
+          message: `"${title}" is now available in Announcements.`,
+          type: 'announcement',
+          link: 'page:announcements',
+        }
+      );
+    });
 
     res.status(201).json({
       message: isAdmin ? 'Announcement posted' : 'Announcement submitted for admin approval',
@@ -271,6 +303,28 @@ router.post('/:id/approve', authenticateToken, requireRole('admin'), async (req,
       [req.user.id, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pending announcement not found' });
+
+    const announcement = result.rows[0];
+    await safeNotify('announcement approve', async () => {
+      await notifyUser(pool, announcement.author_id, {
+        title: 'Announcement approved',
+        message: `"${announcement.title}" is now live in Announcements.`,
+        type: 'announcement',
+        link: 'page:announcements',
+      });
+
+      await notifyAudience(
+        pool,
+        { department: announcement.department, excludeUserIds: [announcement.author_id] },
+        {
+          title: 'New announcement',
+          message: `"${announcement.title}" is now available in Announcements.`,
+          type: 'announcement',
+          link: 'page:announcements',
+        }
+      );
+    });
+
     res.json({ message: 'Announcement approved', announcement: result.rows[0] });
   } catch (err) {
     console.error('Approve announcement error:', err);
@@ -289,6 +343,19 @@ router.post('/:id/reject', authenticateToken, requireRole('admin'), async (req, 
       [req.user.id, reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pending announcement not found' });
+
+    const announcement = result.rows[0];
+    await safeNotify('announcement reject', async () => {
+      await notifyUser(pool, announcement.author_id, {
+        title: 'Announcement rejected',
+        message: reason
+          ? `"${announcement.title}" was rejected: ${reason}`
+          : `"${announcement.title}" was rejected by an administrator.`,
+        type: 'announcement',
+        link: 'page:announcements',
+      });
+    });
+
     res.json({ message: 'Announcement rejected', announcement: result.rows[0] });
   } catch (err) {
     console.error('Reject announcement error:', err);

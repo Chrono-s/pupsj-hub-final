@@ -46,15 +46,19 @@
     sectionSchedules: [],
     lfMatches: null,
     lfMatchingId: null,
+    notifications: [],
+    notificationsUnread: 0,
   };
 
   // Polling handle for Professor Locator
   let locatorPollTimer = null;
+  let notificationsPollTimer = null;
 
   // Per-page scroll position + data-freshness cache
   const pageScrollCache = {};
   const pageLoadedAt    = {};
   const PAGE_CACHE_TTL  = 5 * 60 * 1000; // 5 minutes
+  const NOTIFICATIONS_CACHE_TTL = 60 * 1000;
 
   const departments = ['All', 'General', 'Campus', 'BSIT', 'DIT', 'BSENTREP', 'BSPSYCH', 'BSEDUC', 'BSNM', 'BSFM'];
   const lfCategories = ['Personal Items', 'School Supplies', 'Electronics', 'Clothing', 'Documents', 'Others'];
@@ -223,6 +227,59 @@
     }
   }
 
+  function formatBadgeCount(count) {
+    return count > 99 ? '99+' : String(count);
+  }
+
+  function renderNotificationBadge(id, className = 'nav-badge') {
+    const count = Number(state.notificationsUnread) || 0;
+    return `<span class="${className}${count > 0 ? '' : ' is-hidden'}" id="${id}">${formatBadgeCount(count)}</span>`;
+  }
+
+  function updateNotificationIndicators() {
+    const count = Number(state.notificationsUnread) || 0;
+    const label = formatBadgeCount(count);
+
+    const sidebarBadge = document.getElementById('sidebarNotificationBadge');
+    if (sidebarBadge) {
+      sidebarBadge.textContent = label;
+      sidebarBadge.classList.toggle('is-hidden', count <= 0);
+    }
+
+    const mobileBadge = document.getElementById('mobileNotificationBadge');
+    if (mobileBadge) {
+      mobileBadge.textContent = label;
+      mobileBadge.classList.toggle('is-hidden', count <= 0);
+    }
+  }
+
+  async function refreshNotificationSummary() {
+    if (!state.user) return;
+    const data = await api('/api/notifications/summary');
+    state.notificationsUnread = Number(data.unread_count) || 0;
+    updateNotificationIndicators();
+  }
+
+  function stopNotificationsPolling() {
+    if (notificationsPollTimer) {
+      clearInterval(notificationsPollTimer);
+      notificationsPollTimer = null;
+    }
+  }
+
+  function startNotificationsPolling() {
+    if (!state.user) return;
+    stopNotificationsPolling();
+    refreshNotificationSummary().catch(() => {});
+    notificationsPollTimer = setInterval(() => {
+      if (!state.user) {
+        stopNotificationsPolling();
+        return;
+      }
+      refreshNotificationSummary().catch(() => {});
+    }, 45000);
+  }
+
   // ── TOAST ──
   function showToast(message, type = 'info') {
     let container = document.querySelector('.toast-container');
@@ -376,11 +433,14 @@
   function render() {
     const app = document.getElementById('app');
     if (!state.user) {
+      stopNotificationsPolling();
       app.innerHTML = renderAuth();
       bindAuthEvents();
     } else {
       app.innerHTML = renderLayout();
       bindLayoutEvents();
+      updateNotificationIndicators();
+      startNotificationsPolling();
       navigateTo(state.currentPage);
     }
   }
@@ -939,6 +999,7 @@
           ${isFaculty ? `<div class="nav-item" data-page="teaching"><i class="fas fa-clock"></i> Teaching Schedule</div>` : `<div class="nav-item" data-page="section-schedules"><i class="fas fa-clock"></i> Class Schedules</div>`}
           <div class="nav-item" data-page="chatbot"><i class="fas fa-robot"></i> PUPBot</div>
           <div class="nav-item" data-page="documents"><i class="fas fa-folder-open"></i> Document Templates</div>
+          <div class="nav-item" data-page="notifications"><i class="fas fa-bell"></i> Notifications ${renderNotificationBadge('sidebarNotificationBadge')}</div>
           <div class="nav-item" data-page="profile"><i class="fas fa-user-circle"></i> My Profile</div>
           ${isAdmin ? `
           <div class="nav-section-label">Administration</div>
@@ -971,6 +1032,10 @@
             PUPSJ HUB
           </div>
           <div class="top-header-actions">
+            <button class="btn-icon notification-bell-btn" id="mobileNotifications" title="Notifications">
+              <i class="fas fa-bell"></i>
+              ${renderNotificationBadge('mobileNotificationBadge', 'top-bell-badge')}
+            </button>
             <button class="btn-icon" id="mobileLogout" title="Logout"><i class="fas fa-sign-out-alt"></i></button>
           </div>
         </div>
@@ -1002,16 +1067,20 @@
     if (scrim) scrim.onclick = closeSidebar;
     // Logout
     const logoutBtn = document.getElementById('logoutBtn');
+    const mobileNotifications = document.getElementById('mobileNotifications');
     const mobileLogout = document.getElementById('mobileLogout');
     const doLogout = async () => {
       await api('/api/auth/logout', { method: 'POST' });
       sessionStorage.removeItem('pupsj_token');
+      stopNotificationsPolling();
       state.user = null;
       state.currentPage = 'announcements';
       state.chatMessages = [];
       state.announcements = [];
       state.events = [];
       state.lostFound = [];
+      state.notifications = [];
+      state.notificationsUnread = 0;
       state.adminStats = null;
       state.adminUsers = [];
       state.adminSelectedAllowedIds = new Set();
@@ -1020,6 +1089,7 @@
       showToast('Logged out', 'info');
       render();
     };
+    if (mobileNotifications) mobileNotifications.onclick = () => navigateTo('notifications');
     if (logoutBtn) logoutBtn.onclick = doLogout;
     if (mobileLogout) mobileLogout.onclick = doLogout;
   }
@@ -1096,6 +1166,7 @@
         }
         break;
       case 'documents': loadDocuments(true); break;
+      case 'notifications': loadNotifications(true); break;
       case 'profile': loadProfile(); break;
       case 'admin-dashboard': loadAdminDashboard(); break;
       case 'admin-users': loadAdminUsers(); break;
@@ -1970,6 +2041,165 @@
   // ════════════════════════════════
   //  SECTION SCHEDULES DIRECTORY
   // ════════════════════════════════
+  // Notifications
+  function getNotificationMeta(type) {
+    switch (type) {
+      case 'announcement':
+        return { icon: 'bullhorn', className: 'announcement', label: 'Announcement' };
+      case 'event':
+        return { icon: 'calendar-alt', className: 'event', label: 'Event' };
+      case 'feedback':
+        return { icon: 'star', className: 'feedback', label: 'Feedback' };
+      case 'lostfound':
+        return { icon: 'search-location', className: 'lostfound', label: 'Lost & Found' };
+      default:
+        return { icon: 'bell', className: 'general', label: 'General' };
+    }
+  }
+
+  async function markNotificationRead(id) {
+    const existing = state.notifications.find((notification) => notification.id === id);
+    if (existing?.is_read) return existing;
+
+    const data = await api(`/api/notifications/${id}/read`, { method: 'PATCH' });
+    const updated = data.notification || { ...existing, is_read: true };
+
+    state.notifications = state.notifications.map((notification) =>
+      notification.id === id ? { ...notification, ...updated, is_read: true } : notification
+    );
+    if (existing && !existing.is_read) {
+      state.notificationsUnread = Math.max(0, state.notificationsUnread - 1);
+      updateNotificationIndicators();
+    }
+    pageLoadedAt.notifications = Date.now();
+    return updated;
+  }
+
+  function openNotificationLink(link) {
+    if (!link || typeof link !== 'string') return;
+    if (link.startsWith('page:')) {
+      navigateTo(link.slice(5));
+    }
+  }
+
+  async function openNotification(notificationId) {
+    const notification = state.notifications.find((item) => item.id === notificationId);
+    if (!notification) return;
+
+    try {
+      if (!notification.is_read) {
+        await markNotificationRead(notificationId);
+      }
+      openNotificationLink(notification.link);
+    } catch (err) {
+      showToast(err.message || 'Failed to open notification', 'error');
+    }
+  }
+
+  async function loadNotifications(fromNav = false) {
+    const pageArea = document.getElementById('pageArea');
+
+    if (
+      fromNav &&
+      state.notifications.length > 0 &&
+      pageLoadedAt.notifications &&
+      Date.now() - pageLoadedAt.notifications < NOTIFICATIONS_CACHE_TTL
+    ) {
+      renderNotificationsPage();
+      requestAnimationFrame(() => { pageArea.scrollTop = pageScrollCache.notifications || 0; });
+      return;
+    }
+
+    pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Notifications</h1><p class="page-subtitle">Stay updated on approvals, events, feedback, and AI matches</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;
+
+    try {
+      const data = await api('/api/notifications?limit=50');
+      state.notifications = data.notifications || [];
+      state.notificationsUnread = Number(data.unread_count) || 0;
+      pageLoadedAt.notifications = Date.now();
+      updateNotificationIndicators();
+      renderNotificationsPage();
+    } catch (err) {
+      pageArea.querySelector('.page-content').innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><h3>Failed to load notifications</h3><p>${escHtml(err.message || 'Please try again.')}</p></div>`;
+    }
+  }
+
+  function renderNotificationsPage() {
+    const pageArea = document.getElementById('pageArea');
+    const unreadCount = Number(state.notificationsUnread) || 0;
+
+    pageArea.innerHTML = `
+      <div class="page-header">
+        <h1 class="page-title">Notifications</h1>
+        <p class="page-subtitle">Activity from announcements, events, feedback, and lost & found</p>
+      </div>
+      <div class="page-content">
+        <div class="notifications-toolbar">
+          <div class="notifications-toolbar-copy">
+            <span class="notifications-count">${unreadCount} unread</span>
+            <span class="notifications-total">${state.notifications.length} recent notification${state.notifications.length !== 1 ? 's' : ''}</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="markAllNotificationsRead" ${unreadCount === 0 ? 'disabled' : ''}>
+            <i class="fas fa-check-double"></i> Mark all as read
+          </button>
+        </div>
+        ${state.notifications.length === 0 ? `
+          <div class="empty-state">
+            <i class="fas fa-bell-slash"></i>
+            <h3>No notifications yet</h3>
+            <p>New updates will appear here when something important happens.</p>
+          </div>
+        ` : `
+          <div class="notifications-list">
+            ${state.notifications.map((notification) => {
+              const meta = getNotificationMeta(notification.type);
+              return `
+                <div class="card notification-card${notification.is_read ? '' : ' unread'}" data-notification-id="${notification.id}">
+                  <div class="notification-icon ${meta.className}">
+                    <i class="fas fa-${meta.icon}"></i>
+                  </div>
+                  <div class="notification-body">
+                    <div class="notification-topline">
+                      <span class="notification-type">${meta.label}</span>
+                      <span class="notification-time">${timeAgo(notification.created_at)}</span>
+                    </div>
+                    <h3 class="notification-title">${escHtml(notification.title)}</h3>
+                    ${notification.message ? `<p class="notification-message">${escHtml(notification.message)}</p>` : ''}
+                    <div class="notification-actions-row">
+                      ${notification.link ? '<span class="notification-link">Open related page</span>' : '<span class="notification-link muted">No linked page</span>'}
+                      ${notification.is_read ? '<span class="notification-status">Read</span>' : '<span class="notification-status unread">Unread</span>'}
+                    </div>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `}
+      </div>`;
+
+    const markAllBtn = document.getElementById('markAllNotificationsRead');
+    if (markAllBtn) {
+      markAllBtn.onclick = async () => {
+        try {
+          const data = await api('/api/notifications/read-all', { method: 'PATCH' });
+          state.notifications = state.notifications.map((notification) => ({ ...notification, is_read: true }));
+          state.notificationsUnread = 0;
+          pageLoadedAt.notifications = Date.now();
+          updateNotificationIndicators();
+          renderNotificationsPage();
+          showToast(data.message || 'Notifications updated', 'success');
+        } catch (err) {
+          showToast(err.message || 'Failed to update notifications', 'error');
+        }
+      };
+    }
+
+    document.querySelectorAll('[data-notification-id]').forEach((card) => {
+      card.onclick = () => openNotification(card.dataset.notificationId);
+    });
+  }
+
+  // Section schedules directory
   async function loadSectionSchedules() {
     const pageArea = document.getElementById('pageArea');
     pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Class Schedules</h1><p class="page-subtitle">Browse posted schedules by section</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;

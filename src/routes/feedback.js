@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { uploadFeedback } = require('../middleware/upload');
+const { notifyUser, safeNotify } = require('../services/notifications');
 
 const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8000';
 
@@ -100,12 +101,17 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
     if (!event_id) return res.status(400).json({ error: 'event_id is required' });
 
     const eventCheck = await pool.query(
-      'SELECT id FROM events WHERE id = $1 AND status != $2',
+      `SELECT id, title, author_id
+       FROM events
+       WHERE id = $1
+         AND status != $2`,
       [event_id, 'deleted']
     );
     if (!eventCheck.rows.length) {
       return res.status(404).json({ error: 'Event not found' });
     }
+
+    const event = eventCheck.rows[0];
 
     const duplicateCheck = await pool.query(
       `SELECT id
@@ -143,6 +149,17 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
         );
       }
     }
+
+    await safeNotify('feedback create', async () => {
+      if (event.author_id && event.author_id !== req.user.id) {
+        await notifyUser(pool, event.author_id, {
+          title: 'New event feedback',
+          message: `Your event "${event.title}" received a new ${r}-star review.`,
+          type: 'feedback',
+          link: 'page:events',
+        });
+      }
+    });
 
     res.status(201).json({ message: 'Feedback submitted', feedback });
   } catch (err) {

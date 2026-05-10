@@ -4,6 +4,7 @@ const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadLostFound } = require('../middleware/upload');
 const { rankLostFoundCandidates } = require('../services/lostFoundMatcher');
+const { notifyAdmins, notifyUsers, safeNotify } = require('../services/notifications');
 
 const AUTO_MATCH_THRESHOLD = 0.78;
 const VALID_STATUSES = ['open', 'matched', 'claimed', 'resolved', 'closed'];
@@ -17,6 +18,10 @@ function parseImageFingerprints(raw) {
   } catch (_) {
     return [];
   }
+}
+
+function itemLabel(item) {
+  return item?.item_name || 'your item';
 }
 
 function isStrongAutoMatch(best) {
@@ -159,6 +164,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
 router.post('/', authenticateToken, requireRole('faculty', 'admin'), uploadLostFound.array('images', 5), async (req, res) => {
   const client = await pool.connect();
+  let hydratedItem = null;
+  let autoMatch = null;
   try {
     const { type, item_name, description, category, location_found, contact_info } = req.body;
     if (!type || !item_name || !description) {
@@ -185,11 +192,33 @@ router.post('/', authenticateToken, requireRole('faculty', 'admin'), uploadLostF
       }
     }
 
-    const hydratedItem = await fetchLostFoundItemWithImages(client, item.id);
+    hydratedItem = await fetchLostFoundItemWithImages(client, item.id);
     hydratedItem.image_fingerprints = parseImageFingerprints(req.body.image_fingerprints);
-    const autoMatch = await maybeQueueAutoMatch(client, hydratedItem);
+    autoMatch = await maybeQueueAutoMatch(client, hydratedItem);
 
     await client.query('COMMIT');
+
+    if (autoMatch?.matched) {
+      await safeNotify('lost-found auto match', async () => {
+        const partner = await fetchLostFoundItemWithImages(pool, autoMatch.partner_id);
+        const reporterIds = [hydratedItem.reporter_id, partner?.reporter_id];
+
+        await notifyUsers(pool, reporterIds, {
+          title: 'Possible lost & found match found',
+          message: `"${itemLabel(hydratedItem)}" may match another report and is waiting for office review.`,
+          type: 'lostfound',
+          link: 'page:lostfound',
+        });
+
+        await notifyAdmins(pool, {
+          title: 'Lost & found review needed',
+          message: `AI suggested a match between "${itemLabel(hydratedItem)}" and "${itemLabel(partner)}".`,
+          type: 'lostfound',
+          link: 'page:lostfound',
+        });
+      });
+    }
+
     res.status(201).json({ message: 'Item reported', item: hydratedItem, autoMatch });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
@@ -266,8 +295,10 @@ router.get('/review/pending', authenticateToken, requireRole('admin'), async (re
 
 router.patch('/review/:id', authenticateToken, requireRole('admin'), async (req, res) => {
   const client = await pool.connect();
+  let reviewItems = [];
+  let decision = null;
   try {
-    const decision = req.body?.decision;
+    decision = req.body?.decision;
     if (!['approve', 'reject'].includes(decision)) {
       return res.status(400).json({ error: 'Decision must be approve or reject' });
     }
@@ -287,6 +318,14 @@ router.patch('/review/:id', authenticateToken, requireRole('admin'), async (req,
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Review has no linked match' });
     }
+
+    const reviewItemsResult = await client.query(
+      `SELECT id, reporter_id, item_name
+       FROM lost_found
+       WHERE id = ANY($1::uuid[])`,
+      [[review.id, review.matched_with]]
+    );
+    reviewItems = reviewItemsResult.rows;
 
     if (decision === 'approve') {
       await client.query(
@@ -313,6 +352,23 @@ router.patch('/review/:id', authenticateToken, requireRole('admin'), async (req,
     }
 
     await client.query('COMMIT');
+
+    await safeNotify('lost-found review decision', async () => {
+      const anchorItem = reviewItems.find((item) => item.id === review.id) || reviewItems[0];
+      await notifyUsers(
+        pool,
+        reviewItems.map((item) => item.reporter_id),
+        {
+          title: decision === 'approve' ? 'Lost & found match approved' : 'Lost & found match rejected',
+          message: decision === 'approve'
+            ? `A reported match involving "${itemLabel(anchorItem)}" was approved. Please coordinate with the office.`
+            : `The proposed match involving "${itemLabel(anchorItem)}" was not approved after review.`,
+          type: 'lostfound',
+          link: 'page:lostfound',
+        }
+      );
+    });
+
     res.json({ message: decision === 'approve' ? 'Match approved' : 'Match rejected' });
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}

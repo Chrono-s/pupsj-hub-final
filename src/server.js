@@ -308,6 +308,7 @@ app.use(
 //  API ROUTES
 // ─────────────────────────────────────────────────────────────
 app.use('/api/auth', require('./routes/auth'));
+app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/announcements', require('./routes/announcements'));
 app.use('/api/events', require('./routes/events'));
 app.use('/api/lost-found', require('./routes/lostfound'));

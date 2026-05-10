@@ -3,6 +3,11 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadEvent } = require('../middleware/upload');
+const { notifyAdmins, notifyAudience, notifyUser, safeNotify } = require('../services/notifications');
+
+function actorName(user) {
+  return [user?.first_name, user?.last_name].filter(Boolean).join(' ').trim() || 'A user';
+}
 
 // Get events
 // - Admin sees all (optionally filter by ?status=pending|active|...)
@@ -108,6 +113,33 @@ router.post('/', authenticateToken, requireRole('faculty', 'admin'), uploadEvent
       }
     }
 
+    await safeNotify('event create', async () => {
+      if (status === 'pending') {
+        await notifyAdmins(
+          pool,
+          {
+            title: 'Event awaiting review',
+            message: `${actorName(req.user)} submitted "${title}" for approval.`,
+            type: 'event',
+            link: 'page:admin-dashboard',
+          },
+          [req.user.id]
+        );
+        return;
+      }
+
+      await notifyAudience(
+        pool,
+        { department: scope, excludeUserIds: [req.user.id] },
+        {
+          title: 'New event posted',
+          message: `"${title}" is now listed in the Event Calendar.`,
+          type: 'event',
+          link: 'page:events',
+        }
+      );
+    });
+
     res.status(201).json({
       message: isAdmin ? 'Event created' : 'Event submitted for admin approval',
       event
@@ -211,6 +243,28 @@ router.post('/:id/approve', authenticateToken, requireRole('admin'), async (req,
       [req.user.id, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pending event not found' });
+
+    const event = result.rows[0];
+    await safeNotify('event approve', async () => {
+      await notifyUser(pool, event.author_id, {
+        title: 'Event approved',
+        message: `"${event.title}" is now live in the Event Calendar.`,
+        type: 'event',
+        link: 'page:events',
+      });
+
+      await notifyAudience(
+        pool,
+        { department: event.department, excludeUserIds: [event.author_id] },
+        {
+          title: 'New event posted',
+          message: `"${event.title}" is now listed in the Event Calendar.`,
+          type: 'event',
+          link: 'page:events',
+        }
+      );
+    });
+
     res.json({ message: 'Event approved', event: result.rows[0] });
   } catch (err) {
     console.error('Approve event error:', err);
@@ -228,6 +282,19 @@ router.post('/:id/reject', authenticateToken, requireRole('admin'), async (req, 
       [req.user.id, reason || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Pending event not found' });
+
+    const event = result.rows[0];
+    await safeNotify('event reject', async () => {
+      await notifyUser(pool, event.author_id, {
+        title: 'Event rejected',
+        message: reason
+          ? `"${event.title}" was rejected: ${reason}`
+          : `"${event.title}" was rejected by an administrator.`,
+        type: 'event',
+        link: 'page:events',
+      });
+    });
+
     res.json({ message: 'Event rejected', event: result.rows[0] });
   } catch (err) {
     console.error('Reject event error:', err);
