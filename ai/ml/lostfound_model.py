@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 import json
@@ -29,6 +30,27 @@ ITEM_TYPES = {
     "notebook", "id", "card", "umbrella", "flashdrive", "usb", "phone", "charger",
     "bag", "backpack", "pencilcase", "eyeglasses", "keys", "key", "jacket",
 }
+
+
+def parse_date(value: Any) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
 
 
 def normalize_text(value: str) -> str:
@@ -68,6 +90,12 @@ def coverage(left: set[str], right: set[str]) -> float:
     if not left:
         return 0.0
     return len(left & right) / len(left)
+
+
+def mismatch(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return 1.0 if left.isdisjoint(right) else 0.0
 
 
 def parse_fingerprint(raw: str) -> dict[str, Any]:
@@ -145,6 +173,11 @@ def build_feature_row(query: dict[str, Any], candidate: dict[str, Any]) -> dict[
     candidate_types = candidate_tokens & ITEM_TYPES
     query_codes = {token for token in query_tokens if any(ch.isdigit() for ch in token)}
     candidate_codes = {token for token in candidate_tokens if any(ch.isdigit() for ch in token)}
+    query_date = parse_date(query.get("date_reported"))
+    candidate_date = parse_date(candidate.get("date_reported"))
+    days_apart = None
+    if query_date and candidate_date:
+        days_apart = abs((query_date - candidate_date).days)
 
     qfps = list(query.get("image_fingerprints") or [])
     cfps = list(candidate.get("image_fingerprints") or [])
@@ -155,12 +188,21 @@ def build_feature_row(query: dict[str, Any], candidate: dict[str, Any]) -> dict[
         "name_overlap": overlap(query_name, candidate_name),
         "name_coverage": coverage(query_name, candidate_name),
         "color_overlap": overlap(query_colors, candidate_colors),
+        "color_mismatch": mismatch(query_colors, candidate_colors),
         "brand_overlap": overlap(query_brands, candidate_brands),
+        "brand_mismatch": mismatch(query_brands, candidate_brands),
         "type_overlap": overlap(query_types, candidate_types),
+        "type_mismatch": mismatch(query_types, candidate_types),
         "code_overlap": overlap(query_codes, candidate_codes),
+        "exact_code_match": 1.0 if query_codes and candidate_codes and not query_codes.isdisjoint(candidate_codes) else 0.0,
+        "code_mismatch": mismatch(query_codes, candidate_codes),
         "same_category": 1.0 if normalize_text(str(query.get("category") or "")) == normalize_text(str(candidate.get("category") or "")) and query.get("category") and candidate.get("category") else 0.0,
         "same_location_word": overlap(set(tokenize(str(query.get("location_found") or ""))), set(tokenize(str(candidate.get("location_found") or "")))),
         "image_similarity": image_similarity(qfps, cfps),
+        "report_date_gap": max(0.0, 1.0 - (min(days_apart, 30) / 30.0)) if days_apart is not None else 0.0,
+        "has_query_fingerprint": 1.0 if qfps else 0.0,
+        "has_candidate_fingerprint": 1.0 if cfps else 0.0,
+        "valid_type_pair": 1.0 if query.get("type") and candidate.get("type") and str(query.get("type")).strip().lower() != str(candidate.get("type")).strip().lower() else 0.0,
         "query_len": min(len(query_tokens), 20) / 20.0,
         "candidate_len": min(len(candidate_tokens), 20) / 20.0,
     }

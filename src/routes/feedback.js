@@ -93,10 +93,34 @@ router.get('/event/:eventId/summary', authenticateToken, async (req, res) => {
 router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (req, res) => {
   try {
     const { event_id, rating, comment } = req.body;
+    const normalizedComment = String(comment || '').trim();
 
     const r = parseInt(rating);
     if (!r || r < 1 || r > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     if (!event_id) return res.status(400).json({ error: 'event_id is required' });
+
+    const eventCheck = await pool.query(
+      'SELECT id FROM events WHERE id = $1 AND status != $2',
+      [event_id, 'deleted']
+    );
+    if (!eventCheck.rows.length) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    const duplicateCheck = await pool.query(
+      `SELECT id
+       FROM feedback
+       WHERE user_id = $1
+         AND event_id = $2
+         AND rating = $3
+         AND COALESCE(TRIM(comment), '') = $4
+         AND created_at >= NOW() - INTERVAL '24 hours'
+       LIMIT 1`,
+      [req.user.id, event_id, r, normalizedComment]
+    );
+    if (duplicateCheck.rows.length) {
+      return res.status(409).json({ error: 'Duplicate feedback detected. Please edit your existing feedback instead.' });
+    }
 
     let sentiment = 'neutral';
     if (r >= 4) sentiment = 'positive';
@@ -105,7 +129,7 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
     const result = await pool.query(
       `INSERT INTO feedback (user_id, event_id, rating, comment, sentiment)
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [req.user.id, event_id, r, comment, sentiment]
+      [req.user.id, event_id, r, normalizedComment || null, sentiment]
     );
 
     const feedback = result.rows[0];

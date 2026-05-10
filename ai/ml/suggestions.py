@@ -172,6 +172,7 @@ def generate_suggestions(
     complaint_keywords: list[str],
     cluster_keywords: list[list[str]] | None = None,
     max_suggestions: int = 5,
+    min_hit_count: int = 1,
 ) -> list[dict]:
     """
     Match detected complaint terms against the suggestion catalogue.
@@ -180,6 +181,8 @@ def generate_suggestions(
         complaint_keywords: flat list of top keywords from negative feedback
         cluster_keywords: optional list of keyword-lists (one per KMeans cluster)
         max_suggestions: cap on returned suggestions
+        min_hit_count: require at least this many keyword hits before returning
+                       a category-specific recommendation
 
     Returns:
         List of {"category", "matched_keywords", "recommendation"} dicts.
@@ -201,10 +204,11 @@ def generate_suggestions(
         if entry["category"] in used_categories:
             continue
         hits = [k for k in entry["keywords"] if _word_matches(k, pool)]
-        if hits:
+        if len(hits) >= min_hit_count:
             scored.append((len(hits), {
                 "category": entry["category"],
                 "matched_keywords": hits[:5],
+                "support_hits": len(hits),
                 "recommendation": entry["recommendation"],
             }))
             used_categories.add(entry["category"])
@@ -220,6 +224,7 @@ def generate_suggestions(
         results.append({
             "category": "general",
             "matched_keywords": safe_kws,
+            "support_hits": len(safe_kws),
             "recommendation": (
                 "Attendees raised concerns that were not covered by standard categories. "
                 "Review the negative feedback comments directly and discuss improvement "

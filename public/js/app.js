@@ -1644,6 +1644,12 @@
       const sent   = data.sentiment_breakdown || {};
       const suggestions    = data.suggestions || [];
       const complaintThemes = data.complaint_themes || [];
+      const analysisQuality = data.analysis_quality || {};
+      const sampleLevelColor = analysisQuality.sample_level === 'strong'
+        ? 'var(--success)'
+        : analysisQuality.sample_level === 'moderate'
+          ? 'var(--warning)'
+          : 'var(--danger)';
 
       const sentIcons = { positive:'fa-smile', neutral:'fa-meh', negative:'fa-frown' };
       const catIcons  = { timeliness:'fa-clock', food_refreshments:'fa-utensils', venue_comfort:'fa-building', av_equipment:'fa-microphone', organization:'fa-tasks', content_relevance:'fa-book', duration:'fa-hourglass-half', registration:'fa-clipboard-list', communication:'fa-bullhorn', safety:'fa-shield-alt' };
@@ -1668,6 +1674,21 @@
             </div>`).join('')}`)}
         </div>
 
+        ${analysisQuality.summary ? sectionCard(`
+          ${sectionLabel('ANALYSIS QUALITY')}
+          <div style="display:flex;gap:12px;align-items:flex-start;">
+            <i class="fas fa-shield-alt" style="color:${sampleLevelColor};margin-top:2px;flex-shrink:0;"></i>
+            <div>
+              <p style="margin:0 0 8px;font-size:.9rem;line-height:1.55;">${escHtml(analysisQuality.summary)}</p>
+              <p style="margin:0;font-size:.75rem;color:var(--text-secondary);">
+                Usable comments: ${data.usable_responses || total}/${data.total_responses || total}
+                ${data.raw_usable_responses && data.raw_usable_responses !== data.usable_responses ? ` • Raw usable before merge: ${escHtml(String(data.raw_usable_responses))}` : ''}
+                ${data.duplicate_comments_collapsed ? ` • Duplicate comments merged: ${escHtml(String(data.duplicate_comments_collapsed))}` : ''}
+                ${analysisQuality.negative_evidence_level ? ` • Negative evidence: ${escHtml(String(analysisQuality.negative_evidence_level).replace(/_/g, ' '))}` : ''}
+              </p>
+            </div>
+          </div>
+        `) : ''}
 
         <!-- Suggestions -->
         ${suggestions.length ? sectionCard(`
@@ -1675,10 +1696,13 @@
           ${suggestions.map((s,i) => `
             <div style="display:flex;gap:12px;align-items:flex-start;${i<suggestions.length-1?'margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--bg-soft);':''}">
               <i class="fas ${catIcons[s.category]||'fa-lightbulb'}" style="color:var(--primary);margin-top:2px;flex-shrink:0;width:16px;"></i>
-              <p style="margin:0;font-size:.875rem;line-height:1.55;">${escHtml(s.recommendation)}</p>
+              <div>
+                <p style="margin:0;font-size:.875rem;line-height:1.55;">${escHtml(s.recommendation)}</p>
+                ${s.support_hits ? `<p style="margin:6px 0 0;font-size:.72rem;color:var(--text-secondary);">Support signals: ${escHtml(String(s.support_hits))}</p>` : ''}
+              </div>
             </div>`).join('')}`) : ''}
 
-        <p style="margin:0;font-size:.72rem;color:var(--text-secondary);text-align:right;">${total} responses analyzed</p>
+        <p style="margin:0;font-size:.72rem;color:var(--text-secondary);text-align:right;">${data.usable_responses || total} usable responses analyzed</p>
       `;
     } catch (err) {
       modal.querySelector('div').innerHTML = `
@@ -1864,6 +1888,7 @@
                     <strong>${escHtml(m.item_name)}</strong>
                     <p>${escHtml(m.description)}</p>
                     ${m.location_found ? `<div class="lf-match-loc"><i class="fas fa-map-marker-alt"></i> ${escHtml(m.location_found)}</div>` : ''}
+                    ${m.image_analysis_used && m.image_match_score != null ? `<div class="lf-match-loc"><i class="fas fa-image"></i> Image analysis match: ${Math.round(Number(m.image_match_score) * 100)}%</div>` : ''}
                     ${m.common_keywords && m.common_keywords.length > 0 ? `<div class="lf-match-keywords">${m.common_keywords.map(k => `<span class="kw-chip">${escHtml(k)}</span>`).join('')}</div>` : ''}
                     ${m.contact_info ? `<div class="lf-match-contact"><i class="fas fa-phone"></i> ${escHtml(m.contact_info)}</div>` : ''}
                   </div>

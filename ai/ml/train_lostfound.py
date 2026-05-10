@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 import random
 
 import joblib
@@ -11,6 +12,7 @@ from sklearn.model_selection import train_test_split
 from ai.ml.lostfound_model import MODEL_DIR, MODEL_PATH, build_feature_row
 
 random.seed(42)
+DATE_START = date(2026, 1, 1)
 
 ITEM_LIBRARY = [
     {"item_name": "black nike wallet", "category": "Personal Items", "description_bits": ["black", "nike logo", "folding wallet", "small zipper pocket"]},
@@ -46,42 +48,73 @@ def render_bits(bits: list[str]) -> str:
     return ", ".join(bits)
 
 
+def sample_bits(bits: list[str], max_items: int = 3) -> list[str]:
+    return random.sample(bits, k=min(max_items, len(bits)))
+
+
+def random_report_date(start_day: date | None = None, min_offset: int = 0, max_offset: int = 7) -> str:
+    anchor = start_day or (DATE_START + timedelta(days=random.randint(0, 120)))
+    return (anchor + timedelta(days=random.randint(min_offset, max_offset))).isoformat()
+
+
 def make_example(base: dict, positive: bool) -> tuple[dict, dict, int]:
-    query_bits = random.sample(base["description_bits"], k=min(3, len(base["description_bits"])))
-    candidate_bits = random.sample(base["description_bits"], k=min(3, len(base["description_bits"])))
+    query_bits = sample_bits(base["description_bits"])
+    candidate_bits = sample_bits(base["description_bits"])
+    base_day = DATE_START + timedelta(days=random.randint(0, 120))
 
     if positive:
         query = {
+            "type": "lost",
             "item_name": base["item_name"],
             "description": random.choice(POS_TEMPLATES).format(item_name=base["item_name"], bits=render_bits(query_bits)),
             "category": base["category"],
             "location_found": random.choice(LOCATIONS),
+            "date_reported": random_report_date(base_day, 0, 2),
             "image_fingerprints": [],
         }
         candidate = {
             "id": f"cand-{random.randint(1000, 9999)}",
+            "type": "found",
             "item_name": base["item_name"],
             "description": random.choice(POS_TEMPLATES).format(item_name=base["item_name"], bits=render_bits(candidate_bits)),
             "category": base["category"],
             "location_found": random.choice(LOCATIONS),
+            "date_reported": random_report_date(base_day, 0, 5),
             "image_fingerprints": [],
         }
         return query, candidate, 1
 
-    other = random.choice([item for item in ITEM_LIBRARY if item["item_name"] != base["item_name"]])
+    same_category_pool = [
+        item for item in ITEM_LIBRARY
+        if item["item_name"] != base["item_name"] and item["category"] == base["category"]
+    ]
+    other_pool = same_category_pool if same_category_pool and random.random() < 0.7 else [
+        item for item in ITEM_LIBRARY if item["item_name"] != base["item_name"]
+    ]
+    other = random.choice(other_pool)
+    other_bits = sample_bits(other["description_bits"])
+    if random.random() < 0.55:
+        shared_bit = random.choice(base["description_bits"])
+        if shared_bit not in other_bits:
+            other_bits[-1] = shared_bit
+
     query = {
+        "type": "lost",
         "item_name": base["item_name"],
         "description": random.choice(NEG_TEMPLATES).format(item_name=base["item_name"], bits=render_bits(query_bits)),
         "category": base["category"],
         "location_found": random.choice(LOCATIONS),
+        "date_reported": random_report_date(base_day, 0, 2),
         "image_fingerprints": [],
     }
     candidate = {
         "id": f"cand-{random.randint(1000, 9999)}",
+        "type": "found",
         "item_name": other["item_name"],
-        "description": random.choice(NEG_TEMPLATES).format(item_name=other["item_name"], bits=render_bits(random.sample(other["description_bits"], k=min(3, len(other["description_bits"]))))),
+        "description": random.choice(NEG_TEMPLATES).format(item_name=other["item_name"], bits=render_bits(other_bits)),
         "category": other["category"],
         "location_found": random.choice(LOCATIONS),
+        "date_reported": random_report_date(base_day, 0 if same_category_pool and other in same_category_pool else 10, 5 if same_category_pool and other in same_category_pool else 45),
         "image_fingerprints": [],
     }
     return query, candidate, 0
@@ -91,11 +124,11 @@ def build_dataset() -> tuple[list[dict], list[int]]:
     rows: list[dict] = []
     labels: list[int] = []
     for item in ITEM_LIBRARY:
-        for _ in range(140):
+        for _ in range(180):
             q, c, y = make_example(item, True)
             rows.append(build_feature_row(q, c))
             labels.append(y)
-        for _ in range(180):
+        for _ in range(240):
             q, c, y = make_example(item, False)
             rows.append(build_feature_row(q, c))
             labels.append(y)

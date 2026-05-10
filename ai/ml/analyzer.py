@@ -329,6 +329,7 @@ def _cluster_negatives(
         themes.append({
             "theme_id": int(c),
             "size":     int(mask.sum()),
+            "share_of_negative": round(float(mask.sum() / n), 4),
             "keywords": kws,
         })
     themes.sort(key=lambda t: t["size"], reverse=True)
@@ -341,6 +342,130 @@ def _repr_quotes(raw_comments: list[str], mask: np.ndarray, k: int = 2) -> list[
         return []
     ranked = sorted(idx, key=lambda i: len(raw_comments[i]), reverse=True)
     return [raw_comments[i] for i in ranked[:k]]
+
+
+def _collapse_near_duplicates(
+    rows: list[dict],
+    cleaned_comments: list[str],
+    similarity_threshold: float = 0.96,
+) -> tuple[list[dict], list[str], int]:
+    if len(rows) < 2:
+        return rows, cleaned_comments, 0
+
+    unique_rows: list[dict] = []
+    unique_cleaned: list[str] = []
+    seen_exact: set[tuple[int, str]] = set()
+    duplicates_collapsed = 0
+
+    for row, cleaned in zip(rows, cleaned_comments):
+        key = (int(row["rating"]), cleaned)
+        if cleaned and key in seen_exact:
+            duplicates_collapsed += 1
+            continue
+        seen_exact.add(key)
+        unique_rows.append(row)
+        unique_cleaned.append(cleaned)
+
+    if len(unique_rows) < 2:
+        return unique_rows, unique_cleaned, duplicates_collapsed
+
+    try:
+        vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
+        X = vec.fit_transform(unique_cleaned)
+        sim = cosine_similarity(X)
+    except Exception:
+        return unique_rows, unique_cleaned, duplicates_collapsed
+
+    keep_indices: list[int] = []
+    merged: set[int] = set()
+    for i, row in enumerate(unique_rows):
+        if i in merged:
+            continue
+        keep_indices.append(i)
+        for j in range(i + 1, len(unique_rows)):
+            if j in merged:
+                continue
+            if int(unique_rows[j]["rating"]) != int(row["rating"]):
+                continue
+            if sim[i, j] >= similarity_threshold:
+                merged.add(j)
+                duplicates_collapsed += 1
+
+    deduped_rows = [unique_rows[i] for i in keep_indices]
+    deduped_cleaned = [unique_cleaned[i] for i in keep_indices]
+    return deduped_rows, deduped_cleaned, duplicates_collapsed
+
+
+def _analysis_quality(
+    total_responses: int,
+    usable_responses: int,
+    raw_usable_responses: int,
+    negative_count: int,
+    theme_count: int,
+    suggestion_count: int,
+    duplicates_collapsed: int,
+) -> dict:
+    usable_ratio = (usable_responses / total_responses) if total_responses else 0.0
+
+    if usable_responses >= 12:
+        sample_level = "strong"
+    elif usable_responses >= 6:
+        sample_level = "moderate"
+    elif usable_responses >= 3:
+        sample_level = "limited"
+    else:
+        sample_level = "very_limited"
+
+    if negative_count >= 8:
+        complaint_level = "strong"
+    elif negative_count >= 4:
+        complaint_level = "moderate"
+    elif negative_count >= 2:
+        complaint_level = "limited"
+    elif negative_count == 1:
+        complaint_level = "very_limited"
+    else:
+        complaint_level = "none"
+
+    if usable_responses < 3:
+        summary = (
+            "Very limited usable sample. Treat complaint themes and suggestions cautiously."
+        )
+    elif negative_count == 0:
+        summary = (
+            "No repeated negative signal was found, so improvement suggestions are intentionally conservative."
+        )
+    elif negative_count < 2:
+        summary = (
+            "Only one negative comment was found, so suggestions are withheld to avoid overclaiming."
+        )
+    elif negative_count < 4:
+        summary = (
+            "Suggestions are based on a small number of negative comments and should be treated as early signals."
+        )
+    elif usable_ratio < 0.6:
+        summary = (
+            "Several comments were too short or noisy to use, so insights reflect only the clearer feedback."
+        )
+    elif duplicates_collapsed > 0:
+        summary = (
+            "Repeated or near-duplicate comments were merged so the insights reflect unique feedback patterns more fairly."
+        )
+    else:
+        summary = (
+            "Insights are backed by repeated feedback patterns from a solid usable sample."
+        )
+
+    return {
+        "sample_level": sample_level,
+        "negative_evidence_level": complaint_level,
+        "usable_ratio": round(float(usable_ratio), 4),
+        "raw_usable_responses": int(raw_usable_responses),
+        "duplicates_collapsed": int(duplicates_collapsed),
+        "clustering_reliable": bool(negative_count >= 3 and theme_count > 0),
+        "suggestions_reliable": bool(negative_count >= 2 and suggestion_count > 0),
+        "summary": summary,
+    }
 
 
 class FeedbackAnalyzer:
@@ -404,9 +529,12 @@ class FeedbackAnalyzer:
                 ),
             }
 
+        raw_usable_responses = len(rows)
+        cleaned_initial = [preprocess_for_tfidf(r["comment"]) for r in rows]
+        rows, cleaned, duplicates_collapsed = _collapse_near_duplicates(rows, cleaned_initial)
+
         ratings      = np.array([r["rating"] for r in rows])
         raw_comments = [r["comment"] for r in rows]
-        cleaned      = [preprocess_for_tfidf(c) for c in raw_comments]
         token_lists  = [c.split() for c in cleaned]
 
         # ── Vectorise ─────────────────────────────────────────────────────
@@ -488,18 +616,38 @@ class FeedbackAnalyzer:
         sample_complaints = _repr_quotes(raw_comments, neg_mask)
 
         # ── Suggestions ───────────────────────────────────────────────────
+        negative_count = int(neg_mask.sum())
         complaint_kw_flat = [t["keyword"] for t in top_complaints]
         cluster_kw        = [t["keywords"] for t in complaint_themes]
-        suggestions       = generate_suggestions(complaint_kw_flat, cluster_kw)
+        if negative_count >= 2:
+            suggestions = generate_suggestions(
+                complaint_kw_flat,
+                cluster_kw,
+                max_suggestions=5 if negative_count >= 4 else 2,
+                min_hit_count=2 if negative_count >= 6 else 1,
+            )
+        else:
+            suggestions = []
 
         # ── Rating distribution ───────────────────────────────────────────
         dist = Counter(int(r) for r in ratings)
         rating_distribution = {str(i): int(dist.get(i, 0)) for i in range(1, 6)}
+        analysis_quality = _analysis_quality(
+            total_responses=int(len(feedback)),
+            usable_responses=int(len(rows)),
+            raw_usable_responses=int(raw_usable_responses),
+            negative_count=negative_count,
+            theme_count=len(complaint_themes),
+            suggestion_count=len(suggestions),
+            duplicates_collapsed=int(duplicates_collapsed),
+        )
 
         return {
             "event_title": event_title,
             "total_responses":  int(len(feedback)),
             "usable_responses": int(len(rows)),
+            "raw_usable_responses": int(raw_usable_responses),
+            "duplicate_comments_collapsed": int(duplicates_collapsed),
             "average_rating":   round(float(ratings.mean()), 2),
             "rating_distribution": rating_distribution,
             "sentiment_breakdown": {
@@ -513,6 +661,7 @@ class FeedbackAnalyzer:
             "sample_praise_quotes":    sample_praises,
             "sample_complaint_quotes": sample_complaints,
             "suggestions": suggestions,
+            "analysis_quality": analysis_quality,
             "model_info": {
                 "vectorizer":    f"TfidfVectorizer (vocab_source={vocab_source})",
                 "clustering":    "KMeans (auto k=2–3, seed=42)",
