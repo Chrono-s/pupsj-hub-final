@@ -39,6 +39,16 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+# Load environment variables early so Hugging Face and ML configurations are active before imports
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+# Suppress Hugging Face unauthenticated requests and hub warnings
+try:
+    from huggingface_hub import logging as hf_logging
+    hf_logging.set_verbosity_error()
+except ImportError:
+    pass
+
 # Optional ML imports
 try:
     from PIL import Image
@@ -53,8 +63,6 @@ try:
 except ImportError:
     sentence_transformers_available = False
     SentenceTransformer = None
-
-load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -292,7 +300,7 @@ _SYSTEM = (
     "5. Use bullet points, numbered lists, or bold headers to organize answers with 3+ points.\n"
     "6. For app navigation questions, give specific step-by-step instructions "
     "(e.g., 'Open the sidebar ☰ → tap \"Event Calendar\" → click a date with a dot').\n"
-    "7. Be concise for simple questions; be thorough and comprehensive for complex ones.\n"
+    "7. Always be thorough and comprehensive in your answers. Do not summarize or omit important details from the context.\n"
     "8. If the question mixes app navigation AND handbook policy, answer both parts.\n"
     "9. Never invent dates, times, rooms, file names, office hours, requirements, or event details. "
     "If a detail is missing from the provided context, say it is not available.\n"
@@ -748,7 +756,7 @@ async def _groq(prompt: str) -> str:
                     "model": GROQ_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": GROQ_TEMPERATURE,
-                    "max_tokens": 1024,
+                    "max_tokens": 4096,
                 },
             )
             if r.status_code == 429 and attempt == 0:
@@ -770,7 +778,7 @@ async def _gemini(prompt: str) -> str:
                         "temperature": GEMINI_TEMPERATURE,
                         "topP": 0.2,
                         "topK": 20,
-                        "maxOutputTokens": 1024,
+                        "maxOutputTokens": 4096,
                     },
                 },
             )

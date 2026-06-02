@@ -70,6 +70,7 @@ const uploadLostFound = multer({ storage: createStorage('lostfound'), fileFilter
 const uploadEvent = multer({ storage: createStorage('events'), fileFilter, limits });
 const uploadFeedback = multer({ storage: createStorage('feedback'), fileFilter, limits });
 const uploadDocument = multer({ storage: createStorage('documents'), fileFilter: documentFileFilter, limits: { fileSize: 25 * 1024 * 1024 } }); // 25MB for documents
+const uploadSystem = multer({ storage: createStorage('system'), fileFilter, limits });
 
 // CSV upload — uses memory storage (no file kept on disk, we parse and discard)
 function csvFileFilter(req, file, cb) {
@@ -81,5 +82,7 @@ function csvFileFilter(req, file, cb) {
   else cb(new Error('Only CSV files are allowed. Save your Excel sheet as CSV (File → Save As → CSV).'), false);
 }
 const uploadCsv = multer({ storage: multer.memoryStorage(), fileFilter: csvFileFilter, limits: { fileSize: 2 * 1024 * 1024 } }); // 2MB
+const uploadPages = multer({ storage: createStorage('pages'), fileFilter, limits });
 
-module.exports = { uploadAnnouncement, uploadLostFound, uploadEvent, uploadFeedback, uploadDocument, uploadCsv, uploadProfile };
+module.exports = { uploadAnnouncement, uploadLostFound, uploadEvent, uploadFeedback, uploadDocument, uploadCsv, uploadProfile, uploadSystem, uploadPages };
+

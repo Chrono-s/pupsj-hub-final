@@ -83,11 +83,16 @@ def tokenize(value: str) -> list[str]:
 def overlap(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
-    return len(left & right) / max(len(left), len(right))
+    denom = max(len(left), len(right))
+    if denom == 0:
+        return 0.0
+    return len(left & right) / denom
 
 
 def coverage(left: set[str], right: set[str]) -> float:
     if not left:
+        return 0.0
+    if len(left) == 0:
         return 0.0
     return len(left & right) / len(left)
 
@@ -114,13 +119,16 @@ def parse_fingerprint(raw: str) -> dict[str, Any]:
 def hex_to_bits(value: str) -> str:
     if not value:
         return ""
-    return "".join(bin(int(char, 16))[2:].zfill(4) for char in value)
+    try:
+        return "".join(bin(int(char, 16))[2:].zfill(4) for char in value)
+    except (ValueError, TypeError):
+        return ""
 
 
 def hamming_similarity(left: str, right: str) -> float:
     left_bits = hex_to_bits(left)
     right_bits = hex_to_bits(right)
-    if not left_bits or not right_bits or len(left_bits) != len(right_bits):
+    if not left_bits or not right_bits or len(left_bits) != len(right_bits) or len(left_bits) == 0:
         return 0.0
     diff = sum(1 for a, b in zip(left_bits, right_bits) if a != b)
     return 1.0 - (diff / len(left_bits))

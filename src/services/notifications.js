@@ -38,7 +38,7 @@ async function getAdminUserIds(db) {
   const result = await db.query(
     `SELECT id
      FROM users
-     WHERE role = 'admin'
+     WHERE role IN ('admin', 'superadmin')
        AND is_active = TRUE`
   );
   return result.rows.map((row) => row.id);

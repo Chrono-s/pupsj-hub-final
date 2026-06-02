@@ -4,8 +4,8 @@
   "description": "PUP San Juan Campus Hub - Announcements, Events, Lost & Found, Schedules",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#800000",
-  "theme_color": "#800000",
+  "background_color": "#880808",
+  "theme_color": "#880808",
   "orientation": "portrait",
   "icons": [
     {

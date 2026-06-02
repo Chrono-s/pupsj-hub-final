@@ -10,8 +10,8 @@ taskkill /F /FI "WINDOWTITLE eq PUPSJ HUB AI"     /T >nul 2>&1
 for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":3000 "') do (
     taskkill /F /PID %%p >nul 2>&1
 )
-:: Free port 8000 (AI sidecar)
-for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8000 "') do (
+:: Free port 8001 (AI sidecar)
+for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":8001 "') do (
     taskkill /F /PID %%p >nul 2>&1
 )
 

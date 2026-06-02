@@ -38,6 +38,7 @@ app.use(
           "'unsafe-inline'",
           'https://cdnjs.cloudflare.com',
           'https://cdn.jsdelivr.net',
+          'https://cdn.sheetjs.com',
         ],
         scriptSrcAttr: ["'unsafe-inline'"], // required: app.js uses onclick="..." handlers
         styleSrc: [
@@ -201,7 +202,7 @@ const WAF_PATTERNS = [
   /\bunion\s+select\b/i,
   /\bselect\s+.*\s+from\s+information_schema\b/i,
   /\bor\s+1\s*=\s*1\b/i,
-  /\.\.(\/|\\){2,}/,              // path traversal
+  /\.\.(?:\/|\\)/,              // path traversal
 ];
 function wafScan(value) {
   if (typeof value !== 'string') return false;
@@ -307,19 +308,70 @@ app.use(
 // ─────────────────────────────────────────────────────────────
 //  API ROUTES
 // ─────────────────────────────────────────────────────────────
+app.get('/api/system-settings', async (req, res) => {
+  const pool = require('./config/database');
+  try {
+    const result = await pool.query('SELECT key, value FROM system_settings');
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.key] = row.value;
+    });
+    res.json(settings);
+  } catch (err) {
+    console.error('Fetch system settings error:', err);
+    res.status(500).json({ error: 'Failed to fetch system settings' });
+  }
+});
+
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/notifications', require('./routes/notifications'));
+
+// ── TEST EMAIL ENDPOINT (Remove after debugging) ─────────────────────────────
+app.get('/api/test-email', async (req, res) => {
+  const { sendVerificationEmail } = require('./services/email');
+  const testEmail = req.query.email || 'test@example.com';
+  try {
+    console.log(`[Test] Attempting to send test email to ${testEmail}...`);
+    await sendVerificationEmail(testEmail, 'Test User', 'test-token-123');
+    res.json({ 
+      success: true, 
+      message: `Test email sent to ${testEmail}. Check server logs for confirmation.`,
+      config: {
+        host: process.env.EMAIL_HOST,
+        port: process.env.EMAIL_PORT,
+        user: process.env.EMAIL_USER,
+        from: process.env.EMAIL_FROM,
+        passSet: !!process.env.EMAIL_PASS
+      }
+    });
+  } catch (err) {
+    console.error('[Test] Email test failed:', err.message);
+    res.status(500).json({ 
+      error: 'Email test failed', 
+      details: err.message,
+      config: {
+        host: process.env.EMAIL_HOST,
+        port: process.env.EMAIL_PORT,
+        user: process.env.EMAIL_USER,
+        from: process.env.EMAIL_FROM,
+        passSet: !!process.env.EMAIL_PASS
+      }
+    });
+  }
+});
 app.use('/api/announcements', require('./routes/announcements'));
 app.use('/api/events', require('./routes/events'));
 app.use('/api/lost-found', require('./routes/lostfound'));
 app.use('/api/feedback', require('./routes/feedback'));
 app.use('/api/schedules', require('./routes/schedules'));
+app.use('/api/loading', require('./routes/loading'));
 app.use('/api/chatbot', require('./routes/chatbot'));
 app.use('/api/admin', require('./routes/admin'));
 app.use('/api/documents', require('./routes/documents'));
 app.use('/api/faculty-schedules', require('./routes/facultySchedules'));
 app.use('/api/faculty', require('./routes/faculty'));
 app.use('/api/section-schedules', require('./routes/sectionSchedules'));
+app.use('/api/pages', require('./routes/pages'));
 
 // API 404 — any /api/* route that wasn't matched returns JSON (never HTML)
 app.use('/api', (req, res) => {
@@ -363,8 +415,21 @@ app.use((err, req, res, next) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-//  STARTUP
+//  STARTUP & MIGRATIONS
 // ─────────────────────────────────────────────────────────────
+const pool = require('./config/database');
+Promise.all([
+  pool.query('ALTER TABLE lost_found ADD COLUMN IF NOT EXISTS date_lost_found DATE DEFAULT CURRENT_DATE;'),
+  pool.query('ALTER TABLE lost_found ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;'),
+  pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;'),
+  pool.query('ALTER TABLE lost_found DROP CONSTRAINT IF EXISTS lost_found_status_check;'),
+  pool.query("ALTER TABLE lost_found ADD CONSTRAINT lost_found_status_check CHECK (status IN ('open', 'matched', 'claimed', 'resolved', 'closed', 'deleted'));")
+]).then(() => {
+  console.log('Database auto-migrations successfully completed.');
+}).catch(err => {
+  console.error('Database auto-migration warning:', err.message);
+});
+
 app.listen(PORT, () => {
   console.log(`PUPSJ HUB Server running on http://localhost:${PORT}`);
   console.log(`   Mode: ${IS_PROD ? 'PRODUCTION' : 'development'}`);

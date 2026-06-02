@@ -1,4 +1,4 @@
-const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8000';
+const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8001';
 const MATCH_PANEL_MIN_SCORE = 35;
 
 const STOP_WORDS = new Set([
@@ -74,18 +74,37 @@ function computeHeuristicMatchScore(item1, item2) {
   const category2 = normalizeLooseText(item2.category);
   if (category1 && category2) {
     if (category1 === category2) score += 35;
-    else score -= 12;
+    else score -= 5;
   }
 
   const name1 = extractKeywords(item1.item_name || '');
   const name2 = extractKeywords(item2.item_name || '');
+  const desc1 = extractKeywords(item1.description || '');
+  const desc2 = extractKeywords(item2.description || '');
+
+  // Name direct matching
   const nameCommon = intersection(name1, name2);
   score += Math.min(nameCommon.length * 25, 50);
 
-  const desc1 = extractKeywords(item1.description || '');
-  const desc2 = extractKeywords(item2.description || '');
+  // Description direct matching
   const descCommon = intersection(desc1, desc2);
   score += Math.min(descCommon.length * 6, 30);
+
+  // Cross-matching name words in the other item's total words (name + description)
+  const words1 = new Set([...name1, ...desc1]);
+  const words2 = new Set([...name2, ...desc2]);
+
+  const name1InItem2 = name1.filter(w => words2.has(w));
+  const name2InItem1 = name2.filter(w => words1.has(w));
+  if (name1InItem2.length > 0 || name2InItem1.length > 0) {
+    score += 20; // Cross-match bonus (e.g. name of one is mentioned in description of other)
+  }
+
+  // Any common words across name/description (overall overlap)
+  const overallCommon = intersection([...words1], [...words2]);
+  if (overallCommon.length > 0) {
+    score += Math.min(overallCommon.length * 15, 50);
+  }
 
   score += attributeOverlapScore(
     extractAttributeTokens(item1, COLOR_WORDS),
@@ -119,7 +138,9 @@ function computeHeuristicMatchScore(item1, item2) {
     score += Math.min(locCommon.length * 12, 20);
   }
 
-  const daysApart = daysBetween(item1.date_reported, item2.date_reported);
+  const date1 = item1.date_lost_found || item1.date_reported || item1.created_at;
+  const date2 = item2.date_lost_found || item2.date_reported || item2.created_at;
+  const daysApart = daysBetween(date1, date2);
   if (daysApart != null) {
     if (daysApart <= 3) score += 10;
     else if (daysApart <= 7) score += 6;
@@ -162,6 +183,7 @@ function imagePathsFor(item) {
     .filter(Boolean);
 }
 
+// Ensure proper value constraints
 function clamp01(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return 0;
@@ -260,6 +282,7 @@ async function rankLostFoundCandidates(target, candidates, options = {}) {
         imagePairScores.set(String(row.id), clamp01(row.image_to_image));
       }
     }
+
   } catch (err) {
     console.warn('[lostfound] Vision matcher unavailable:', err.message);
   }
@@ -277,32 +300,18 @@ async function rankLostFoundCandidates(target, candidates, options = {}) {
         && normalizeLooseText(normalizedTarget.category) !== normalizeLooseText(candidate.category);
 
       let combined = heuristicRaw;
-      if (imageAnalysisUsed && typeof structuredRaw === 'number' && typeof visionRaw === 'number') {
-        combined = (structuredRaw * 0.45) + (imagePairRaw * 0.40) + (visionRaw * 0.10) + (heuristicRaw * 0.05);
-      } else if (imageAnalysisUsed && typeof structuredRaw === 'number') {
-        combined = (structuredRaw * 0.55) + (imagePairRaw * 0.35) + (heuristicRaw * 0.10);
-      } else if (imageAnalysisUsed) {
-        combined = (imagePairRaw * 0.70) + (visionRaw * 0.15) + (heuristicRaw * 0.15);
-      } else if (typeof structuredRaw === 'number' && typeof visionRaw === 'number') {
-        combined = (structuredRaw * 0.65) + (visionRaw * 0.25) + (heuristicRaw * 0.10);
-      } else if (typeof structuredRaw === 'number') {
-        combined = (structuredRaw * 0.80) + (heuristicRaw * 0.20);
-      } else if (typeof visionRaw === 'number') {
-        combined = (visionRaw * 0.45) + (heuristicRaw * 0.55);
+      if (typeof structuredRaw === 'number') {
+        combined = Math.max(combined, structuredRaw);
       }
-
+      if (typeof visionRaw === 'number') {
+        combined = Math.max(combined, visionRaw);
+      }
       if (imageAnalysisUsed && typeof imagePairRaw === 'number') {
-        const textSignalStrong = heuristicRaw >= 0.55 || (typeof structuredRaw === 'number' && structuredRaw >= 0.6);
-        if (imagePairRaw >= 0.82 && textSignalStrong) combined += 0.05;
-        if (imagePairRaw <= 0.2 && textSignalStrong) combined -= 0.12;
+        combined = Math.max(combined, imagePairRaw);
       }
 
-      if (typeof structuredRaw === 'number' && typeof visionRaw === 'number' && structuredRaw >= 0.7 && visionRaw >= 0.7) {
-        combined += 0.04;
-      }
-
-      if (categoryMismatch && !(imageAnalysisUsed && imagePairRaw >= 0.85)) {
-        combined -= 0.08;
+      if (categoryMismatch && combined < 0.6) {
+        combined -= 0.05;
       }
 
       const normalizedScore = round4(combined);

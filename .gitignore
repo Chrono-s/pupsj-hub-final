@@ -137,3 +137,44 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# =========================================================================
+# PUPSJ HUB AI, Python & Local Overrides (CRITICAL)
+# =========================================================================
+# Python Virtual Environments & Pycache
+ai.venv/
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+ai/**/__pycache__/
+ai/**/*.pyc
+
+# Local AI Models (Pickles generated during training)
+ai/models/*.pkl
+
+# Local sidecar execution logs
+ai/sidecar.log
+
+# User Uploads Directories (Do NOT commit user uploaded media)
+public/uploads/announcements/
+public/uploads/documents/
+public/uploads/events/
+public/uploads/lostfound/
+public/uploads/pages/
+public/uploads/profiles/
+public/uploads/system/
+
+# Local backup, temporary, and patch helper files
+*.bak
+public/js/app.js.bak
+temp_head_app.js
+temp_index_app.js
+patch_*.js
+fix_css.py
+{public/
+restore.py

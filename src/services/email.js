@@ -1,59 +1,75 @@
 /**
- * Email Service — PUPSJ HUB
- * Uses Nodemailer with Gmail SMTP (or logs to console in dev/no-config mode).
- *
- * Required .env variables:
- *   EMAIL_HOST   (e.g. smtp.gmail.com)
- *   EMAIL_PORT   (e.g. 587)
- *   EMAIL_USER   (your Gmail address)
- *   EMAIL_PASS   (Gmail App Password — NOT your regular password)
- *   EMAIL_FROM   (e.g. "PUPSJ HUB <noreply@pupsj.edu.ph>")
- *   APP_URL      (e.g. http://localhost:3000)
- *
- * If EMAIL_USER / EMAIL_PASS are not set, emails are printed to console
- * (handy for local development without a mail server).
+ * Email Service - PUPSJ HUB
+ * Uses Nodemailer with Gmail SMTP, or logs emails locally in development.
  */
 
 const nodemailer = require('nodemailer');
 
-const APP_URL  = process.env.APP_URL  || 'http://localhost:3000';
-const FROM     = process.env.EMAIL_FROM || 'PUPSJ HUB <noreply@pupsj.edu.ph>';
-const devMode  = !process.env.EMAIL_USER || !process.env.EMAIL_PASS;
+const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+const FROM = process.env.EMAIL_FROM || 'PUPSJ HUB <noreply@pupsj.edu.ph>';
+const EMAIL_HOST = process.env.EMAIL_HOST || 'smtp.gmail.com';
+const EMAIL_PORT = parseInt(process.env.EMAIL_PORT || '587', 10);
+const EMAIL_USER = (process.env.EMAIL_USER || '').trim();
+const EMAIL_PASS = (process.env.EMAIL_PASS || '').trim();
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const hasSmtpCredentials = Boolean(EMAIL_USER && EMAIL_PASS);
+const devMode = !hasSmtpCredentials && NODE_ENV !== 'production';
 
-let transporter;
+let transporter = null;
 
 if (devMode) {
-  // Console-only "transport" for development/testing
-  transporter = null;
-  console.log('[Email] No EMAIL_USER/EMAIL_PASS found — email will be logged to console only.');
+  console.log('[Email] No EMAIL_USER/EMAIL_PASS found - email will be logged to console only.');
+} else if (!hasSmtpCredentials) {
+  console.error('[Email] SMTP is not configured. Set EMAIL_USER and EMAIL_PASS to send real emails.');
 } else {
+  console.log(`[Email] Configuring SMTP: ${EMAIL_HOST}:${EMAIL_PORT} (User: ${EMAIL_USER})`);
   transporter = nodemailer.createTransport({
-    host:   process.env.EMAIL_HOST || 'smtp.gmail.com',
-    port:   parseInt(process.env.EMAIL_PORT || '587', 10),
-    secure: process.env.EMAIL_PORT === '465',
+    host: EMAIL_HOST,
+    port: EMAIL_PORT,
+    secure: EMAIL_PORT === 465,
     auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS,
+      user: EMAIL_USER,
+      pass: EMAIL_PASS,
     },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+  });
+
+  transporter.verify((error) => {
+    if (error) {
+      console.error('[Email] SMTP Connection Error:', error.message);
+      if (error.message.includes('Invalid login') || error.message.includes('Username and Password not accepted')) {
+        console.error('[Email] TIP: If using Gmail, you must use an App Password, not your regular password.');
+      }
+    } else {
+      console.log('[Email] SMTP server is ready to take our messages');
+    }
   });
 }
 
-/**
- * Internal send helper. Falls back to console.log in devMode.
- */
 async function sendMail({ to, subject, html, text }) {
-  if (devMode || !transporter) {
+  if (devMode) {
     console.log('\n========================================');
     console.log(`[Email DEV] TO: ${to}`);
     console.log(`[Email DEV] SUBJECT: ${subject}`);
     console.log(`[Email DEV] TEXT:\n${text || html}`);
     console.log('========================================\n');
-    return;
+    return { success: true, mode: 'dev' };
   }
-  await transporter.sendMail({ from: FROM, to, subject, html, text });
-}
 
-// ─── Email Templates ───────────────────────────────────────────────────────
+  if (!transporter) {
+    throw new Error('Email delivery is not configured. Set EMAIL_USER and EMAIL_PASS in the environment.');
+  }
+
+  try {
+    const info = await transporter.sendMail({ from: FROM, to, subject, html, text });
+    console.log(`[Email] Sent to ${to}: ${info.messageId}`);
+    return { success: true, messageId: info.messageId };
+  } catch (error) {
+    console.error(`[Email] Error sending to ${to}:`, error.message);
+    throw error;
+  }
+}
 
 function baseLayout(body) {
   return `
@@ -86,16 +102,13 @@ function baseLayout(body) {
       </div>
       <div class="body">${body}</div>
       <div class="ftr">
-        &copy; ${new Date().getFullYear()} PUPSJ HUB — Polytechnic University of the Philippines San Juan Campus
+        &copy; ${new Date().getFullYear()} PUPSJ HUB - Polytechnic University of the Philippines San Juan Campus
       </div>
     </div>
   </body>
   </html>`;
 }
 
-/**
- * Send email verification email after registration.
- */
 async function sendVerificationEmail(toEmail, firstName, token) {
   const link = `${APP_URL}/?verify=${token}`;
   await sendMail({
@@ -114,9 +127,6 @@ async function sendVerificationEmail(toEmail, firstName, token) {
   });
 }
 
-/**
- * Send password reset email.
- */
 async function sendPasswordResetEmail(toEmail, firstName, token) {
   const link = `${APP_URL}/?reset=${token}`;
   await sendMail({
@@ -135,4 +145,31 @@ async function sendPasswordResetEmail(toEmail, firstName, token) {
   });
 }
 
-module.exports = { sendVerificationEmail, sendPasswordResetEmail };
+async function sendWelcomeAdminEmail(toEmail, firstName, password) {
+  await sendMail({
+    to: toEmail,
+    subject: 'Welcome to PUPSJ HUB - Admin Account Created',
+    text: `Hello ${firstName},\n\nYour admin account for PUPSJ HUB has been created successfully!\n\nHere are your login credentials:\nEmail: ${toEmail}\nPassword: ${password}\n\nYou can log in directly at: ${APP_URL}\n\nPlease keep your credentials secure.`,
+    html: baseLayout(`
+      <p>Hi <strong>${firstName}</strong>,</p>
+      <p>Welcome to <strong>PUPSJ HUB</strong>! A standard <strong>Admin</strong> account has been created for you by the Super Admin.</p>
+      <p>Here are your secure credentials to log in:</p>
+      <table style="width: 100%; border-collapse: collapse; margin: 20px 0; background: #fafafa; border: 1px solid #eaeaea;">
+        <tr>
+          <td style="padding: 12px; border-bottom: 1px solid #eaeaea; font-weight: bold; width: 120px;">Email:</td>
+          <td style="padding: 12px; border-bottom: 1px solid #eaeaea;">${toEmail}</td>
+        </tr>
+        <tr>
+          <td style="padding: 12px; font-weight: bold;">Password:</td>
+          <td style="padding: 12px; font-family: monospace; font-size: 16px; font-weight: bold; color: #880808;">${password}</td>
+        </tr>
+      </table>
+      <div class="btn-wrap">
+        <a class="btn" href="${APP_URL}">Log In Now</a>
+      </div>
+      <p>Please make sure to change your password in your Profile once logged in to keep your account secure.</p>
+    `),
+  });
+}
+
+module.exports = { sendVerificationEmail, sendPasswordResetEmail, sendWelcomeAdminEmail };

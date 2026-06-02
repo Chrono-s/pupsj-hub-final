@@ -10,6 +10,11 @@ const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8000';
 // Get feedback for an event (with images)
 router.get('/event/:eventId', authenticateToken, async (req, res) => {
   try {
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(req.params.eventId)) {
+      return res.json([]);
+    }
+
     const result = await pool.query(
       `SELECT f.*, u.first_name || ' ' || u.last_name as user_name,
         u.first_name, u.last_name, u.profile_image as user_profile_image,
@@ -35,6 +40,11 @@ router.get('/event/:eventId', authenticateToken, async (req, res) => {
 // AI insights for an event's feedback (admin or event author only)
 router.get('/event/:eventId/insights', authenticateToken, async (req, res) => {
   try {
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(req.params.eventId)) {
+      return res.json({});
+    }
+
     const eventResult = await pool.query(
       'SELECT title, author_id FROM events WHERE id = $1',
       [req.params.eventId]
@@ -67,6 +77,9 @@ router.get('/event/:eventId/insights', authenticateToken, async (req, res) => {
     if (err.name === 'TimeoutError') {
       return res.status(504).json({ error: 'AI analysis timed out. Try again.' });
     }
+    if (err.code === 'ECONNREFUSED' || err.message?.includes('fetch failed')) {
+      return res.status(503).json({ error: 'AI Insights sidecar is currently offline. Please try again later.' });
+    }
     res.status(500).json({ error: 'Failed to generate insights' });
   }
 });
@@ -74,6 +87,11 @@ router.get('/event/:eventId/insights', authenticateToken, async (req, res) => {
 // Get feedback summary for an event
 router.get('/event/:eventId/summary', authenticateToken, async (req, res) => {
   try {
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(req.params.eventId)) {
+      return res.json({ total: 0, average_rating: 0, positive: 0, neutral: 0, negative: 0 });
+    }
+
     const result = await pool.query(
       `SELECT
         COUNT(*) as total,
@@ -100,8 +118,13 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
     if (!r || r < 1 || r > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
     if (!event_id) return res.status(400).json({ error: 'event_id is required' });
 
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(event_id)) {
+      return res.status(400).json({ error: 'Invalid event ID' });
+    }
+
     const eventCheck = await pool.query(
-      `SELECT id, title, author_id
+      `SELECT id, title, author_id, event_date, start_time, end_time
        FROM events
        WHERE id = $1
          AND status != $2`,
@@ -113,19 +136,33 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
 
     const event = eventCheck.rows[0];
 
-    const duplicateCheck = await pool.query(
-      `SELECT id
-       FROM feedback
-       WHERE user_id = $1
-         AND event_id = $2
-         AND rating = $3
-         AND COALESCE(TRIM(comment), '') = $4
-         AND created_at >= NOW() - INTERVAL '24 hours'
-       LIMIT 1`,
-      [req.user.id, event_id, r, normalizedComment]
+    // Enforce feedback concluded time check
+    const d = new Date(event.event_date);
+    const datePart = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    let targetTime = event.end_time || event.start_time || '23:59:59';
+    if (targetTime.split(':').length === 2) {
+      targetTime += ':00';
+    }
+    const eventDateTime = new Date(`${datePart}T${targetTime}`);
+    if (new Date() < eventDateTime) {
+      return res.status(400).json({ error: 'Feedback can only be submitted after the event has concluded' });
+    }
+    const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+    if (new Date() - eventDateTime > threeDaysMs) {
+      return res.status(400).json({ error: 'Feedback submission period is closed. Reviews are only accepted within 3 days after the event has concluded.' });
+    }
+
+    // Enforce exactly one feedback per event per student/faculty
+    if (req.user.role !== 'student' && req.user.role !== 'faculty') {
+      return res.status(403).json({ error: 'Only students and faculty can submit feedback' });
+    }
+
+    const dupCheck = await pool.query(
+      `SELECT id FROM feedback WHERE user_id = $1 AND event_id = $2`,
+      [req.user.id, event_id]
     );
-    if (duplicateCheck.rows.length) {
-      return res.status(409).json({ error: 'Duplicate feedback detected. Please edit your existing feedback instead.' });
+    if (dupCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'You have already submitted feedback for this event' });
     }
 
     let sentiment = 'neutral';
@@ -172,6 +209,10 @@ router.post('/', authenticateToken, uploadFeedback.array('images', 5), async (re
 router.patch('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(404).json({ error: 'Feedback not found' });
+    }
     const { rating, comment } = req.body;
     const r = parseInt(rating);
     if (!r || r < 1 || r > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
@@ -181,6 +222,8 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     if (check.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
+
+    // Removed check: students/faculty can always edit/delete their own feedback at any time after submission
 
     let sentiment = 'neutral';
     if (r >= 4) sentiment = 'positive';
@@ -201,11 +244,17 @@ router.patch('/:id', authenticateToken, async (req, res) => {
 router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const UUID_REGEX = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (!UUID_REGEX.test(id)) {
+      return res.status(404).json({ error: 'Feedback not found' });
+    }
     const check = await pool.query('SELECT user_id FROM feedback WHERE id = $1', [id]);
     if (check.rows.length === 0) return res.status(404).json({ error: 'Feedback not found' });
     if (check.rows[0].user_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
+
+    // Removed check: students/faculty can always edit/delete their own feedback at any time after submission
     await pool.query('DELETE FROM feedback WHERE id = $1', [id]);
     res.json({ message: 'Feedback deleted' });
   } catch (err) {

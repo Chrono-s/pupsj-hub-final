@@ -36,7 +36,7 @@ MODEL_DIR              = Path(__file__).resolve().parent.parent / "models"
 SENTIMENT_MODEL_PATH   = MODEL_DIR / "sentiment_model.pkl"
 GLOBAL_TFIDF_PATH      = MODEL_DIR / "global_feedback_tfidf.pkl"
 
-MIN_COMMENT_TOKENS = 3   # skip comments that clean to fewer tokens
+MIN_COMMENT_TOKENS = 1   # skip comments that clean to fewer tokens
 
 # Blocklist: obvious non-feedback strings
 _SPAM_BLOCKLIST = {
@@ -63,8 +63,8 @@ def _is_real_feedback(raw: str) -> bool:
     alpha_chars = [c for c in stripped if c.isalpha()]
     total_chars = [c for c in stripped if not c.isspace()]
 
-    # Must have at least 4 alphabetic characters
-    if len(alpha_chars) < 4:
+    # Must have at least 3 alphabetic characters
+    if len(alpha_chars) < 3:
         return False
 
     # Alpha characters must make up at least 40% of non-whitespace content

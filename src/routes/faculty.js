@@ -9,7 +9,7 @@ router.get('/list', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT id, first_name, last_name, department
        FROM users
-       WHERE role IN ('faculty', 'admin') AND is_active = TRUE AND is_verified = TRUE
+       WHERE role = 'faculty' AND is_active = TRUE AND is_verified = TRUE
        ORDER BY last_name ASC, first_name ASC`
     );
     res.json(result.rows);
@@ -36,22 +36,31 @@ router.get('/locations', authenticateToken, async (req, res) => {
         CASE
           WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW()
             THEN 'unavailable'
-          ELSE COALESCE(u.faculty_status, 'unavailable')
+          ELSE TRIM(COALESCE(u.faculty_status, 'unavailable'))
         END AS status,
-        u.faculty_status_room AS room,
-        u.faculty_status_note AS note,
-        u.faculty_status_until AS until_time,
+        CASE
+          WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW() THEN NULL
+          ELSE u.faculty_status_room
+        END AS room,
+        CASE
+          WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW() THEN NULL
+          ELSE u.faculty_status_note
+        END AS note,
+        CASE
+          WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW() THEN NULL
+          ELSE u.faculty_status_until
+        END AS until_time,
         u.faculty_status_updated_at AS updated_at
       FROM users u
-      WHERE u.role IN ('faculty', 'admin')
+      WHERE u.role = 'faculty'
         AND u.is_active = TRUE
         AND u.is_verified = TRUE
       ORDER BY
         CASE
           WHEN u.faculty_status_until IS NOT NULL AND u.faculty_status_until < NOW() THEN 3
-          WHEN u.faculty_status = 'in_class' THEN 0
-          WHEN u.faculty_status = 'in_office' THEN 1
-          WHEN u.faculty_status = 'available' THEN 2
+          WHEN TRIM(u.faculty_status) = 'in_class' THEN 0
+          WHEN TRIM(u.faculty_status) = 'in_office' THEN 1
+          WHEN TRIM(u.faculty_status) = 'available' THEN 2
           ELSE 3
         END,
         u.last_name ASC, u.first_name ASC

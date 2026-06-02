@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadCsv } = require('../middleware/upload');
 const VALID_YEAR_LEVELS = ['1st', '2nd', '3rd', '4th'];
 const VALID_SECTIONS = ['1-1','1-2','1-3','2-1','2-2','2-3','3-1','3-2','3-3','4-1','4-2','4-3'];
@@ -131,6 +131,253 @@ function isPupFormat(headers) {
   return headers.includes('schedule') && headers.includes('description');
 }
 
+// Get schedules and embeds
+router.get('/embeds', authenticateToken, async (req, res) => {
+  try {
+    const { department: filterDept, section: filterSect } = req.query;
+    const filterYear = normalizeYearLevel(req.query.year_level);
+
+    // 1. Fetch class schedules (table view) using identical logic to GET /
+    let schedules = [];
+    if (req.user.role === 'student') {
+      const userRes = await pool.query('SELECT department, year_level, section FROM users WHERE id = $1', [req.user.id]);
+      const dbUser = userRes.rows[0] || {};
+      const searchDept = (dbUser.department || req.user.department || '').trim();
+      const searchYear = (dbUser.year_level || req.user.year_level || '').trim();
+      const searchSect = (dbUser.section || req.user.section || '').trim();
+
+      const query = `
+        SELECT * FROM (
+          SELECT cs.id::TEXT, cs.subject_code::TEXT, TRIM(cs.subject_name)::TEXT AS subject_name, TRIM(cs.day_of_week)::TEXT AS day_of_week,
+                 cs.start_time::TEXT, cs.end_time::TEXT, TRIM(cs.room)::TEXT AS room,
+                 COALESCE(u.first_name || ' ' || u.last_name, cs.instructor)::TEXT AS instructor,
+                 TRIM(cs.department)::TEXT AS department, TRIM(cs.section)::TEXT AS section, TRIM(cs.year_level)::TEXT AS year_level, cs.created_at,
+                 (COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))::TEXT AS faculty_name,
+                 cs.faculty_user_id::TEXT, FALSE AS from_faculty_schedule
+          FROM class_schedules cs
+          LEFT JOIN users u ON cs.faculty_user_id = u.id
+          UNION ALL
+          SELECT fs.id::TEXT, fs.subject_code::TEXT, TRIM(fs.subject_name)::TEXT AS subject_name, TRIM(fs.day_of_week)::TEXT AS day_of_week,
+                 fs.start_time::TEXT, fs.end_time::TEXT, TRIM(fs.room)::TEXT AS room,
+                 COALESCE(f.first_name || ' ' || f.last_name, '')::TEXT AS instructor,
+                 TRIM(fs.department)::TEXT AS department, TRIM(fs.section)::TEXT AS section, TRIM(fs.year_level)::TEXT AS year_level, fs.created_at,
+                 (COALESCE(f.first_name, '') || ' ' || COALESCE(f.last_name, ''))::TEXT AS faculty_name,
+                 fs.faculty_id::TEXT AS faculty_user_id, TRUE AS from_faculty_schedule
+          FROM faculty_schedules fs
+          LEFT JOIN users f ON fs.faculty_id = f.id
+        ) AS all_schedules
+        WHERE (LOWER(TRIM(department)) = LOWER(TRIM($1)) OR LOWER(TRIM(department)) = 'general')
+          AND ($2 = '' OR LOWER(TRIM(year_level)) LIKE LOWER(TRIM($2)) || '%' OR year_level IS NULL OR year_level = '')
+          AND ($3 = '' OR REPLACE(LOWER(TRIM(section)), '-', '') = REPLACE(LOWER(TRIM($3)), '-', '') OR section IS NULL OR section = '')
+        ORDER BY CASE day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 WHEN 'Sunday' THEN 7 END, start_time ASC`;
+      const result = await pool.query(query, [searchDept, searchYear, searchSect]);
+      schedules = result.rows;
+    } else {
+      let query = `
+        SELECT cs.*, f.first_name || ' ' || f.last_name AS faculty_name
+        FROM class_schedules cs
+        LEFT JOIN users f ON cs.faculty_user_id = f.id
+        WHERE 1=1`;
+      const params = [];
+      if (req.user.role === 'faculty') {
+        params.push(req.user.id);
+        query += ` AND cs.faculty_user_id = $${params.length}`;
+      } else if (filterDept && filterDept !== 'All') {
+        params.push(filterDept);
+        query += ` AND cs.department = $${params.length}`;
+      }
+      if (filterSect && req.user.role !== 'faculty') {
+        params.push(filterSect);
+        query += ` AND cs.section = $${params.length}`;
+      }
+      if (filterYear && req.user.role !== 'faculty') {
+        params.push(filterYear);
+        query += ` AND cs.year_level = $${params.length}`;
+      }
+      query += ` ORDER BY CASE cs.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 WHEN 'Sunday' THEN 7 END, cs.start_time ASC`;
+      const result = await pool.query(query, params);
+      schedules = result.rows;
+    }
+
+    // 2. Fetch section_schedule_embeds (re-using table for embeds)
+    let embedsQuery = `
+      SELECT ss.*, u.first_name || ' ' || u.last_name AS posted_by_name,
+             f.first_name || ' ' || f.last_name AS faculty_name
+      FROM section_schedule_embeds ss
+      LEFT JOIN users u ON ss.posted_by = u.id
+      LEFT JOIN users f ON ss.faculty_id = f.id
+      WHERE ss.is_active = TRUE`;
+    const embedsParams = [];
+
+    if (req.user.role === 'student') {
+      const userRes = await pool.query('SELECT department, year_level, section FROM users WHERE id = $1', [req.user.id]);
+      const u = userRes.rows[0] || {};
+      embedsParams.push((u.department || '').trim());
+      embedsParams.push((u.year_level || '').trim());
+      embedsParams.push((u.section || '').trim());
+      embedsQuery += ` AND ss.target_type = 'section' 
+                       AND (LOWER(TRIM(ss.department)) = LOWER(TRIM($1)) OR ss.department IS NULL OR ss.department = '')
+                       AND ($2 = '' OR LOWER(TRIM(ss.year_level)) LIKE LOWER(TRIM($2)) || '%' OR ss.year_level IS NULL OR ss.year_level = '')
+                       AND ($3 = '' OR REPLACE(LOWER(TRIM(ss.section)), '-', '') = REPLACE(LOWER(TRIM($3)), '-', '') OR ss.section IS NULL OR ss.section = '')`;
+    } else if (req.user.role === 'faculty') {
+      embedsParams.push(req.user.id);
+      embedsQuery += ` AND ss.target_type = 'faculty' AND ss.faculty_id = $1`;
+    }
+
+    embedsQuery += ` ORDER BY ss.created_at DESC`;
+    const embedsResult = await pool.query(embedsQuery, embedsParams);
+    const embeds = embedsResult.rows;
+
+    res.json({ schedules, embeds });
+  } catch (err) {
+    console.error('[Schedules] Embeds Error:', err);
+    res.status(500).json({ error: 'Failed' });
+  }
+});
+
+// POST a new embed (admin only)
+router.post('/embeds', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'superadmin') return res.status(403).json({ error: 'Access denied' });
+  try {
+    const { title, department, year_level, section, embed_url, target_type, faculty_id } = req.body;
+    if (!title || !embed_url) return res.status(400).json({ error: 'Title and URL are required' });
+
+    const query = `
+      INSERT INTO section_schedule_embeds (title, department, year_level, section, embed_url, target_type, faculty_id, posted_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *`;
+    const result = await pool.query(query, [
+      title, 
+      target_type === 'faculty' ? null : department, 
+      target_type === 'faculty' ? null : year_level, 
+      target_type === 'faculty' ? null : section, 
+      embed_url, 
+      target_type || 'section',
+      target_type === 'faculty' ? faculty_id : null,
+      req.user.id
+    ]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('[Schedules] Create Embed Error:', err);
+    res.status(500).json({ error: 'Failed to create embed' });
+  }
+});
+
+// PATCH an embed (admin only)
+router.patch('/embeds/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'superadmin') return res.status(403).json({ error: 'Access denied' });
+  try {
+    const { title, department, year_level, section, embed_url, target_type, faculty_id } = req.body;
+    const query = `
+      UPDATE section_schedule_embeds
+      SET title = $1, department = $2, year_level = $3, section = $4, embed_url = $5, 
+          target_type = $6, faculty_id = $7, updated_at = NOW()
+      WHERE id = $8
+      RETURNING *`;
+    const result = await pool.query(query, [
+      title, 
+      target_type === 'faculty' ? null : department, 
+      target_type === 'faculty' ? null : year_level, 
+      target_type === 'faculty' ? null : section, 
+      embed_url, 
+      target_type || 'section',
+      target_type === 'faculty' ? faculty_id : null,
+      req.params.id
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Embed not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[Schedules] Update Embed Error:', err);
+    res.status(500).json({ error: 'Failed to update embed' });
+  }
+});
+
+// DELETE an embed (admin only)
+router.delete('/embeds/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'superadmin') return res.status(403).json({ error: 'Access denied' });
+  try {
+    const result = await pool.query('DELETE FROM section_schedule_embeds WHERE id = $1 RETURNING *', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Embed not found' });
+    res.json({ message: 'Embed deleted' });
+  } catch (err) {
+    console.error('[Schedules] Delete Embed Error:', err);
+    res.status(500).json({ error: 'Failed to delete embed' });
+  }
+});
+
+// GET /fetch-sheet — Proxy to fetch and parse Google Sheets/CSV (to avoid CORS)
+router.get('/fetch-sheet', authenticateToken, async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'URL is required' });
+
+  try {
+    // 1. Identify if it's a Google Sheet and transform to export format if needed
+    let fetchUrl = url;
+    if (url.includes('docs.google.com/spreadsheets')) {
+      // Transform to CSV export URL
+      const match = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
+      if (match) {
+        fetchUrl = `https://docs.google.com/spreadsheets/d/${match[1]}/export?format=csv`;
+      }
+    }
+
+    const response = await fetch(fetchUrl);
+    if (!response.ok) throw new Error('Failed to fetch external sheet');
+    
+    const csvData = await response.text();
+    
+    // Simple CSV parser (handles basic quoting but optimized for speed)
+    const rows = csvData.split('\n').map(line => {
+      const parts = [];
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (char === '"') inQuotes = !inQuotes;
+        else if (char === ',' && !inQuotes) {
+          parts.push(current.trim());
+          current = '';
+        } else current += char;
+      }
+      parts.push(current.trim());
+      return parts;
+    });
+
+    if (rows.length < 2) return res.json({ rows: [] });
+
+    // Assuming first row is header
+    const headers = rows[0];
+    const jsonData = rows.slice(1).map(row => {
+      const obj = {};
+      headers.forEach((h, i) => {
+        if (row[i] !== undefined) obj[h.toLowerCase().replace(/ /g, '_')] = row[i];
+      });
+      return obj;
+    });
+
+    res.json({ rows: jsonData });
+  } catch (err) {
+    console.error('[Schedules] Fetch Sheet Error:', err);
+    res.status(500).json({ error: 'Failed to parse sheet' });
+  }
+});
+
+// PATCH toggle an embed (admin only)
+router.patch('/embeds/:id/toggle', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'admin' && req.user.role !== 'superadmin') return res.status(403).json({ error: 'Access denied' });
+  try {
+    const result = await pool.query(
+      'UPDATE section_schedule_embeds SET is_active = NOT is_active, updated_at = NOW() WHERE id = $1 RETURNING *',
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Embed not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[Schedules] Toggle Embed Error:', err);
+    res.status(500).json({ error: 'Failed to toggle embed' });
+  }
+});
+
 // Get class schedules
 router.get('/', authenticateToken, async (req, res) => {
   try {
@@ -232,8 +479,8 @@ router.get('/', authenticateToken, async (req, res) => {
 
 
 
-// Add a class
-router.post('/', authenticateToken, async (req, res) => {
+// Add a class (admin/superadmin only)
+router.post('/', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const { subject_code, subject_name, day_of_week, start_time, end_time, room, instructor, faculty_user_id, department } = req.body;
     const section = normalizeSection(req.body.section);
@@ -268,7 +515,7 @@ router.get('/template', authenticateToken, (req, res) => {
 // Upload CSV — replaces user's existing class schedule
 // Supports both PUP official format and generic format
 // Accepts optional department and section via form fields
-router.post('/upload', authenticateToken, uploadCsv.single('file'), async (req, res) => {
+router.post('/upload', authenticateToken, requireRole('admin'), uploadCsv.single('file'), async (req, res) => {
   const client = await pool.connect();
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -426,8 +673,8 @@ router.post('/upload', authenticateToken, uploadCsv.single('file'), async (req, 
   }
 });
 
-// Update a class
-router.patch('/:id', authenticateToken, async (req, res) => {
+// Update a class (admin/superadmin only)
+router.patch('/:id', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { subject_code, subject_name, day_of_week, start_time, end_time, room, instructor, faculty_user_id, department } = req.body;
@@ -454,14 +701,10 @@ router.patch('/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete a class
-router.delete('/:id', authenticateToken, async (req, res) => {
+// Delete a class (admin/superadmin only)
+router.delete('/:id', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
-    if (req.user.role === 'admin') {
-      await pool.query('DELETE FROM class_schedules WHERE id = $1', [req.params.id]);
-    } else {
-      await pool.query('DELETE FROM class_schedules WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-    }
+    await pool.query('DELETE FROM class_schedules WHERE id = $1', [req.params.id]);
     res.json({ message: 'Schedule deleted' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete schedule' });

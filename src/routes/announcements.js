@@ -17,34 +17,80 @@ router.get('/', authenticateToken, async (req, res) => {
     const { department: filterDept, status: filterStatus, page = 1, limit = 20 } = req.query;
     const offset = (page - 1) * limit;
 
+    // Run auto-archiving query: 3 months
+    await pool.query(
+      `UPDATE announcements 
+       SET status = 'archived' 
+       WHERE created_at < NOW() - INTERVAL '3 months' 
+         AND status = 'active'`
+    ).catch(err => console.error('Auto-archive announcements error:', err));
+
+    // Run auto-delete for soft-deleted announcements: 6 months
+    await pool.query(
+      `DELETE FROM announcements 
+       WHERE status = 'deleted' 
+         AND updated_at < NOW() - INTERVAL '6 months'`
+    ).catch(err => console.error('Auto-delete soft-deleted announcements error:', err));
+
+    const isStaff = req.user.role === 'faculty' || req.user.role === 'admin' || req.user.role === 'superadmin';
     const isAdmin = req.user.role === 'admin';
     const params = [];
 
     let statusClause;
-    if (isAdmin) {
-      if (filterStatus && ['pending', 'active', 'archived', 'rejected'].includes(filterStatus)) {
+    if (isStaff) {
+      if (filterStatus === 'archived') {
+        statusClause = `(a.status = 'archived' OR a.status = 'deleted')`;
+      } else if (filterStatus && ['pending', 'active', 'rejected'].includes(filterStatus)) {
         params.push(filterStatus);
         statusClause = `a.status = $${params.length}`;
       } else {
-        statusClause = `a.status != 'deleted'`;
+        statusClause = `a.status != 'deleted' AND a.status != 'archived'`;
       }
     } else {
-      // Non-admin: active posts visible per dept rules, OR own posts any status (except deleted).
+      // Students / Guests: active posts visible per dept rules, OR own posts any status (except deleted).
       params.push(req.user.id);
       const ownIdParam = params.length;
       statusClause = `((a.status = 'active') OR (a.author_id = $${ownIdParam} AND a.status != 'deleted'))`;
     }
 
+    // Restrict department queries by student/guest to General/Campus (or their own department)
+    if ((req.user.role === 'student' || req.user.role === 'guest') && filterDept && filterDept !== 'All') {
+      const allowedScopes = req.user.role === 'guest' ? new Set(['General', 'Campus']) : new Set(['General', 'Campus', req.user.department].filter(Boolean));
+      if (!allowedScopes.has(filterDept)) {
+        return res.json({ announcements: [], total: 0, page: parseInt(page), totalPages: 0 });
+      }
+    }
+
     let deptClause = '';
     if (!isAdmin) {
       if (req.user.role === 'faculty') {
-        // Faculty are institution-wide — they see all active announcements, not filtered by dept
-        deptClause = '';
+        if (filterDept && filterDept !== 'All') {
+          params.push(filterDept);
+          deptClause = ` AND a.department = $${params.length}`;
+        } else {
+          deptClause = '';
+        }
+      } else if (req.user.role === 'guest') {
+        if (filterDept && filterDept !== 'All') {
+          const allowed = ['General', 'Campus'];
+          const actualDept = allowed.includes(filterDept) ? filterDept : 'General';
+          params.push(actualDept);
+          deptClause = ` AND a.department = $${params.length}`;
+        } else {
+          deptClause = ` AND a.department IN ('General', 'Campus')`;
+        }
       } else {
         const userDept = req.user.department || '';
-        params.push(userDept);
-        const deptParam = params.length;
-        deptClause = ` AND (a.department IN ('General','Campus') OR a.department = $${deptParam} OR a.author_id = $${ownIdParamOrSelf(params, req.user.id)})`;
+        if (filterDept && filterDept !== 'All') {
+          const allowed = ['General', 'Campus', userDept];
+          const actualDept = allowed.includes(filterDept) ? filterDept : userDept;
+          params.push(actualDept);
+          deptClause = ` AND a.department = $${params.length}`;
+        } else {
+          params.push(userDept);
+          const deptParam = params.length;
+          deptClause = ` AND (a.department IN ('General','Campus') OR a.department = $${deptParam} OR a.author_id = $${ownIdParamOrSelf(params, req.user.id)})`;
+        }
       }
     } else if (filterDept && filterDept !== 'All') {
       params.push(filterDept);
@@ -56,6 +102,8 @@ router.get('/', authenticateToken, async (req, res) => {
         u.first_name || ' ' || u.last_name as author_name,
         u.profile_image as author_image,
         u.role as author_role,
+        pg.name as page_name,
+        pg.logo_image as page_logo,
         COALESCE(
           json_agg(
             json_build_object('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order)
@@ -63,9 +111,10 @@ router.get('/', authenticateToken, async (req, res) => {
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
+      LEFT JOIN pages pg ON a.page_id = pg.id
       LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
       WHERE ${statusClause}${deptClause}
-      GROUP BY a.id, u.first_name, u.last_name, u.profile_image, u.role
+      GROUP BY a.id, u.first_name, u.last_name, u.profile_image, u.role, pg.name, pg.logo_image
       ORDER BY a.is_pinned DESC, a.created_at DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
@@ -76,12 +125,14 @@ router.get('/', authenticateToken, async (req, res) => {
     // Count
     const countParams = [];
     let countStatusClause;
-    if (isAdmin) {
-      if (filterStatus && ['pending', 'active', 'archived', 'rejected'].includes(filterStatus)) {
+    if (isStaff) {
+      if (filterStatus === 'archived') {
+        countStatusClause = `(status = 'archived' OR status = 'deleted')`;
+      } else if (filterStatus && ['pending', 'active', 'rejected'].includes(filterStatus)) {
         countParams.push(filterStatus);
         countStatusClause = `status = $${countParams.length}`;
       } else {
-        countStatusClause = `status != 'deleted'`;
+        countStatusClause = `status != 'deleted' AND status != 'archived'`;
       }
     } else {
       countParams.push(req.user.id);
@@ -90,15 +141,38 @@ router.get('/', authenticateToken, async (req, res) => {
     let countDeptClause = '';
     if (!isAdmin) {
       if (req.user.role === 'faculty') {
-        countDeptClause = '';
+        if (filterDept && filterDept !== 'All') {
+          countParams.push(filterDept);
+          countDeptClause = ` AND department = $${countParams.length}`;
+        } else {
+          countDeptClause = '';
+        }
+      } else if (req.user.role === 'guest') {
+        if (filterDept && filterDept !== 'All') {
+          const allowed = ['General', 'Campus'];
+          const actualDept = allowed.includes(filterDept) ? filterDept : 'General';
+          countParams.push(actualDept);
+          countDeptClause = ` AND department = $${countParams.length}`;
+        } else {
+          countDeptClause = ` AND department IN ('General', 'Campus')`;
+        }
       } else {
-        countParams.push(req.user.department || '');
-        countDeptClause = ` AND (department IN ('General','Campus') OR department = $${countParams.length} OR author_id = $1)`;
+        const userDept = req.user.department || '';
+        if (filterDept && filterDept !== 'All') {
+          const allowed = ['General', 'Campus', userDept];
+          const actualDept = allowed.includes(filterDept) ? filterDept : userDept;
+          countParams.push(actualDept);
+          countDeptClause = ` AND department = $${countParams.length}`;
+        } else {
+          countParams.push(userDept);
+          countDeptClause = ` AND (department IN ('General','Campus') OR department = $${countParams.length} OR author_id = $1)`;
+        }
       }
     } else if (filterDept && filterDept !== 'All') {
       countParams.push(filterDept);
       countDeptClause = ` AND department = $${countParams.length}`;
     }
+
     const countResult = await pool.query(
       `SELECT COUNT(*) FROM announcements WHERE ${countStatusClause}${countDeptClause}`,
       countParams
@@ -274,6 +348,8 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), async (req,
         u.first_name || ' ' || u.last_name as author_name,
         u.role as author_role,
         u.department as author_department,
+        pg.name as page_name,
+        pg.logo_image as page_logo,
         COALESCE(
           json_agg(
             json_build_object('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order)
@@ -281,9 +357,10 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), async (req,
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
+      LEFT JOIN pages pg ON a.page_id = pg.id
       LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
       WHERE a.status = 'pending'
-      GROUP BY a.id, u.first_name, u.last_name, u.role, u.department
+      GROUP BY a.id, u.first_name, u.last_name, u.role, u.department, pg.name, pg.logo_image
       ORDER BY a.created_at ASC
     `);
     res.json(result.rows);

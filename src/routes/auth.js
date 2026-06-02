@@ -10,10 +10,14 @@ const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/e
 
 const VALID_YEAR_LEVELS = ['1st', '2nd', '3rd', '4th'];
 const VALID_STUDENT_TYPES = ['regular', 'irregular'];
+const FACULTY_NUMBER_REGEX = /^F-\d{4}$/;
 
-/** Generate a cryptographically secure URL-safe token */
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : '';
 }
 
 // Register
@@ -23,8 +27,9 @@ router.post('/register', async (req, res) => {
     const year_level = typeof req.body.year_level === 'string' ? req.body.year_level.trim() : '';
     const student_type = typeof req.body.student_type === 'string' ? req.body.student_type.trim().toLowerCase() : '';
     const registrationRole = typeof req.body.registration_role === 'string' ? req.body.registration_role.trim().toLowerCase() : '';
+    const normalizedEmail = normalizeEmail(email);
 
-    if (!student_number || !email || !password || !first_name || !last_name) {
+    if (!student_number || !normalizedEmail || !password || !first_name || !last_name) {
       return res.status(400).json({ error: 'First name, last name, ID number, email, and password are required' });
     }
     if (password.length < 6) {
@@ -33,7 +38,6 @@ router.post('/register', async (req, res) => {
 
     const trimmedId = student_number.trim().toUpperCase();
 
-    // Check if this ID is in the allowed registrations list
     const allowed = await pool.query(
       'SELECT * FROM allowed_registrations WHERE id_number = $1',
       [trimmedId]
@@ -47,7 +51,6 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: `This ID is approved for ${allowedEntry.role} registration.` });
     }
     if (allowedEntry.is_used) {
-      // Recover stale "used" IDs when the linked user no longer exists (e.g., deleted account).
       const existingById = await pool.query(
         'SELECT id FROM users WHERE student_number = $1',
         [trimmedId]
@@ -63,10 +66,9 @@ router.post('/register', async (req, res) => {
       }
     }
 
-    // Check existing user
     const existing = await pool.query(
       'SELECT id FROM users WHERE email = $1 OR student_number = $2',
-      [email, trimmedId]
+      [normalizedEmail, trimmedId]
     );
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: 'Email or ID Number already registered' });
@@ -75,6 +77,9 @@ router.post('/register', async (req, res) => {
     const password_hash = await bcrypt.hash(password, 12);
     const normalizedSection = typeof section === 'string' ? section.trim() : '';
     const isStudentRegistration = allowedEntry.role === 'student';
+    if (!isStudentRegistration && !FACULTY_NUMBER_REGEX.test(trimmedId)) {
+      return res.status(400).json({ error: 'Faculty number must follow the format F-0000.' });
+    }
     if (isStudentRegistration) {
       if (!normalizedSection || !year_level || !student_type) {
         return res.status(400).json({ error: 'Section, year level, and student type are required for student registration' });
@@ -87,18 +92,16 @@ router.post('/register', async (req, res) => {
       }
     }
 
-    // Generate email verification token (expires in 24 hours)
     const verificationToken = generateToken();
     const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    // Auto-assign role and department from allowed_registrations
-    // is_verified = false — user must verify email before logging in
     const result = await pool.query(
       `INSERT INTO users (student_number, email, password_hash, first_name, middle_initial, last_name, role, department, section, year_level, student_type, is_verified, email_verification_token, email_verification_expires)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13) RETURNING id, first_name, middle_initial, last_name, role, department, section, year_level, student_type`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13)
+       RETURNING id, first_name, middle_initial, last_name, role, department, section, year_level, student_type`,
       [
         trimmedId,
-        email,
+        normalizedEmail,
         password_hash,
         first_name.trim(),
         middle_initial ? middle_initial.trim().substring(0, 10) : null,
@@ -113,13 +116,19 @@ router.post('/register', async (req, res) => {
       ]
     );
 
-    // Mark the allowed registration as used
     await pool.query('UPDATE allowed_registrations SET is_used = true WHERE id = $1', [allowedEntry.id]);
 
-    // Send verification email (non-blocking — don't fail registration if email fails)
-    sendVerificationEmail(email, first_name.trim(), verificationToken).catch(e =>
-      console.error('[Auth] Failed to send verification email:', e.message)
-    );
+    try {
+      await sendVerificationEmail(normalizedEmail, first_name.trim(), verificationToken);
+    } catch (e) {
+      console.error('[Auth] Failed to send verification email:', e.message);
+      return res.status(201).json({
+        message: 'Registration successful, but we were unable to send the verification email. Please try resending it from the login screen or contact support.',
+        requiresEmailVerification: true,
+        emailSendError: true,
+        user: result.rows[0]
+      });
+    }
 
     res.status(201).json({
       message: 'Registration successful! Please check your email to verify your account before logging in.',
@@ -136,32 +145,33 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     const result = await pool.query(
       'SELECT * FROM users WHERE email = $1 AND is_active = true',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
-      console.warn(`[AUTH] Failed login — unknown email: ${email} | IP: ${req.ip}`);
+      console.warn(`[AUTH] Failed login - unknown email: ${normalizedEmail} | IP: ${req.ip}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
 
-    if (user.role !== 'admin') {
+    if (user.role !== 'admin' && user.role !== 'superadmin') {
       const allowed = await pool.query(
         'SELECT 1 FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($1))',
         [user.student_number]
       );
       if (allowed.rows.length === 0) {
-        console.warn(`[AUTH] Login blocked - removed from allowed registrations: ${email} | IP: ${req.ip}`);
+        console.warn(`[AUTH] Login blocked - removed from allowed registrations: ${normalizedEmail} | IP: ${req.ip}`);
         return res.status(403).json({ error: 'Your ID is no longer authorized. Please contact your admin.' });
       }
     }
 
-    if (!user.is_verified && user.role !== 'admin') {
-      console.warn(`[AUTH] Login blocked — unverified account: ${email} | IP: ${req.ip}`);
+    if (!user.is_verified && user.role !== 'admin' && user.role !== 'superadmin') {
+      console.warn(`[AUTH] Login blocked - unverified account: ${normalizedEmail} | IP: ${req.ip}`);
       return res.status(403).json({
         error: 'Please verify your email address before logging in. Check your inbox for the verification link.',
         code: 'EMAIL_NOT_VERIFIED'
@@ -170,7 +180,7 @@ router.post('/login', async (req, res) => {
 
     const validPassword = await bcrypt.compare(password, user.password_hash);
     if (!validPassword) {
-      console.warn(`[AUTH] Failed login — wrong password: ${email} | IP: ${req.ip}`);
+      console.warn(`[AUTH] Failed login - wrong password: ${normalizedEmail} | IP: ${req.ip}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -191,7 +201,7 @@ router.post('/login', async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '4h' }
     );
 
-    console.log(`[AUTH] Successful login: ${email} (${user.role}) | IP: ${req.ip}`);
+    console.log(`[AUTH] Successful login: ${normalizedEmail} (${user.role}) | IP: ${req.ip}`);
 
     res.json({
       message: 'Login successful',
@@ -227,7 +237,22 @@ router.get('/me', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT id, student_number, email, first_name, middle_initial, last_name, role, department, section,
               year_level, student_type, profile_image, phone, bio, position, schedule_embed_url,
-              faculty_status, faculty_status_room, faculty_status_note, faculty_status_until,
+              CASE
+                WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN 'unavailable'
+                ELSE TRIM(COALESCE(faculty_status, 'unavailable'))
+              END AS faculty_status,
+              CASE
+                WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN NULL
+                ELSE faculty_status_room
+              END AS faculty_status_room,
+              CASE
+                WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN NULL
+                ELSE faculty_status_note
+              END AS faculty_status_note,
+              CASE
+                WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN NULL
+                ELSE faculty_status_until
+              END AS faculty_status_until,
               faculty_status_updated_at, created_at
        FROM users WHERE id = $1`,
       [req.user.id]
@@ -244,7 +269,23 @@ router.get('/me', authenticateToken, async (req, res) => {
 // Update profile (text fields)
 router.patch('/me', authenticateToken, async (req, res) => {
   try {
-    const { first_name, middle_initial, last_name, department, section, phone, bio, position } = req.body;
+    let { first_name, middle_initial, last_name, department, section, phone, bio, position } = req.body;
+    
+    const userQuery = await pool.query('SELECT role, first_name, last_name, department, section FROM users WHERE id = $1', [req.user.id]);
+    if (userQuery.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const user = userQuery.rows[0];
+
+    if (user.role === 'student' || user.role === 'faculty') {
+      first_name = user.first_name;
+      last_name = user.last_name;
+      department = user.department;
+      section = user.section;
+    } else if (user.role === 'admin' || user.role === 'superadmin') {
+      department = null;
+    }
+
     if (!first_name || !last_name) {
       return res.status(400).json({ error: 'First name and last name are required' });
     }
@@ -280,21 +321,20 @@ router.patch('/me', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Schedule embed URL (Google Docs/Sheets/Calendar, Canva, Microsoft only) ──
-// Matches whole-host to prevent e.g. "evil.docs.google.com" bypass.
+// Schedule embed URL (Google Docs/Sheets/Calendar, Canva, Microsoft only)
 const EMBED_HOST_ALLOWLIST = [
   /^(docs|sheets|calendar)\.google\.com$/i,
   /^drive\.google\.com$/i,
   /^(www\.)?canva\.com$/i,
   /^onedrive\.live\.com$/i,
   /^(view|embed|sway)\.office\.com$/i,
-  /^1drv\.ms$/i,                 // OneDrive short links
+  /^1drv\.ms$/i,
   /^(www\.)?office\.com$/i,
   /^(www\.)?sway\.cloud\.microsoft$/i,
 ];
 
 function isAllowedEmbedUrl(raw) {
-  if (!raw) return true; // empty clears the URL
+  if (!raw) return true;
   try {
     const u = new URL(raw);
     if (u.protocol !== 'https:') return false;
@@ -323,12 +363,12 @@ router.patch('/me/schedule', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Faculty manual status (Professor Locator, Option B) ──
+// Faculty manual status (Professor Locator, Option B)
 const VALID_FACULTY_STATUSES = ['in_class', 'in_office', 'available', 'unavailable'];
 
 router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
   try {
-    if (!['faculty', 'admin'].includes(req.user.role)) {
+    if (req.user.role !== 'faculty') {
       return res.status(403).json({ error: 'Only faculty can update their status' });
     }
     const { status, room, note, until } = req.body || {};
@@ -350,7 +390,7 @@ router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
              faculty_status_updated_at = NOW(),
              updated_at = NOW()
        WHERE id = $5
-       RETURNING faculty_status, faculty_status_room, faculty_status_note, faculty_status_until, faculty_status_updated_at`,
+       RETURNING TRIM(faculty_status) AS faculty_status, faculty_status_room, faculty_status_note, faculty_status_until, faculty_status_updated_at`,
       [
         status,
         room ? String(room).trim().substring(0, 100) : null,
@@ -366,8 +406,7 @@ router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Verify Email ──────────────────────────────────────────────────────────────
-// GET /api/auth/verify-email?token=xxx
+// Verify Email
 router.get('/verify-email', async (req, res) => {
   try {
     const { token } = req.query;
@@ -393,7 +432,6 @@ router.get('/verify-email', async (req, res) => {
       return res.status(400).json({ error: 'Verification link has expired. Please re-register or contact your admin.' });
     }
 
-    // Mark as verified and clear token
     await pool.query(
       `UPDATE users
          SET is_verified = true,
@@ -412,34 +450,34 @@ router.get('/verify-email', async (req, res) => {
   }
 });
 
-// ── Forgot Password ────────────────────────────────────────────────────────────
-// POST /api/auth/forgot-password  { email }
+// Forgot Password
 router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return res.status(400).json({ error: 'Email is required' });
 
-    // Always respond with success to prevent email enumeration
     const result = await pool.query(
       'SELECT id, first_name, email FROM users WHERE email = $1 AND is_active = true',
-      [email.trim().toLowerCase()]
+      [normalizedEmail]
     );
 
     if (result.rows.length > 0) {
       const user = result.rows[0];
       const resetToken = generateToken();
-      const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      const resetExpires = new Date(Date.now() + 60 * 60 * 1000);
 
       await pool.query(
         `UPDATE users SET password_reset_token = $1, password_reset_expires = $2, updated_at = NOW() WHERE id = $3`,
         [resetToken, resetExpires, user.id]
       );
 
-      sendPasswordResetEmail(user.email, user.first_name, resetToken).catch(e =>
-        console.error('[Auth] Failed to send password reset email:', e.message)
-      );
-
-      console.log(`[Auth] Password reset requested: ${user.email}`);
+      try {
+        await sendPasswordResetEmail(user.email, user.first_name, resetToken);
+        console.log(`[Auth] Password reset email sent: ${user.email}`);
+      } catch (e) {
+        console.error('[Auth] Failed to send password reset email:', e.message);
+      }
     }
 
     res.json({ message: 'If that email is registered, a password reset link has been sent.' });
@@ -449,8 +487,7 @@ router.post('/forgot-password', async (req, res) => {
   }
 });
 
-// ── Reset Password ─────────────────────────────────────────────────────────────
-// POST /api/auth/reset-password  { token, password }
+// Reset Password
 router.post('/reset-password', async (req, res) => {
   try {
     const { token, password } = req.body;
@@ -491,16 +528,16 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-// ── Resend Verification Email ──────────────────────────────────────────────────
-// POST /api/auth/resend-verification  { email }
+// Resend Verification Email
 router.post('/resend-verification', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return res.status(400).json({ error: 'Email is required' });
 
     const result = await pool.query(
       'SELECT id, first_name, email, is_verified FROM users WHERE email = $1',
-      [email.trim().toLowerCase()]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0 || result.rows[0].is_verified) {
@@ -516,11 +553,14 @@ router.post('/resend-verification', async (req, res) => {
       [verificationToken, verificationExpires, user.id]
     );
 
-    sendVerificationEmail(user.email, user.first_name, verificationToken).catch(e =>
-      console.error('[Auth] Failed to resend verification email:', e.message)
-    );
+    try {
+      await sendVerificationEmail(user.email, user.first_name, verificationToken);
+    } catch (e) {
+      console.error('[Auth] Failed to resend verification email:', e.message);
+      return res.status(500).json({ error: 'We were unable to send the verification email. Please try again or contact support.' });
+    }
 
-    res.json({ message: 'Verification email sent! Please check your inbox.' });
+    res.json({ message: 'Verification email resent successfully. Please check your inbox.' });
   } catch (err) {
     console.error('Resend verification error:', err);
     res.status(500).json({ error: 'Failed to resend verification email' });
@@ -540,6 +580,64 @@ router.post('/me/avatar', authenticateToken, uploadProfile.single('avatar'), asy
   } catch (err) {
     console.error('Upload avatar error:', err);
     res.status(500).json({ error: 'Failed to upload avatar' });
+  }
+});
+
+// Guest Login
+router.post('/guest-login', async (req, res) => {
+  try {
+    // Check if guest user already exists
+    let result = await pool.query("SELECT * FROM users WHERE email = 'guest@pupsj.edu.ph'");
+    let user;
+    if (result.rows.length === 0) {
+      // Create guest user
+      const guestHash = await bcrypt.hash('guestpassword123', 12);
+      const insertResult = await pool.query(
+        `INSERT INTO users (student_number, email, password_hash, first_name, last_name, role, is_verified, is_active)
+         VALUES ('GUEST-001', 'guest@pupsj.edu.ph', $1, 'Guest', 'User', 'guest', true, true)
+         RETURNING *`,
+        [guestHash]
+      );
+      user = insertResult.rows[0];
+    } else {
+      user = result.rows[0];
+    }
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        department: user.department,
+        section: user.section,
+        year_level: user.year_level,
+        student_type: user.student_type
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '4h' }
+    );
+
+    res.json({
+      message: 'Guest login successful',
+      user: {
+        id: user.id,
+        email: user.email,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        role: user.role,
+        department: user.department,
+        section: user.section,
+        year_level: user.year_level,
+        student_type: user.student_type,
+        profile_image: user.profile_image
+      },
+      token
+    });
+  } catch (err) {
+    console.error('Guest login error:', err);
+    res.status(500).json({ error: 'Guest login failed' });
   }
 });
 

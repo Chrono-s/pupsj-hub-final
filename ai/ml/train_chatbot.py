@@ -47,6 +47,16 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 # Allow running from project root or directly from this directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+# Suppress Hugging Face unauthenticated requests and hub warnings
+try:
+    from huggingface_hub import logging as hf_logging
+    hf_logging.set_verbosity_error()
+except ImportError:
+    pass
+
 from ai.ml.retriever import (   # noqa: E402
     HandbookRetriever,
     SemanticRetriever,

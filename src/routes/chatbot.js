@@ -3,7 +3,7 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
-const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8000';
+const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8001';
 
 // ── AI sidecar call ───────────────────────────────────────────────────────────
 async function askAI(message, history = [], doc_context = [], live_data = {}) {
@@ -22,13 +22,62 @@ async function askAI(message, history = [], doc_context = [], live_data = {}) {
 
 // ── Module query detectors ────────────────────────────────────────────────────
 const MODULE_RE = {
-  documents:     /\b(file|template|form|document|download|proposal|docx?|pdf|find.*file|find.*form|find.*template)\b/i,
-  events:        /\b(event|calendar|activity|activities|seminar|workshop|symposium|competition|orientation|when is|upcoming|it week|intramurals)\b/i,
-  announcements: /\b(announcement|news|update|notice|bulletin|latest|recent|what('s| is) (new|happening)|any news|memo)\b/i,
-  lostfound:     /\b(lost (and|&) found|lost item|found item|missing item|report.*lost|search.*item|lost.*belong|looking for.*item|someone found|i found a|report a found)\b/i,
-  faculty:       /\b(professor|prof\b|faculty|teacher|instructor|sir\b|ma'?am|where is.*prof|is.*available|in class|in office|locator|availability)\b/i,
+  documents:     /\b(file|template|form|document|download|proposal|docx?|pdf|find.*file|find.*form|find.*template|dokumento|porma|i-download)\b/i,
+  events:        /\b(event|calendar|activity|activities|seminar|workshop|symposium|competition|orientation|when is|upcoming|it week|intramurals|kaganapan|magaganap|aktibidad)\b/i,
+  announcements: /\b(announcement|news|update|notice|bulletin|latest|recent|what('s| is) (new|happening)|any news|memo|anunsyo|balita|ulat|abiso)\b/i,
+  lostfound:     /\b(lost (and|&) found|lost item|found item|missing item|report.*lost|search.*item|lost.*belong|looking for.*item|someone found|i found a|report a found|nawawala|nakita|nawala|susi|gamit|pitaka|nahanap)\b/i,
+  faculty:       /\b(professor|prof\b|faculty|teacher|instructor|sir\b|ma'?am|where is.*prof|is.*available|in class|in office|locator|availability|guro)\b/i,
 };
 const FOLLOW_UP_RE = /\b(it|that|this|they|them|those|these|there|here|what about|how about|and for|and what|what else|how so|why|when|where|who|which one|same one)\b/i;
+
+// ── Security visibility helpers ───────────────────────────────────────────────
+function getDocumentVisibilitySql(user, params) {
+  if (user.role === 'admin' || user.role === 'superadmin' || user.role === 'faculty') {
+    return "dt.status = 'active'";
+  }
+  if (user.role === 'guest') {
+    return "dt.status = 'active' AND dt.department = 'General'";
+  }
+  params.push(user.department || '');
+  const deptIdx = params.length;
+  params.push(user.id);
+  const userIdx = params.length;
+  return `dt.status = 'active' AND (
+    dt.department IN ('General', 'Campus')
+    OR dt.department = $${deptIdx}
+    OR (dt.department = 'Specific Students' AND EXISTS (
+      SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = $${userIdx}
+    ))
+  )`;
+}
+
+function getAnnouncementVisibilitySql(user, params, tableAlias = 'a') {
+  if (user.role === 'admin' || user.role === 'superadmin' || user.role === 'faculty') {
+    return `${tableAlias}.status = 'active'`;
+  }
+  if (user.role === 'guest') {
+    return `${tableAlias}.status = 'active' AND ${tableAlias}.department IN ('General', 'Campus')`;
+  }
+  params.push(user.department || '');
+  const deptIdx = params.length;
+  params.push(user.id);
+  const userIdx = params.length;
+  return `${tableAlias}.status = 'active' AND (${tableAlias}.department IN ('General', 'Campus') OR ${tableAlias}.department = $${deptIdx} OR ${tableAlias}.author_id = $${userIdx})`;
+}
+
+function getEventVisibilitySql(user, params, tableAlias = 'e') {
+  const statusCond = tableAlias ? `${tableAlias}.status = 'active'` : "status = 'active'";
+  const deptCol = tableAlias ? `${tableAlias}.department` : "department";
+  if (user.role === 'admin' || user.role === 'superadmin' || user.role === 'faculty') {
+    return statusCond;
+  }
+  if (user.role === 'guest') {
+    return `${statusCond} AND (${deptCol} IN ('General', 'Campus'))`;
+  }
+  params.push(user.department || '');
+  const deptIdx = params.length;
+  return `${statusCond} AND (${deptCol} IN ('General', 'Campus') OR ${deptCol} = $${deptIdx})`;
+}
 
 // ── Helper: extract keywords from message ─────────────────────────────────────
 function extractKeywords(message, stopWords) {
@@ -41,6 +90,15 @@ function formatTime(t) {
   const [h, m] = t.split(':');
   const hour = parseInt(h);
   return `${hour % 12 || 12}:${m} ${hour >= 12 ? 'PM' : 'AM'}`;
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return '';
+  const b = parseInt(bytes);
+  if (isNaN(b)) return '';
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
 function detectFacultyStatusFilter(message) {
@@ -112,7 +170,8 @@ function isLikelyFollowUp(message) {
   const text = String(message || '').trim();
   if (!text) return false;
   const tokenCount = text.split(/\s+/).filter(Boolean).length;
-  return tokenCount <= 8 || FOLLOW_UP_RE.test(text);
+  // It's a follow-up if it explicitly uses follow-up pronouns/phrases, OR if it's ultra-short (1-2 words) which requires context
+  return FOLLOW_UP_RE.test(text) || (tokenCount <= 2);
 }
 
 function buildContextualQuery(message, history = []) {
@@ -142,28 +201,33 @@ function buildContextualQuery(message, history = []) {
 }
 
 // ── Context fetchers (one per module) ─────────────────────────────────────────
-async function fetchDocuments(message) {
+async function fetchDocuments(message, user) {
   const sw = new Set(['where','find','this','file','form','that','what','which','from','have','with','about','how','can','template','document','download']);
   const kw = extractKeywords(message, sw);
   try {
     let rows = [];
     if (kw.length > 0) {
+      const params = kw.map(w => `%${w}%`);
       const cond = kw.map((_, i) => `(dt.title ILIKE $${i+1} OR dt.file_name ILIKE $${i+1})`).join(' OR ');
+      const visibilitySql = getDocumentVisibilitySql(user, params);
       const r = await pool.query(
         `SELECT dt.title, dt.file_name, dc.name as category
          FROM document_templates dt
          LEFT JOIN document_categories dc ON dc.id = dt.category_id
-         WHERE dt.status = 'active' AND (${cond}) ORDER BY dt.title ASC LIMIT 5`,
-        kw.map(w => `%${w}%`)
+         WHERE ${visibilitySql} AND (${cond}) ORDER BY dt.title ASC LIMIT 5`,
+        params
       );
       rows = r.rows;
     }
     if (rows.length === 0) {
+      const params = [];
+      const visibilitySql = getDocumentVisibilitySql(user, params);
       const r = await pool.query(
         `SELECT dt.title, dt.file_name, dc.name as category
          FROM document_templates dt
          LEFT JOIN document_categories dc ON dc.id = dt.category_id
-         WHERE dt.status = 'active' ORDER BY dc.name ASC, dt.title ASC`
+         WHERE ${visibilitySql} ORDER BY dc.name ASC, dt.title ASC`,
+        params
       );
       rows = r.rows;
     }
@@ -171,26 +235,31 @@ async function fetchDocuments(message) {
   } catch (e) { console.error('[ctx:docs]', e.message); return []; }
 }
 
-async function fetchEvents(message) {
+async function fetchEvents(message, user) {
   const sw = new Set(['when','what','where','which','the','event','events','that','this','for','about','happening','upcoming','schedule','is','are','any']);
   const kw = extractKeywords(message, sw);
   try {
     let rows = [];
     if (kw.length > 0) {
+      const params = kw.map(w => `%${w}%`);
       const cond = kw.map((_, i) => `(e.title ILIKE $${i+1} OR e.description ILIKE $${i+1} OR e.location ILIKE $${i+1})`).join(' OR ');
+      const visibilitySql = getEventVisibilitySql(user, params, 'e');
       const r = await pool.query(
         `SELECT e.title, e.description, e.location, e.event_date, e.start_time, e.end_time, e.department
-         FROM events e WHERE e.status != 'deleted' AND (${cond})
+         FROM events e WHERE ${visibilitySql} AND (${cond})
          ORDER BY ABS(EXTRACT(EPOCH FROM (e.event_date - CURRENT_DATE))) ASC LIMIT 5`,
-        kw.map(w => `%${w}%`)
+        params
       );
       rows = r.rows;
     }
     if (rows.length === 0) {
+      const params = [];
+      const visibilitySql = getEventVisibilitySql(user, params, 'e');
       const r = await pool.query(
-        `SELECT title, description, location, event_date, start_time, end_time, department
-         FROM events WHERE status != 'deleted' AND event_date >= CURRENT_DATE
-         ORDER BY event_date ASC LIMIT 5`
+        `SELECT e.title, e.description, e.location, e.event_date, e.start_time, e.end_time, e.department
+         FROM events e WHERE ${visibilitySql} AND e.event_date >= CURRENT_DATE
+         ORDER BY e.event_date ASC LIMIT 5`,
+        params
       );
       rows = r.rows;
     }
@@ -198,7 +267,7 @@ async function fetchEvents(message) {
   } catch (e) { console.error('[ctx:events]', e.message); return []; }
 }
 
-async function fetchAnnouncements(message) {
+async function fetchAnnouncements(message, user) {
   const sw = new Set(['announcement','announcements','any','bulletin','from','latest','list','memo','new','news','notice','recent','show','tell','the','update','updates','what','which']);
   const kw = extractKeywords(message, sw);
   try {
@@ -219,10 +288,12 @@ async function fetchAnnouncements(message) {
         `)
         .join(' + ');
 
+      const visibilitySql = getAnnouncementVisibilitySql(user, params, 'a');
+
       const r = await pool.query(
         `SELECT a.title, a.content, a.department, a.created_at, (${score}) AS relevance
          FROM announcements a
-         WHERE a.status = 'active' AND (${cond})
+         WHERE ${visibilitySql} AND (${cond})
          ORDER BY relevance DESC, a.is_pinned DESC, a.created_at DESC
          LIMIT 5`,
         params
@@ -231,12 +302,15 @@ async function fetchAnnouncements(message) {
     }
 
     if (rows.length === 0) {
+      const params = [];
+      const visibilitySql = getAnnouncementVisibilitySql(user, params, 'a');
       const r = await pool.query(
-        `SELECT title, content, department, created_at
-         FROM announcements
-         WHERE status = 'active'
-         ORDER BY is_pinned DESC, created_at DESC
-         LIMIT 5`
+        `SELECT a.title, a.content, a.department, a.created_at
+         FROM announcements a
+         WHERE ${visibilitySql}
+         ORDER BY a.is_pinned DESC, a.created_at DESC
+         LIMIT 5`,
+        params
       );
       rows = r.rows;
     }
@@ -244,16 +318,18 @@ async function fetchAnnouncements(message) {
   } catch (e) { console.error('[ctx:announcements]', e.message); return []; }
 }
 
-async function fetchLostFound(message) {
+async function fetchLostFound(message, user) {
   const sw = new Set(['lost','found','missing','item','where','what','about','report','any','the','was','been','someone','looking','for']);
   const kw = extractKeywords(message, sw);
+  const isRestricted = user && (user.role === 'student' || user.role === 'faculty' || user.role === 'guest');
+  const typeFilter = isRestricted ? " AND lf.type = 'lost'" : "";
   try {
     let rows = [];
     if (kw.length > 0) {
       const cond = kw.map((_, i) => `(lf.item_name ILIKE $${i+1} OR lf.description ILIKE $${i+1} OR lf.category ILIKE $${i+1})`).join(' OR ');
       const r = await pool.query(
         `SELECT lf.type, lf.item_name, lf.description, lf.category, lf.location_found, lf.date_reported, lf.contact_info
-         FROM lost_found lf WHERE lf.status = 'open' AND (${cond})
+         FROM lost_found lf WHERE lf.status = 'open'${typeFilter} AND (${cond})
          ORDER BY lf.date_reported DESC LIMIT 5`,
         kw.map(w => `%${w}%`)
       );
@@ -262,7 +338,7 @@ async function fetchLostFound(message) {
     if (rows.length === 0) {
       const r = await pool.query(
         `SELECT type, item_name, description, category, location_found, date_reported
-         FROM lost_found WHERE status = 'open' ORDER BY date_reported DESC LIMIT 5`
+         FROM lost_found WHERE status = 'open'${isRestricted ? " AND type = 'lost'" : ""} ORDER BY date_reported DESC LIMIT 5`
       );
       rows = r.rows;
     }
@@ -346,13 +422,96 @@ async function fetchFaculty(message) {
   } catch (e) { console.error('[ctx:faculty]', e.message); return []; }
 }
 
+function parseDateFromMessage(message) {
+  if (!message) return null;
+  const msg = message.toLowerCase().trim();
+  const today = new Date();
+  
+  // Relative date keywords
+  if (/\btoday\b|\bngayong\s*araw\b/.test(msg)) {
+    return today.toISOString().split('T')[0];
+  }
+  if (/\btomorrow\b|\bbukas\b/.test(msg)) {
+    const tomorrow = new Date();
+    tomorrow.setDate(today.getDate() + 1);
+    return tomorrow.toISOString().split('T')[0];
+  }
+  if (/\byesterday\b|\bkahapon\b/.test(msg)) {
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    return yesterday.toISOString().split('T')[0];
+  }
+
+  // Month-day map for absolute dates
+  const months = {
+    january: 1, jan: 1, enero: 1,
+    february: 2, feb: 2, pebrero: 2,
+    march: 3, mar: 3, marso: 3,
+    april: 4, apr: 4, abril: 4,
+    may: 5, mayo: 5,
+    june: 6, jun: 6, hunyo: 6,
+    july: 7, jul: 7, hulyo: 7,
+    august: 8, aug: 8, agosto: 8,
+    september: 9, sep: 9, sept: 9, setyembre: 9,
+    october: 10, oct: 10, oktubre: 10,
+    november: 11, nov: 11, nobyembre: 11,
+    december: 12, dec: 12, disyembre: 12
+  };
+
+  const monthNamesPattern = Object.keys(months).join('|');
+  
+  // Format: "May 2 2026", "may 2", "may 2nd, 2026"
+  const monthDayYearRegex = new RegExp(`\\b(${monthNamesPattern})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b(?:\\s*,?\\s*(\\d{4}))?`, 'i');
+  const mMatch = msg.match(monthDayYearRegex);
+  if (mMatch) {
+    const monthName = mMatch[1].toLowerCase();
+    const month = months[monthName];
+    const day = parseInt(mMatch[2]);
+    let year = mMatch[3] ? parseInt(mMatch[3]) : today.getFullYear();
+    
+    const mm = String(month).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    return `${year}-${mm}-${dd}`;
+  }
+
+  // Format: "2 of May 2026", "2nd of may"
+  const dayOfMonthRegex = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(${monthNamesPattern})\\b(?:\\s*,?\\s*(\\d{4}))?`, 'i');
+  const dMatch = msg.match(dayOfMonthRegex);
+  if (dMatch) {
+    const day = parseInt(dMatch[1]);
+    const monthName = dMatch[2].toLowerCase();
+    const month = months[monthName];
+    let year = dMatch[3] ? parseInt(dMatch[3]) : today.getFullYear();
+    
+    const mm = String(month).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    return `${year}-${mm}-${dd}`;
+  }
+
+  // Format: YYYY-MM-DD or MM/DD/YYYY or MM-DD-YYYY
+  const numericDateRegex = /\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b|\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/;
+  const numMatch = msg.match(numericDateRegex);
+  if (numMatch) {
+    if (numMatch[1]) {
+      return `${numMatch[1]}-${numMatch[2].padStart(2, '0')}-${numMatch[3].padStart(2, '0')}`;
+    } else {
+      return `${numMatch[6]}-${numMatch[4].padStart(2, '0')}-${numMatch[5].padStart(2, '0')}`;
+    }
+  }
+
+  return null;
+}
+
 // ── Unified context fetcher ───────────────────────────────────────────────────
-async function getAllModuleContexts(message) {
+async function getAllModuleContexts(message, user) {
   const tasks = [];
-  if (MODULE_RE.documents.test(message))     tasks.push(['documents',     fetchDocuments(message)]);
-  if (MODULE_RE.events.test(message))        tasks.push(['events',        fetchEvents(message)]);
-  if (MODULE_RE.announcements.test(message)) tasks.push(['announcements', fetchAnnouncements(message)]);
-  if (MODULE_RE.lostfound.test(message))     tasks.push(['lostfound',     fetchLostFound(message)]);
+  if (MODULE_RE.documents.test(message))     tasks.push(['documents',     fetchDocuments(message, user)]);
+  if (MODULE_RE.announcements.test(message)) tasks.push(['announcements', fetchAnnouncements(message, user)]);
+
+  if (user.role !== 'guest') {
+    if (MODULE_RE.events.test(message))        tasks.push(['events',        fetchEvents(message, user)]);
+  }
+  if (MODULE_RE.lostfound.test(message))     tasks.push(['lostfound',     fetchLostFound(message, user)]);
   if (MODULE_RE.faculty.test(message))       tasks.push(['faculty',       fetchFaculty(message)]);
 
   const settled = await Promise.all(tasks.map(([k, p]) => p.then(r => [k, r])));
@@ -805,11 +964,448 @@ router.post('/message', authenticateToken, async (req, res) => {
       return res.json({ response: _OFF_TOPIC_REPLY, images: [] });
     }
 
-    let botResponse, images = [];
+    // ── Live system query interception ──
     const effectiveMessage = buildContextualQuery(message, history);
+    const lowerMessage = message.toLowerCase().trim();
+
+    // Check guest restrictions on modules before executing anything
+    if (req.user.role === 'guest') {
+      const asksAboutEvents = MODULE_RE.events.test(effectiveMessage);
+      
+      if (asksAboutEvents) {
+        const responseText = `As a guest user, I can only help you with public announcements and document templates. Details regarding the Event Calendar feature are restricted. Please register or log in to access this information!`;
+        
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+    }
+    
+    // 1. DOCUMENT TEMPLATES
+    const isDocQuery = /\b(clearance\s*form|accreditation\s*(document|template|form|files|documents)|accreditation|clearance|document|template|form|download)\b/i.test(effectiveMessage) && !/\b(schedule|announcement|event|lost|found)\b/i.test(effectiveMessage);
+    
+    // 2. CLASS SCHEDULE
+    const isScheduleQuery = /\b(schedule|schedules|class\s*schedule|my\s*schedule)\b/i.test(effectiveMessage);
+    
+    // 3. ANNOUNCEMENTS
+    const isAnnQuery = /\b(latest\s*announcement|new\s*announcement|recent\s*announcement|announcements|news|update|updates)\b/i.test(effectiveMessage) && /\b(latest|new|recent|any|what)\b/i.test(effectiveMessage);
+    
+    // 4. EVENTS
+    const isEventQuery = /\b(upcoming\s*event|events\s*coming\s*up|upcoming\s*activities|activities\s*coming\s*up|next\s*event|events|calendar|activity|activities)\b/i.test(effectiveMessage) && /\b(upcoming|coming|next|any|what)\b/i.test(effectiveMessage);
+    
+    // 5. LOST & FOUND
+    const isLFQuery = /\b(find|found|lost|missing|seen|keys|phone|wallet|bag|card|item|belonging)\b/i.test(effectiveMessage) && 
+                      /\b(did|anyone|someone|lost|found|looking\s*for|missing)\b/i.test(effectiveMessage) &&
+                      !/\b(how\s+to|where\s+can\s+i|how\s+do\s+i|where\s+to|where\s+do\s+i|steps\s+to|instructions\s+to)\s+(post|report|submit|create|add|claim|register)\b/i.test(effectiveMessage);
+
+    if (isDocQuery) {
+      // Check if it's a category/folder follow-up query
+      const isCategoryFollowUp = /\b(other\s*(file|document|template|form|item|list)|another\s*(file|document|template|form)|in\s*that\s*folder|in\s*that\s*category|same\s*folder|same\s*category|folder|category)\b/i.test(message) && history.length > 0;
+      
+      let lastCategoryDocs = [];
+      let lastCategoryName = '';
+      
+      if (isCategoryFollowUp) {
+        const lastTurn = [...history].reverse().find(t => t.user || t.bot);
+        if (lastTurn) {
+          const lastUserText = String(lastTurn.user || '');
+          const lastBotText = String(lastTurn.bot || '');
+          
+          const docLookupResult = await pool.query(
+            `SELECT dt.category_id, dc.name AS category_name
+             FROM document_templates dt
+             JOIN document_categories dc ON dt.category_id = dc.id
+             WHERE dt.status = 'active' AND (
+               $1 ILIKE '%' || dt.title || '%' 
+               OR $2 ILIKE '%' || dt.title || '%'
+               OR $1 ILIKE '%' || dt.file_name || '%'
+               OR $2 ILIKE '%' || dt.file_name || '%'
+             )
+             LIMIT 1`,
+            [lastUserText, lastBotText]
+          );
+          
+          if (docLookupResult.rows.length > 0) {
+            const { category_id, category_name } = docLookupResult.rows[0];
+            lastCategoryName = category_name;
+            const params = [category_id];
+            const visibilitySql = getDocumentVisibilitySql(req.user, params);
+            
+            const categoryDocsResult = await pool.query(
+              `SELECT dt.*, dc.name as category_name
+               FROM document_templates dt
+               LEFT JOIN document_categories dc ON dt.category_id = dc.id
+               WHERE ${visibilitySql} AND dt.category_id = $1
+               ORDER BY dt.title ASC`,
+              params
+            );
+            lastCategoryDocs = categoryDocsResult.rows;
+          }
+        }
+      }
+
+      let docRows = [];
+      if (isCategoryFollowUp && lastCategoryDocs.length > 0) {
+        docRows = lastCategoryDocs;
+      } else {
+        const stopWords = new Set(['show', 'me', 'can', 'i', 'get', 'the', 'a', 'an', 'please', 'find', 'search', 'for', 'any', 'download', 'want', 'retrieve', 'is', 'are', 'there', 'of', 'some', 'any', 'specific', 'form', 'forms', 'document', 'documents', 'template', 'templates', 'file', 'files']);
+        const words = message.toLowerCase().replace(/[?.,!]/g, '').split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+        
+        if (words.length > 0) {
+          const params = words.map(w => `%${w}%`);
+          const conds = words.map((_, i) => `(dt.title ILIKE $${i+1} OR dt.description ILIKE $${i+1} OR dt.file_name ILIKE $${i+1})`).join(' OR ');
+          const visibilitySql = getDocumentVisibilitySql(req.user, params);
+          
+          const r = await pool.query(
+            `SELECT dt.*, dc.name as category_name
+             FROM document_templates dt
+             LEFT JOIN document_categories dc ON dt.category_id = dc.id
+             WHERE ${visibilitySql} AND (${conds})
+             ORDER BY dt.title ASC LIMIT 5`,
+            params
+          );
+          docRows = r.rows;
+        } else {
+          const params = [];
+          const visibilitySql = getDocumentVisibilitySql(req.user, params);
+          
+          const r = await pool.query(
+            `SELECT dt.*, dc.name as category_name
+             FROM document_templates dt
+             LEFT JOIN document_categories dc ON dt.category_id = dc.id
+             WHERE ${visibilitySql}
+             ORDER BY dt.created_at DESC LIMIT 5`,
+            params
+          );
+          docRows = r.rows;
+        }
+      }
+
+      if (docRows.length === 0) {
+        const responseText = "No results found for your query.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      let richHtml = '';
+      let responseText = '';
+      if (isCategoryFollowUp && lastCategoryName) {
+        richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-folder-open" style="color: var(--maroon); margin-right: 6px;"></i> Category: ${lastCategoryName}</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+        `;
+        responseText = `Here are the files in the **${lastCategoryName}** category:`;
+      } else {
+        richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-file-alt" style="color: var(--maroon); margin-right: 6px;"></i> Matching Documents</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+        `;
+        responseText = "Here are the matching templates:";
+      }
+
+      docRows.forEach(doc => {
+        richHtml += `
+  <div class="doc-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; box-shadow: var(--shadow-sm);">
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+      <span style="font-size: 13px; font-weight: 700; color: var(--text-primary); line-height: 1.3;">${doc.title}</span>
+      ${doc.category_name ? `<span style="background: rgba(136,8,8,0.08); color: var(--maroon); font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; white-space: nowrap;">${doc.category_name}</span>` : ''}
+    </div>
+    ${doc.description ? `<p style="font-size: 11px; color: var(--text-secondary); margin: 2px 0;">${doc.description}</p>` : ''}
+    <div style="font-size: 10px; color: var(--text-light); margin-bottom: 6px;">
+      <i class="far fa-file"></i> ${doc.file_name} ${doc.file_size ? `· ${formatFileSize(doc.file_size)}` : ''}
+    </div>
+    <a href="${doc.file_url}" download="${doc.file_name}" class="doc-file-download-btn" onclick="window._trackDownload('${doc.id}')" style="display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 12px; border-radius: 6px; border: 1.5px solid #880808; color: #880808; background: transparent; font-size: 12px; font-weight: 600; text-decoration: none; transition: all 0.2s; cursor: pointer; white-space: nowrap; margin-top: 4px; width: fit-content;">
+      <i class="fas fa-download"></i> Download
+    </a>
+  </div>
+        `;
+      });
+      richHtml += `</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, isCategoryFollowUp && lastCategoryName ? `[Rich System Content: Category - ${lastCategoryName}]` : '[Rich System Content: Document Templates]']
+      );
+      return res.json({ response: responseText, richHtml, images: [] });
+    }
+
+    else if (isScheduleQuery) {
+      if (req.user.role === 'guest') {
+        const responseText = "Guest users do not have class schedules. Please log in to your account to view your schedule.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      const isFaculty = req.user.role === 'faculty';
+      let schedRows = [];
+      if (isFaculty) {
+        const r = await pool.query(
+          `SELECT * FROM faculty_schedules WHERE faculty_id = $1 ORDER BY CASE
+            WHEN day_of_week = 'Monday' THEN 1
+            WHEN day_of_week = 'Tuesday' THEN 2
+            WHEN day_of_week = 'Wednesday' THEN 3
+            WHEN day_of_week = 'Thursday' THEN 4
+            WHEN day_of_week = 'Friday' THEN 5
+            WHEN day_of_week = 'Saturday' THEN 6
+            WHEN day_of_week = 'Sunday' THEN 7
+            ELSE 8
+          END, start_time ASC`,
+          [req.user.id]
+        );
+        schedRows = r.rows;
+      } else {
+        const r = await pool.query(
+          `SELECT * FROM class_schedules WHERE user_id = $1 ORDER BY CASE
+            WHEN day_of_week = 'Monday' THEN 1
+            WHEN day_of_week = 'Tuesday' THEN 2
+            WHEN day_of_week = 'Wednesday' THEN 3
+            WHEN day_of_week = 'Thursday' THEN 4
+            WHEN day_of_week = 'Friday' THEN 5
+            WHEN day_of_week = 'Saturday' THEN 6
+            WHEN day_of_week = 'Sunday' THEN 7
+            ELSE 8
+          END, start_time ASC`,
+          [req.user.id]
+        );
+        schedRows = r.rows;
+      }
+
+      if (schedRows.length === 0) {
+        const responseText = "No results found for your query. It looks like you don't have any classes in your schedule yet.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-calendar-alt" style="color: var(--maroon); margin-right: 6px;"></i> My Class Schedule</div>
+<div class="chatbot-schedule-table-wrap" style="overflow-x: auto; margin-top: 6px; border: 1.5px solid var(--border); border-radius: 8px; background: var(--bg-card);">
+  <table style="width: 100%; border-collapse: collapse; font-size: 11px; text-align: left;">
+    <thead>
+      <tr style="background: var(--bg-secondary); border-bottom: 1.5px solid var(--border);">
+        <th style="padding: 8px 10px; font-weight: 700; color: var(--text-secondary);">Day & Time</th>
+        <th style="padding: 8px 10px; font-weight: 700; color: var(--text-secondary);">Subject</th>
+        <th style="padding: 8px 10px; font-weight: 700; color: var(--text-secondary);">Room</th>
+      </tr>
+    </thead>
+    <tbody>
+      `;
+      schedRows.forEach(row => {
+        const dayTime = `${row.day_of_week.substring(0,3)} ${formatTime(row.start_time)}-${formatTime(row.end_time)}`;
+        richHtml += `
+      <tr style="border-bottom: 1px solid var(--border-light);">
+        <td style="padding: 8px 10px; white-space: nowrap; font-weight: 600; color: var(--maroon);">${dayTime}</td>
+        <td style="padding: 8px 10px;">
+          <div style="font-weight: 700; color: var(--text-primary);">${row.subject_code}</div>
+          <div style="font-size: 10px; color: var(--text-secondary);">${row.subject_name}</div>
+          ${row.instructor ? `<div style="font-size: 9px; color: var(--text-light);">Inst: ${row.instructor}</div>` : ''}
+        </td>
+        <td style="padding: 8px 10px; font-weight: 600; color: var(--text-primary);">${row.room || 'N/A'}</td>
+      </tr>
+        `;
+      });
+      richHtml += `
+    </tbody>
+  </table>
+</div>
+      `;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, '[Rich System Content: Class Schedule]']
+      );
+      return res.json({ response: "Here is your class schedule:", richHtml, images: [] });
+    }
+
+    else if (isAnnQuery) {
+      let params = [];
+      const visibilitySql = getAnnouncementVisibilitySql(req.user, params, 'a');
+      let annQuery = `
+        SELECT a.*, u.first_name, u.last_name, u.role as author_role
+        FROM announcements a
+        LEFT JOIN users u ON a.author_id = u.id
+        WHERE ${visibilitySql}
+        ORDER BY a.created_at DESC LIMIT 5
+      `;
+
+      const r = await pool.query(annQuery, params);
+      const annRows = r.rows;
+
+      if (annRows.length === 0) {
+        const responseText = "No results found for your query. There are no recent announcements.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-bullhorn" style="color: var(--maroon); margin-right: 6px;"></i> Recent Announcements</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+      `;
+      annRows.forEach(ann => {
+        const dateStr = new Date(ann.created_at).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'});
+        richHtml += `
+  <div class="ann-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; box-shadow: var(--shadow-sm);">
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+      <span style="font-size: 13px; font-weight: 700; color: var(--text-primary); line-height: 1.3;">${ann.title}</span>
+      <span style="background: rgba(136,8,8,0.08); color: var(--maroon); font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; white-space: nowrap;">${ann.department}</span>
+    </div>
+    <div style="font-size: 11px; color: var(--text-light); margin-bottom: 4px;"><i class="far fa-calendar-alt"></i> ${dateStr}</div>
+    <p style="font-size: 12px; color: var(--text-secondary); margin: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.4;">${ann.content}</p>
+  </div>
+        `;
+      });
+      richHtml += `</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, '[Rich System Content: Recent Announcements]']
+      );
+      return res.json({ response: "Here are the latest announcements:", richHtml, images: [] });
+    }
+
+    else if (isEventQuery) {
+      let params = [];
+      const visibilitySql = getEventVisibilitySql(req.user, params, '');
+      let eventQuery = `
+        SELECT * FROM events
+        WHERE ${visibilitySql} AND event_date >= CURRENT_DATE
+        ORDER BY event_date ASC, start_time ASC LIMIT 5
+      `;
+
+      const r = await pool.query(eventQuery, params);
+      const eventRows = r.rows;
+
+      if (eventRows.length === 0) {
+        const responseText = "No results found for your query. There are no upcoming events.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-calendar-day" style="color: var(--maroon); margin-right: 6px;"></i> Upcoming Events</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+      `;
+      eventRows.forEach(ev => {
+        const dateStr = new Date(ev.event_date).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'});
+        const timeStr = ev.start_time ? formatTime(ev.start_time) : '';
+        richHtml += `
+  <div class="event-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; box-shadow: var(--shadow-sm);">
+    <span style="font-size: 13px; font-weight: 700; color: var(--text-primary);">${ev.title}</span>
+    <div style="font-size: 11px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 2px;">
+      <div><i class="far fa-calendar-alt" style="width: 14px;"></i> ${dateStr} ${timeStr ? ' at ' + timeStr : ''}</div>
+      ${ev.location ? `<div><i class="fas fa-map-marker-alt" style="width: 14px;"></i> ${ev.location}</div>` : ''}
+    </div>
+  </div>
+        `;
+      });
+      richHtml += `</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, '[Rich System Content: Upcoming Events]']
+      );
+      return res.json({ response: "Here are the upcoming events:", richHtml, images: [] });
+    }
+
+    else if (isLFQuery) {
+      const isRestricted = req.user.role === 'student' || req.user.role === 'faculty' || req.user.role === 'guest';
+      const lfTypeFilter = isRestricted ? " AND lf.type = 'lost'" : '';
+      const words = message.toLowerCase().replace(/[?.,!]/g, '').split(/\s+/).filter(w => w.length > 2 && !['did', 'anyone', 'find', 'found', 'lost', 'my', 'the', 'looking', 'for', 'have', 'seen', 'belonging', 'item', 'items', 'and', 'report', 'reports', 'what', 'are', 'who', 'how', 'why', 'when', 'where', 'was', 'were', 'you', 'not', 'but', 'has', 'had', 'with', 'from', 'out', 'all', 'any', 'about', 'context', 'previous', 'answer'].includes(w));
+      let lfRows = [];
+      if (words.length > 0) {
+        let lfQuery = `
+          SELECT lf.*, lfi.image_url
+          FROM lost_found lf
+          LEFT JOIN (
+            SELECT lost_found_id, MIN(image_url) as image_url
+            FROM lost_found_images
+            GROUP BY lost_found_id
+          ) lfi ON lf.id = lfi.lost_found_id
+          WHERE lf.status = 'open' AND lf.approved = true${lfTypeFilter}
+        `;
+        const conds = words.map((w, idx) => {
+          return `(lf.item_name ILIKE $${idx + 1} OR lf.description ILIKE $${idx + 1} OR lf.category ILIKE $${idx + 1})`;
+        });
+        lfQuery += ` AND (${conds.join(' OR ')})`;
+        lfQuery += ` ORDER BY lf.date_reported DESC, lf.created_at DESC LIMIT 5`;
+
+        const r = await pool.query(lfQuery, words.map(w => `%${w}%`));
+        lfRows = r.rows;
+      } else {
+        const r = await pool.query(
+          `SELECT lf.*, lfi.image_url
+           FROM lost_found lf
+           LEFT JOIN (
+             SELECT lost_found_id, MIN(image_url) as image_url
+             FROM lost_found_images
+             GROUP BY lost_found_id
+           ) lfi ON lf.id = lfi.lost_found_id
+           WHERE lf.status = 'open' AND lf.approved = true${lfTypeFilter}
+           ORDER BY lf.date_reported DESC, lf.created_at DESC LIMIT 5`
+        );
+        lfRows = r.rows;
+      }
+
+      if (lfRows.length === 0) {
+        const responseText = "No results found for your query.";
+        await pool.query(
+          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+          [req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-search-location" style="color: var(--maroon); margin-right: 6px;"></i> Lost & Found Reports</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+      `;
+      lfRows.forEach(lf => {
+        const dateStr = new Date(lf.date_reported).toLocaleDateString();
+        richHtml += `
+  <div class="lf-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; gap: 10px; box-shadow: var(--shadow-sm);">
+    ${lf.image_url ? `<img src="${lf.image_url}" style="width: 50px; height: 50px; object-fit: cover; border-radius: 6px; flex-shrink: 0;">` : `<div style="width: 50px; height: 50px; background: rgba(136,8,8,0.05); color: var(--maroon); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;"><i class="fas fa-box-open"></i></div>`}
+    <div style="display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1;">
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px;">
+        <span style="font-size: 13px; font-weight: 700; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${lf.item_name}</span>
+        <span style="font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 1px 4px; border-radius: 3px; background: ${lf.type === 'lost' ? '#fef2f2' : '#f0fdf4'}; color: ${lf.type === 'lost' ? '#ef4444' : '#22c55e'};">${lf.type}</span>
+      </div>
+      <p style="font-size: 11px; color: var(--text-secondary); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${lf.description}</p>
+      <div style="font-size: 10px; color: var(--text-light); margin-top: 2px;">
+        <i class="fas fa-map-marker-alt"></i> ${lf.location_found || 'N/A'} · ${dateStr}
+      </div>
+    </div>
+  </div>
+        `;
+      });
+      richHtml += `</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
+        [req.user.id, message, '[Rich System Content: Lost & Found]']
+      );
+      return res.json({ response: "Here are the matching items:", richHtml, images: [] });
+    }
+
+    let botResponse, images = [];
 
     // Fetch real DB context for all relevant modules in parallel
-    const { doc_context, live_data } = await getAllModuleContexts(effectiveMessage);
+    const { doc_context, live_data } = await getAllModuleContexts(effectiveMessage, req.user);
 
     // Try deterministic direct answer first (exact name/keyword match → no AI needed)
     const directAnswer = buildDirectAnswer(effectiveMessage, doc_context, live_data);

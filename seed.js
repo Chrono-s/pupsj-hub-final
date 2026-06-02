@@ -8,12 +8,8 @@ async function seed() {
     console.log('🔄 Running database schema...');
     const schema = fs.readFileSync(path.join(__dirname, 'database', 'schema.sql'), 'utf8');
     await pool.query(schema);
-    // Run allowed registrations migration
-    const allowedRegMigration = fs.readFileSync(path.join(__dirname, 'database', 'migration-allowed-registrations.sql'), 'utf8');
-    await pool.query(allowedRegMigration);
-    // Run lostfound image fingerprints migration
-    const lostfoundFingerprintsMigration = fs.readFileSync(path.join(__dirname, 'database', 'migration-lostfound-image-fingerprints.sql'), 'utf8');
-    await pool.query(lostfoundFingerprintsMigration);
+    // Since all schemas (including allowed_registrations and lost_found_images columns) are consolidated in schema.sql, 
+    // separate migration files are no longer required.
     console.log('✅ Schema created');
 
     // Create admin user

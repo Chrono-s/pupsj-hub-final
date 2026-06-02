@@ -322,6 +322,14 @@ class SemanticRetriever:
         inst.chunks      = data["chunks"]
         inst.model_name  = data.get("model_name", SEMANTIC_MODEL_NAME)
 
-        from sentence_transformers import SentenceTransformer
-        inst.model = SentenceTransformer(inst.model_name)
-        return inst
+        try:
+            from sentence_transformers import SentenceTransformer
+            inst.model = SentenceTransformer(inst.model_name)
+            return inst
+        except Exception as e:
+            print(
+                f"[SemanticRetriever] Failed to load SentenceTransformer model '{inst.model_name}' "
+                f"({type(e).__name__}: {e}) — falling back to BM25+TF-IDF only."
+            )
+            return None
+
