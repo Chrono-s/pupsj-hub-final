@@ -3823,30 +3823,35 @@
     // Build the matches dashboard content
     let matchDashboardHtml = '';
     if (isAdmin && (state.lostFoundReviews.length > 0 || state.lostFoundRejected.length > 0)) {
+      const pendingCount = state.lostFoundReviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length;
+      const approvedCount = state.lostFoundReviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length;
+      const claimedCount = state.lostFoundReviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length;
+      const rejectedCount = state.lostFoundRejected.length;
+
       matchDashboardHtml = `
-        <div class="card lf-review-queue" style="margin-bottom: 24px; padding: 24px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg-card);">
-          <div class="lf-review-head" style="margin-bottom: 18px;">
-            <h3 style="font-size: 18px; font-weight: 700; color: var(--text-primary); margin-bottom: 6px;"><i class="fas fa-magic" style="color: var(--primary);"></i> AI Matches &amp; Claim Dashboard</h3>
-            <p style="font-size: 13px; color: var(--text-secondary); margin: 0;">Review suggested matches, approve verified matches, and track item claims.</p>
+        <div class="card lf-review-queue">
+          <div class="lf-review-head">
+            <h3><i class="fas fa-magic" style="color: var(--primary);"></i> AI Matches &amp; Claim Dashboard</h3>
+            <p>Review suggested matches, approve verified matches, and track item claims.</p>
           </div>
           
-          <div class="lf-match-dashboard-tabs" style="display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px;">
-            <button class="btn btn-sm ${state.activeMatchTab === 'pending' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('pending')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Matched by AI (${state.lostFoundReviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length})
+          <div class="lf-match-dashboard-tabs">
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'pending' ? 'active' : ''}" onclick="window._changeActiveMatchTab('pending')">
+              Matched by AI (${pendingCount})
             </button>
-            <button class="btn btn-sm ${state.activeMatchTab === 'approved' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('approved')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Approved Matches (${state.lostFoundReviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length})
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'approved' ? 'active' : ''}" onclick="window._changeActiveMatchTab('approved')">
+              Approved Matches (${approvedCount})
             </button>
-            <button class="btn btn-sm ${state.activeMatchTab === 'claimed' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('claimed')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Claimed Items (${state.lostFoundReviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length})
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'claimed' ? 'active' : ''}" onclick="window._changeActiveMatchTab('claimed')">
+              Claimed Items (${claimedCount})
             </button>
-            <button class="btn btn-sm ${state.activeMatchTab === 'rejected' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('rejected')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px; ${state.lostFoundRejected.length > 0 ? 'position:relative;' : ''}">
-              Rejected (${state.lostFoundRejected.length})
-              ${state.lostFoundRejected.length > 0 ? `<span style="position:absolute;top:-5px;right:-5px;background:#dc2626;color:#fff;border-radius:999px;font-size:10px;padding:1px 5px;font-weight:700;">${state.lostFoundRejected.length}</span>` : ''}
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'rejected' ? 'active' : ''}" onclick="window._changeActiveMatchTab('rejected')">
+              Rejected (${rejectedCount})
+              ${rejectedCount > 0 ? `<span class="lf-match-badge-counter">${rejectedCount}</span>` : ''}
             </button>
           </div>
 
-          <div class="lf-review-list" style="display: flex; flex-direction: column; gap: 16px;">
+          <div class="lf-review-list">
             ${(() => {
               const pendingMatches = state.lostFoundReviews.filter(m => 
                 (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') &&
@@ -3888,107 +3893,101 @@
               const score = review.match_score || 0;
               const normalizedScore = score > 1 ? score / 100 : score;
               const pct = Math.round(normalizedScore * 100);
-              const isRejected = state.activeMatchTab === 'rejected';
               
               return `
                 <!-- Top Arrow Navigation Bar -->
-                <div class="lf-match-nav-bar" style="display: flex; justify-content: space-between; align-items: center; background: var(--bg-primary); padding: 10px 16px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 4px;">
+                <div class="lf-match-nav-bar">
                   <div style="display: flex; align-items: center; gap: 10px;">
-                    <span style="background: var(--primary); color: #fff; font-size: 12px; font-weight: 700; padding: 4px 12px; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px;">
+                    <span class="lf-match-count-badge">
                       <i class="fas fa-layer-group" style="font-size: 10px;"></i> Match ${currentIndex + 1} of ${currentTabList.length}
                     </span>
-                    <span style="font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px;">
-                      <i class="fas fa-keyboard" style="opacity: 0.7;"></i> Use <kbd style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 11px; font-family: monospace;">←</kbd> <kbd style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 11px; font-family: monospace;">→</kbd> arrow keys to scroll
+                    <span class="lf-match-key-hint">
+                      <i class="far fa-keyboard" style="opacity: 0.7;"></i> Use <kbd>←</kbd> <kbd>→</kbd> arrow keys to scroll
                     </span>
                   </div>
                   <div style="display: flex; align-items: center; gap: 6px;">
-                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match (← Left Arrow)" style="font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 6px; display: inline-flex; align-items: center; gap: 6px;">
+                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match (← Left Arrow)">
                       <i class="fas fa-chevron-left"></i> Prev
                     </button>
-                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match (→ Right Arrow)" style="font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 6px; display: inline-flex; align-items: center; gap: 6px;">
+                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match (→ Right Arrow)">
                       Next <i class="fas fa-chevron-right"></i>
                     </button>
                   </div>
                 </div>
 
-                <div class="lf-review-card" style="border: 1px solid var(--border); border-radius: 10px; padding: 20px; background: var(--bg-primary); display: flex; flex-direction: column; gap: 16px; transition: all 0.2s ease;">
+                <div class="lf-review-card">
                   <!-- Card Header: Match Score / Status -->
-                  <div class="lf-review-card-hdr" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 10px;">
-                    <span class="match-score-badge" style="font-size: 12px; font-weight: 700; background: var(--primary-soft); color: var(--primary); padding: 4px 10px; border-radius: 999px; display: flex; align-items: center; gap: 6px;">
+                  <div class="lf-review-card-hdr">
+                    <span class="lf-match-score-pill">
                       <i class="fas fa-chart-line"></i> AI Match Score: ${pct}%
                     </span>
-                    <span class="lf-status-badge ${state.activeMatchTab}" style="font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; border-radius: 4px; ${
-                      state.activeMatchTab === 'pending' ? 'background: #fef3c7; color: #d97706;' 
-                      : state.activeMatchTab === 'approved' ? 'background: #dbeafe; color: #2563eb;' 
-                      : state.activeMatchTab === 'rejected' ? 'background: #fee2e2; color: #b91c1c;'
-                      : 'background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe;'
-                    }">
+                    <span class="lf-match-status-badge ${state.activeMatchTab}">
                       ${state.activeMatchTab === 'pending' ? 'Pending Review' : state.activeMatchTab === 'approved' ? 'Approved' : state.activeMatchTab === 'rejected' ? 'Rejected' : 'Claimed'}
                     </span>
                   </div>
                   
                   <!-- Side by Side Columns -->
-                  <div class="lf-review-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+                  <div class="lf-review-columns">
                     <!-- Found Item Column (Left) -->
-                    <div class="lf-review-side" style="display: flex; flex-direction: column; gap: 8px;">
-                      <div class="lf-review-label" style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--primary);">
-                        <i class="fas fa-eye"></i> Found Item Report
+                    <div class="lf-review-side">
+                      <div class="lf-review-label">
+                        <i class="far fa-dot-circle"></i> Found Item Report
                       </div>
-                      <h4 style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0;">${escHtml(found.item_name)}</h4>
-                      <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin: 0;">${escHtml(found.description || '')}</p>
-                      <div class="lf-card-meta" style="display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--text-muted);">
+                      <h4>${escHtml(found.item_name)}</h4>
+                      <p>${escHtml(found.description || '')}</p>
+                      <div class="lf-card-meta">
                         ${found.category ? `<span><i class="fas fa-tag"></i> ${escHtml(found.category)}</span>` : ''}
                         ${found.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(found.location_found)}</span>` : ''}
                         ${found.reporter_name ? `<span><i class="fas fa-user-tie"></i> Reporter: ${escHtml(found.reporter_name)}</span>` : ''}
                       </div>
                       ${found.images && found.images.length > 0 && found.images[0].id ? `
-                        <div class="lf-card-images" style="display: flex; gap: 6px; margin-top: 6px; overflow-x: auto; padding-bottom: 4px;">
-                          ${found.images.map(img => `<img src="${img.image_url}" alt="found item" onclick="window._openImageViewer('${img.image_url}')" style="width: 50px; height: 50px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border);">`).join('')}
+                        <div class="lf-card-images">
+                          ${found.images.map(img => `<img src="${img.image_url}" alt="found item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
                         </div>` : ''}
                     </div>
                     
                     <!-- Lost Item Column (Right) -->
-                    <div class="lf-review-side" style="display: flex; flex-direction: column; gap: 8px; border-left: 1px dashed var(--border); padding-left: 20px;">
-                      <div class="lf-review-label" style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--primary);">
+                    <div class="lf-review-side" style="border-left: 1px dotted var(--border); padding-left: 20px;">
+                      <div class="lf-review-label">
                         <i class="fas fa-search"></i> Matched Lost Report
                       </div>
-                      <h4 style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0;">${escHtml(lost.item_name)}</h4>
-                      <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin: 0;">${escHtml(lost.description || '')}</p>
-                      <div class="lf-card-meta" style="display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--text-muted);">
+                      <h4>${escHtml(lost.item_name)}</h4>
+                      <p>${escHtml(lost.description || '')}</p>
+                      <div class="lf-card-meta">
                         ${lost.category ? `<span><i class="fas fa-tag"></i> ${escHtml(lost.category)}</span>` : ''}
                         ${lost.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(lost.location_found)}</span>` : ''}
                         ${lost.reporter_name ? `<span><i class="fas fa-user"></i> Poster: ${escHtml(lost.reporter_name)}</span>` : ''}
                       </div>
                       ${lost.images && lost.images.length > 0 && lost.images[0].id ? `
-                        <div class="lf-card-images" style="display: flex; gap: 6px; margin-top: 6px; overflow-x: auto; padding-bottom: 4px;">
-                          ${lost.images.map(img => `<img src="${img.image_url}" alt="lost item" onclick="window._openImageViewer('${img.image_url}')" style="width: 50px; height: 50px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border);">`).join('')}
+                        <div class="lf-card-images">
+                          ${lost.images.map(img => `<img src="${img.image_url}" alt="lost item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
                         </div>` : ''}
                     </div>
                   </div>
                   
                   <!-- Action Buttons -->
-                  <div class="lf-review-actions" style="display: flex; justify-content: space-between; align-items: center; gap: 10px; border-top: 1px solid var(--border); padding-top: 12px;">
+                  <div class="lf-review-actions">
                     <div style="display: flex; gap: 6px;">
-                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match" style="font-size: 11px; font-weight: 600; padding: 5px 12px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px;">
+                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match">
                         <i class="fas fa-chevron-left"></i> Prev
                       </button>
-                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match" style="font-size: 11px; font-weight: 600; padding: 5px 12px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px;">
+                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match">
                         Next <i class="fas fa-chevron-right"></i>
                       </button>
                     </div>
 
                     <div style="display: flex; align-items: center; gap: 10px;">
                       ${state.activeMatchTab === 'pending' ? `
-                        <button class="btn btn-success btn-sm" onclick="window._decideLostFoundReview('${found.id}','approve','${lost.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-check"></i> Approve Match</button>
-                        <button class="btn btn-danger btn-sm" onclick="window._decideLostFoundReview('${found.id}','reject','${lost.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-times"></i> Reject Match</button>
+                        <button class="btn btn-success btn-sm" onclick="window._decideLostFoundReview('${found.id}','approve','${lost.id}')"><i class="fas fa-check"></i> Approve Match</button>
+                        <button class="btn btn-danger btn-sm" onclick="window._decideLostFoundReview('${found.id}','reject','${lost.id}')"><i class="fas fa-times"></i> Reject Match</button>
                       ` : state.activeMatchTab === 'approved' ? `
-                        <button class="btn btn-success btn-sm" onclick="window._claimLostFoundMatch('${lost.id}','${found.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px; background: #166534 !important; border-color: #166534 !important;"><i class="fas fa-hand-holding-heart"></i> Claimed</button>
+                        <button class="btn btn-success btn-sm" onclick="window._claimLostFoundMatch('${lost.id}','${found.id}')" style="background: #166534 !important; border-color: #166534 !important;"><i class="fas fa-hand-holding-heart"></i> Claimed</button>
                       ` : state.activeMatchTab === 'rejected' ? `
                         <span style="font-size: 12px; color: var(--text-secondary); margin-right: 6px;"><i class="fas fa-info-circle"></i> Previously rejected — re-open if this was a mistake</span>
-                        <button class="btn btn-secondary btn-sm" onclick="window._reopenLostFoundMatch('${found.id}','${lost.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-undo"></i> Re-open for Review</button>
+                        <button class="btn btn-secondary btn-sm" onclick="window._reopenLostFoundMatch('${found.id}','${lost.id}')"><i class="fas fa-undo"></i> Re-open for Review</button>
                       ` : `
                         <span style="font-size: 13px; color: #166534; font-weight: 600; display: flex; align-items: center; gap: 6px; margin-right: 6px;"><i class="fas fa-check-circle"></i> Handed over and resolved</span>
-                        <button class="btn btn-secondary btn-sm" onclick="window._unclaimLostFoundMatch('${lost.id}','${found.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-undo"></i> Unclaim</button>
+                        <button class="btn btn-secondary btn-sm" onclick="window._unclaimLostFoundMatch('${lost.id}','${found.id}')"><i class="fas fa-undo"></i> Unclaim</button>
                       `}
                     </div>
                   </div>

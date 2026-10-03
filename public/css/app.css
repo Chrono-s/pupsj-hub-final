@@ -2049,6 +2049,250 @@ html[data-theme="light"] .calendar-select:hover {
 .lf-tab.active { background: var(--maroon); color: #fff; }
 .lf-tab:hover:not(.active) { background: rgba(0,0,0,0.03); }
 
+/* LOST & FOUND AI DASHBOARD & MATCHES */
+.lf-review-queue {
+  margin-bottom: 24px;
+  padding: 24px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-sm);
+}
+.lf-review-head h3 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lf-review-head p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0;
+}
+.lf-match-dashboard-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 12px;
+  flex-wrap: wrap;
+}
+.lf-match-pill-tab {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 18px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.lf-match-pill-tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text-primary);
+}
+html[data-theme="dark"] .lf-match-pill-tab:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-primary);
+}
+.lf-match-pill-tab.active {
+  background: var(--primary) !important;
+  color: #ffffff !important;
+  border-color: var(--primary) !important;
+  box-shadow: 0 2px 4px rgba(136, 8, 8, 0.2);
+}
+.lf-match-badge-counter {
+  position: absolute;
+  top: -6px;
+  right: -4px;
+  background: #dc2626;
+  color: #fff;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+.lf-match-nav-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--bg-primary);
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.lf-match-count-badge {
+  background: var(--primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 14px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.lf-match-key-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.lf-match-key-hint kbd {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--text-primary);
+}
+.lf-review-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  background: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  transition: all 0.2s ease;
+}
+.lf-review-card-hdr {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px dotted var(--border);
+  padding-bottom: 12px;
+}
+.lf-match-score-pill {
+  font-size: 12px;
+  font-weight: 700;
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid rgba(220, 38, 38, 0.15);
+  padding: 4px 12px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+html[data-theme="dark"] .lf-match-score-pill {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.lf-match-status-badge {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 4px 12px;
+  border-radius: 999px;
+}
+.lf-match-status-badge.pending {
+  background: #fef3c7;
+  color: #b45309;
+}
+html[data-theme="dark"] .lf-match-status-badge.pending {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+}
+.lf-match-status-badge.approved {
+  background: #dbeafe;
+  color: #2563eb;
+}
+html[data-theme="dark"] .lf-match-status-badge.approved {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+}
+.lf-match-status-badge.rejected {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+html[data-theme="dark"] .lf-match-status-badge.rejected {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+}
+.lf-match-status-badge.claimed {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+}
+html[data-theme="dark"] .lf-match-status-badge.claimed {
+  background: rgba(59, 130, 246, 0.15);
+  color: #60a5fa;
+  border-color: rgba(59, 130, 246, 0.3);
+}
+.lf-review-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+@media (max-width: 768px) {
+  .lf-review-columns {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .lf-review-side:last-child {
+    border-left: none !important;
+    border-top: 1px dotted var(--border);
+    padding-left: 0 !important;
+    padding-top: 16px;
+  }
+}
+.lf-review-side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.lf-review-label {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.lf-review-side h4 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+}
+.lf-review-side p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0;
+}
+.lf-review-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  flex-wrap: wrap;
+}
+
 .lf-card {
   margin-bottom: 12px; padding: 16px 18px;
 }
