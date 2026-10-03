@@ -1,0 +1,59 @@
+{
+  "name": "pupsj-hub",
+  "version": "1.0.0",
+  "description": "PUPSJ HUB - PUP San Juan Campus Progressive Web Application",
+  "main": "src/server.js",
+  "scripts": {
+    "prestart": "node -e \"const k=require('kill-port');const appPort=Number(process.env.PORT||3000);let aiPort=8001;try{aiPort=Number(new URL(process.env.AI_SIDECAR_URL||'http://localhost:8001').port||8001)}catch{}Promise.all([k(appPort),k(aiPort)]).catch(()=>{})\"",
+    "predev": "node -e \"const k=require('kill-port');const appPort=Number(process.env.PORT||3000);let aiPort=8001;try{aiPort=Number(new URL(process.env.AI_SIDECAR_URL||'http://localhost:8001').port||8001)}catch{}Promise.all([k(appPort),k(aiPort)]).catch(()=>{})\"",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "concurrently -n \"server,ai\" -c \"cyan,yellow\" \"node src/server.js\" \"node scripts/start-ai.js\"",
+    "dev": "concurrently -n \"server,ai\" -c \"cyan,yellow\" \"tsx watch src/server.js\" \"node scripts/start-ai.js --reload\"",
+    "seed": "node seed.js",
+    "server": "tsx src/server.js",
+    "ai": "node scripts/start-ai.js --reload"
+  },
+  "keywords": [
+    "pupsj",
+    "pwa",
+    "campus"
+  ],
+  "author": "PUPSJ HUB Team",
+  "license": "MIT",
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^6.5.1",
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "express-session": "^1.19.0",
+    "helmet": "^8.1.0",
+    "hpp": "^0.2.3",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "multer": "^2.1.1",
+    "nodemailer": "^8.0.7",
+    "mysql2": "^3.11.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/express-session": "^1.19.0",
+    "@types/hpp": "^0.2.7",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/morgan": "^1.9.10",
+    "@types/multer": "^2.1.0",
+    "@types/node": "^25.6.0",
+    "@types/pg": "^8.20.0",
+    "concurrently": "^9.2.1",
+    "kill-port": "^2.0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

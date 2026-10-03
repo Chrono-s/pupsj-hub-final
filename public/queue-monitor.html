@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Queue Monitor · PUPSJ CIAS</title>
+  <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
+  <style>
+    :root {
+      --maroon: #880808;
+      --maroon-dark: #620404;
+      --maroon-deep: #460202;
+      --maroon-light: #fff3f3;
+      --maroon-soft: rgba(136, 8, 8, 0.08);
+      --gold: #f59e0b;
+      --gold-light: #fef3c7;
+      --gold-dark: #b45309;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --border-light: #edf2f7;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --text-light: #94a3b8;
+      --blue: #2563eb;
+      --blue-light: #eff6ff;
+      --emerald: #10b981;
+      --emerald-light: #ecfdf5;
+      --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.04);
+      --shadow-md: 0 10px 25px -3px rgba(136, 8, 8, 0.07), 0 4px 12px -2px rgba(15, 23, 42, 0.04);
+      --shadow-lg: 0 20px 35px -5px rgba(136, 8, 8, 0.12), 0 10px 15px -4px rgba(15, 23, 42, 0.05);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── Top Header ────────────────────────────────────────── */
+    .top-header {
+      background: linear-gradient(135deg, var(--maroon-deep) 0%, var(--maroon) 55%, #a61212 100%);
+      color: #fff;
+      padding: 22px clamp(20px, 4vw, 48px);
+      box-shadow: 0 4px 20px rgba(70, 2, 2, 0.25);
+      position: relative;
+      z-index: 10;
+    }
+    .header-content {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .header-left {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .header-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #ffd4d4;
+    }
+    .live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.35);
+      animation: pulse-dot 2s infinite;
+    }
+    @keyframes pulse-dot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.25); opacity: 0.8; }
+    }
+    .header-title {
+      font-size: clamp(24px, 3.2vw, 38px);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin: 2px 0 0;
+    }
+    .header-meta {
+      font-size: 13px;
+      color: #ffe6e6;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 3px;
+    }
+    .header-clock {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight: 600;
+      background: rgba(0, 0, 0, 0.22);
+      padding: 3px 9px;
+      border-radius: 6px;
+      letter-spacing: 0.05em;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn-header {
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: #fff;
+      padding: 9px 16px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      transition: all 0.2s ease;
+    }
+    .btn-header:hover {
+      background: rgba(255, 255, 255, 0.25);
+      transform: translateY(-1px);
+    }
+    .btn-header.is-active {
+      background: #fff;
+      color: var(--maroon);
+      border-color: #fff;
+    }
+
+    /* ── Main Layout ───────────────────────────────────────── */
+    main {
+      max-width: 1600px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 28px clamp(16px, 3.5vw, 44px) 120px;
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(360px, 1fr) minmax(460px, 1.4fr);
+      gap: 24px;
+      align-items: stretch;
+    }
+
+    /* ── Cards Common ──────────────────────────────────────── */
+    .monitor-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow-md);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: box-shadow 0.2s;
+    }
+
+    /* ── Left: Now Serving Card ────────────────────────────── */
+    .card-serving {
+      border-top: 6px solid var(--maroon);
+      padding: 32px 36px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 480px;
+      position: relative;
+    }
+    .card-serving::before {
+      content: "";
+      position: absolute;
+      top: 0; right: 0;
+      width: 220px; height: 220px;
+      background: radial-gradient(circle, rgba(136, 8, 8, 0.035) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .serving-kicker {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .serving-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--maroon);
+      background: var(--maroon-light);
+      border: 1px solid rgba(136, 8, 8, 0.15);
+      padding: 6px 13px;
+      border-radius: 999px;
+    }
+    .serving-badge i {
+      animation: pulse-ring 2s infinite;
+    }
+    @keyframes pulse-ring {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.2); }
+    }
+
+    .serving-tags {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .source-tag {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 4px 10px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .source-tag.appointment {
+      background: var(--blue-light);
+      color: var(--blue);
+      border: 1px solid #bfdbfe;
+    }
+    .source-tag.walk_in {
+      background: #fff7ed;
+      color: #ea580c;
+      border: 1px solid #fed7aa;
+    }
+    .priority-tag {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--gold-light);
+      color: var(--gold-dark);
+      border: 1px solid #fde68a;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .serving-main {
+      margin: 36px 0;
+      text-align: center;
+    }
+    .ticket-prefix {
+      font-size: clamp(16px, 1.8vw, 24px);
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .ticket-number {
+      font-size: clamp(80px, 10vw, 150px);
+      font-weight: 900;
+      line-height: 0.9;
+      letter-spacing: -0.03em;
+      color: var(--maroon);
+      text-shadow: 0 4px 18px rgba(136, 8, 8, 0.12);
+      user-select: all;
+    }
+    .ticket-empty {
+      color: var(--text-light);
+      font-size: clamp(60px, 8vw, 110px);
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+
+    .serving-purpose {
+      margin-top: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      padding: 10px 20px;
+      background: #f1f5f9;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-main);
+      max-width: 90%;
+      word-break: break-word;
+    }
+    .serving-purpose i {
+      color: var(--maroon);
+    }
+
+    .serving-footer {
+      border-top: 1px solid var(--border-light);
+      padding-top: 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    /* ── Right: Up Next Card ───────────────────────────────── */
+    .card-up-next {
+      padding: 24px 28px 28px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .up-next-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--border-light);
+      flex-wrap: wrap;
+    }
+    .up-next-title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .up-next-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: var(--maroon-light);
+      color: var(--maroon);
+      display: grid;
+      place-items: center;
+      font-size: 16px;
+    }
+    .up-next-title {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--text-main);
+      letter-spacing: -0.01em;
+    }
+    .up-next-subtitle {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* ── View Switcher Tabs ────────────────────────────────── */
+    .view-tabs {
+      display: inline-flex;
+      background: #f1f5f9;
+      padding: 4px;
+      border-radius: 12px;
+      gap: 4px;
+      border: 1px solid var(--border);
+    }
+    .view-tab-btn {
+      border: 0;
+      background: transparent;
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.16s ease;
+      white-space: nowrap;
+    }
+    .view-tab-btn:hover {
+      color: var(--text-main);
+    }
+    .view-tab-btn.is-active {
+      background: #fff;
+      color: var(--maroon);
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+    }
+    .view-tab-btn .tab-count {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      color: var(--text-main);
+    }
+    .view-tab-btn.is-active .tab-count {
+      background: var(--maroon-light);
+      color: var(--maroon);
+    }
+
+    /* ── Side-by-Side Columns Container ───────────────────── */
+    .side-by-side-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 18px;
+      flex: 1;
+    }
+    .side-by-side-grid.mode-scheduled {
+      grid-template-columns: 1fr;
+    }
+    .side-by-side-grid.mode-scheduled .queue-col-walkin {
+      display: none;
+    }
+    .side-by-side-grid.mode-walk_ins {
+      grid-template-columns: 1fr;
+    }
+    .side-by-side-grid.mode-walk_ins .queue-col-scheduled {
+      display: none;
+    }
+
+    /* ── Queue Column ──────────────────────────────────────── */
+    .queue-col {
+      background: #fafbfc;
+      border: 1px solid var(--border-light);
+      border-radius: 14px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+    }
+    .queue-col-scheduled {
+      border-top: 4px solid var(--blue);
+    }
+    .queue-col-walkin {
+      border-top: 4px solid #f97316;
+    }
+
+    .col-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 12px;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .col-title {
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .queue-col-scheduled .col-title { color: #1e40af; }
+    .queue-col-walkin .col-title { color: #c2410c; }
+
+    .col-count-pill {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      color: var(--text-muted);
+    }
+    .queue-col-scheduled .col-count-pill {
+      background: var(--blue-light);
+      color: var(--blue);
+    }
+    .queue-col-walkin .col-count-pill {
+      background: #fff7ed;
+      color: #ea580c;
+    }
+
+    .queue-items-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex: 1;
+      overflow-y: auto;
+      max-height: 440px;
+      padding-right: 4px;
+    }
+    .queue-items-list::-webkit-scrollbar {
+      width: 5px;
+    }
+    .queue-items-list::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 99px;
+    }
+
+    /* ── Ticket Item Card ──────────────────────────────────── */
+    .ticket-card-row {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+    }
+    .ticket-card-row:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(0, 0, 0, 0.06);
+      border-color: #cbd5e1;
+    }
+    .ticket-card-row.is-priority {
+      background: linear-gradient(135deg, #fffbeb 0%, #fff 100%);
+      border-color: #fde68a;
+    }
+
+    .row-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .row-position {
+      width: 26px;
+      height: 26px;
+      flex: 0 0 26px;
+      border-radius: 50%;
+      background: #f1f5f9;
+      color: var(--text-muted);
+      display: grid;
+      place-items: center;
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .ticket-card-row.is-priority .row-position {
+      background: var(--gold-light);
+      color: var(--gold-dark);
+    }
+
+    .row-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .row-number {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--text-main);
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    .row-purpose {
+      font-size: 12px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 190px;
+    }
+
+    .row-tags {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .empty-queue-box {
+      margin: auto 0;
+      padding: 38px 20px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+    .empty-queue-box i {
+      font-size: 28px;
+      color: var(--text-light);
+      margin-bottom: 10px;
+      display: block;
+    }
+    .empty-queue-box p {
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    /* ── Floating Controls Bar (Bottom) ────────────────────── */
+    .controls-dock {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.94);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(220, 200, 200, 0.6);
+      box-shadow: 0 16px 40px rgba(70, 2, 2, 0.16);
+      border-radius: 20px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: min(94vw, 680px);
+    }
+    :fullscreen .controls-dock,
+    :-webkit-full-screen .controls-dock,
+    body.is-fullscreen .controls-dock {
+      display: none !important;
+    }
+    .btn-action {
+      border: 0;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 800;
+      padding: 13px 24px;
+      border-radius: 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      transition: all 0.18s ease;
+      white-space: nowrap;
+    }
+    .btn-action:active {
+      transform: scale(0.98);
+    }
+    .btn-call {
+      background: linear-gradient(135deg, #740606, var(--maroon));
+      color: #fff;
+      flex: 1.3;
+      box-shadow: 0 4px 14px rgba(136, 8, 8, 0.28);
+    }
+    .btn-call:hover {
+      background: linear-gradient(135deg, #620404, #740606);
+      box-shadow: 0 6px 18px rgba(136, 8, 8, 0.38);
+      transform: translateY(-1px);
+    }
+    .btn-skip {
+      background: #f1f5f9;
+      color: #475569;
+      border: 1px solid var(--border);
+      flex: 1;
+    }
+    .btn-skip:hover {
+      background: #e2e8f0;
+      color: var(--text-main);
+    }
+    .controls-hint {
+      font-size: 11px;
+      color: var(--text-light);
+      padding: 0 8px;
+      display: none;
+      white-space: nowrap;
+    }
+    kbd {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-size: 10px;
+      font-family: monospace;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    @media (min-width: 768px) {
+      .controls-hint {
+        display: block;
+      }
+    }
+
+    /* ── Responsive ────────────────────────────────────────── */
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+        padding-bottom: 140px;
+      }
+      .card-serving {
+        min-height: 380px;
+      }
+      .side-by-side-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Header -->
+  <header class="top-header">
+    <div class="header-content">
+      <div class="header-left">
+        <div class="header-eyebrow">
+          <span class="live-dot"></span>
+          PUPSJ CIAS · Live Queue Monitor
+        </div>
+        <h1 class="header-title" id="office">Office Queue</h1>
+        <div class="header-meta">
+          <span class="header-clock" id="clock">00:00:00</span>
+          <span>·</span>
+          <span id="dateDisplay">Today</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="soundToggle" class="btn-header" type="button" title="Toggle audio chime on call">
+          <i class="fas fa-bell"></i>
+          <span>Chime On</span>
+        </button>
+        <button id="fullscreen" class="btn-header" type="button" title="Toggle fullscreen monitor view">
+          <i class="fas fa-expand"></i>
+          <span>Full screen</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Grid -->
+  <main>
+    <!-- Left: Now Calling / Serving Card -->
+    <section class="monitor-card card-serving">
+      <div class="serving-kicker">
+        <div class="serving-badge" id="servingBadge">
+          <i class="fas fa-bullhorn" id="servingBadgeIcon"></i>
+          <span id="servingBadgeText">Now Calling</span>
+        </div>
+        <div class="serving-tags" id="servingTags">
+          <!-- Filled dynamically: source tag, priority badge -->
+        </div>
+      </div>
+
+      <div class="serving-main">
+        <div class="ticket-prefix" id="prefix">—</div>
+        <div class="ticket-number" id="now">—</div>
+      </div>
+
+      <div class="serving-footer">
+        <span id="servingStatusText"></span>
+        <span id="ticketCountSummary">0 in queue</span>
+      </div>
+    </section>
+
+    <!-- Right: Up Next Card with Side-by-Side Appointments and Walk-in -->
+    <aside class="monitor-card card-up-next">
+      <div class="up-next-header">
+        <div class="up-next-title-group">
+          <div class="up-next-icon">
+            <i class="fas fa-users-viewfinder"></i>
+          </div>
+          <div>
+            <h2 class="up-next-title">Up Next in Queue</h2>
+            <p class="up-next-subtitle">Queued for office transaction</p>
+          </div>
+        </div>
+
+        <!-- View mode tabs (Side by side default, with option to focus on either) -->
+        <div class="view-tabs" role="tablist">
+          <button class="view-tab-btn is-active" data-view="both" type="button" role="tab" title="Show Appointments and Walk-in side by side">
+            <i class="fas fa-table-columns"></i>
+            <span>Side by Side</span>
+          </button>
+          <button class="view-tab-btn" data-view="scheduled" type="button" role="tab" title="View Appointments only">
+            <i class="fas fa-calendar-check"></i>
+            <span>Appointments</span>
+            <span class="tab-count" id="tabCountSched">0</span>
+          </button>
+          <button class="view-tab-btn" data-view="walk_ins" type="button" role="tab" title="View Walk-ins only">
+            <i class="fas fa-person-walking"></i>
+            <span>Walk-in</span>
+            <span class="tab-count" id="tabCountWalk">0</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Side by Side Columns Container -->
+      <div class="side-by-side-grid" id="queueColumnsContainer">
+        <!-- Appointments Column -->
+        <div class="queue-col queue-col-scheduled">
+          <div class="col-header">
+            <div class="col-title">
+              <i class="fas fa-calendar-check"></i>
+              Appointments
+            </div>
+            <span class="col-count-pill" id="schedPill">0 waiting</span>
+          </div>
+          <div class="queue-items-list" id="scheduledList">
+            <div class="empty-queue-box">
+              <i class="far fa-calendar"></i>
+              <p>No scheduled appointments<br>in queue right now</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Walk-in Column -->
+        <div class="queue-col queue-col-walkin">
+          <div class="col-header">
+            <div class="col-title">
+              <i class="fas fa-person-walking"></i>
+              Walk-in
+            </div>
+            <span class="col-count-pill" id="walkinPill">0 waiting</span>
+          </div>
+          <div class="queue-items-list" id="walkInList">
+            <div class="empty-queue-box">
+              <i class="fas fa-ticket-simple"></i>
+              <p>No walk-in tickets<br>waiting right now</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Controls Dock (Fixed Bottom) -->
+  <div class="controls-dock">
+    <button id="call" class="btn-action btn-call" type="button" title="Call the next ticket in line (Shortcut: Space)">
+      <i class="fas fa-bullhorn"></i>
+      <span>Call Next</span>
+    </button>
+    <button id="skip" class="btn-action btn-skip" type="button" title="Skip current ticket and re-queue at end (Shortcut: S)">
+      <i class="fas fa-forward-step"></i>
+      <span>Skip</span>
+    </button>
+    <div class="controls-hint">
+      <kbd>Space</kbd> Call Next &nbsp;·&nbsp; <kbd>S</kbd> Skip
+    </div>
+  </div>
+
+  <script>
+    const code = location.pathname.split('/').pop();
+    const token = sessionStorage.getItem('pupsj_token') || localStorage.getItem('pupsj_token') || '';
+    let data = null;
+    let activeView = 'both'; // 'both' | 'scheduled' | 'walk_ins'
+    let soundEnabled = localStorage.getItem('pupsj_chime') !== 'false';
+    let lastServingNumber = null;
+
+    // ── Clock ───────────────────────────────────────────────
+    function updateClock() {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+      const dateStr = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+      document.getElementById('clock').textContent = timeStr;
+      document.getElementById('dateDisplay').textContent = dateStr;
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    // ── Sound chime (Web Audio API) ─────────────────────────
+    function playChime() {
+      if (!soundEnabled) return;
+      try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+
+        const playTone = (freq, start, duration) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, start);
+
+          gain.gain.setValueAtTime(0, start);
+          gain.gain.linearRampToValueAtTime(0.22, start + 0.04);
+          gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(start);
+          osc.stop(start + duration);
+        };
+
+        const now = ctx.currentTime;
+        playTone(1046.5, now, 0.45);        // C6
+        playTone(783.99, now + 0.18, 0.65); // G5
+      } catch (_) {}
+    }
+
+    const soundBtn = document.getElementById('soundToggle');
+    function renderSoundBtn() {
+      soundBtn.classList.toggle('is-active', soundEnabled);
+      soundBtn.innerHTML = soundEnabled
+        ? '<i class="fas fa-bell"></i><span>Chime On</span>'
+        : '<i class="fas fa-bell-slash"></i><span>Chime Muted</span>';
+    }
+    soundBtn.onclick = () => {
+      soundEnabled = !soundEnabled;
+      localStorage.setItem('pupsj_chime', soundEnabled);
+      renderSoundBtn();
+      if (soundEnabled) playChime();
+    };
+    renderSoundBtn();
+
+    // ── Ticket Number Splitter ──────────────────────────────
+    const splitTicket = value => {
+      const raw = String(value || '').trim();
+      const parts = raw.split('-');
+      if (parts.length > 1) {
+        let prefix = parts.slice(0, -1).join('-');
+        prefix = prefix.replace(/^OFFICEOFSTUD/i, 'OSA').replace(/^REGISTRAR/i, 'REG');
+        return { prefix, number: parts[parts.length - 1] };
+      }
+      return { prefix: 'Ticket', number: raw || '—' };
+    };
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = value ?? '';
+      return div.innerHTML;
+    }
+
+    // ── Render ──────────────────────────────────────────────
+    function render() {
+      if (!data) return;
+
+      document.getElementById('office').textContent = (data.office?.name || 'Office') + ' Queue';
+
+      const nowServing = data.now_serving;
+      const prefixEl = document.getElementById('prefix');
+      const nowEl = document.getElementById('now');
+      const tagsEl = document.getElementById('servingTags');
+      const statusTextEl = document.getElementById('servingStatusText');
+      const badgeIconEl = document.getElementById('servingBadgeIcon');
+      const badgeTextEl = document.getElementById('servingBadgeText');
+
+      if (nowServing && nowServing.ticket_number) {
+        const split = splitTicket(nowServing.ticket_number);
+        prefixEl.textContent = split.prefix;
+        nowEl.textContent = split.number;
+        nowEl.classList.remove('ticket-empty');
+
+        const isServing = nowServing.status === 'serving';
+        if (badgeIconEl && badgeTextEl) {
+          badgeIconEl.className = isServing ? 'fas fa-user-check' : 'fas fa-bullhorn';
+          badgeTextEl.textContent = isServing ? 'Now Serving' : 'Now Calling';
+        }
+
+        let tagsHtml = '';
+        if (nowServing.source === 'appointment') {
+          tagsHtml += `<span class="source-tag appointment"><i class="fas fa-calendar-check"></i> Appointment</span>`;
+        } else {
+          tagsHtml += `<span class="source-tag walk_in"><i class="fas fa-person-walking"></i> Walk-in</span>`;
+        }
+        if (nowServing.is_priority) {
+          tagsHtml += `<span class="priority-tag"><i class="fas fa-star"></i> Priority${nowServing.priority_type ? ' · ' + escapeHtml(nowServing.priority_type) : ''}</span>`;
+        }
+        tagsEl.innerHTML = tagsHtml;
+
+        statusTextEl.innerHTML = isServing
+          ? `<i class="fas fa-user-check" style="color:#16a34a;margin-right:4px;"></i> Transaction in progress at the office counter`
+          : `<i class="fas fa-bullhorn" style="color:var(--maroon);margin-right:4px;"></i> Ticket called · Please proceed to the office counter`;
+
+        if (lastServingNumber !== nowServing.ticket_number) {
+          playChime();
+          lastServingNumber = nowServing.ticket_number;
+        }
+      } else {
+        if (badgeIconEl && badgeTextEl) {
+          badgeIconEl.className = 'fas fa-circle-check';
+          badgeTextEl.textContent = 'Counter Available';
+        }
+        prefixEl.textContent = 'Office Counter';
+        nowEl.textContent = '—';
+        nowEl.classList.add('ticket-empty');
+        tagsEl.innerHTML = '';
+        statusTextEl.innerHTML = '';
+      }
+
+      // ── Lists Rendering ─────────────────────────────────────
+      const schedItems = data.scheduled || [];
+      const walkItems = data.walk_ins || [];
+      const schedCount = data.scheduled_count ?? schedItems.length;
+      const walkCount = data.walk_ins_count ?? walkItems.length;
+      const totalWaiting = schedCount + walkCount;
+
+      document.getElementById('tabCountSched').textContent = schedCount;
+      document.getElementById('tabCountWalk').textContent = walkCount;
+      document.getElementById('schedPill').textContent = `${schedCount} waiting`;
+      document.getElementById('walkinPill').textContent = `${walkCount} waiting`;
+      document.getElementById('ticketCountSummary').textContent = `${totalWaiting} in queue`;
+
+      const renderList = (items, isFull, emptyText, emptyIcon) => {
+        if (isFull) {
+          return `<div class="empty-queue-box"><i class="fas fa-ban" style="color:#ef4444;"></i><p>Limit reached for today</p></div>`;
+        }
+        if (!items.length) {
+          return `<div class="empty-queue-box"><i class="${emptyIcon}"></i><p>${emptyText}</p></div>`;
+        }
+        return items.map((item, index) => {
+          const split = splitTicket(item.ticket_number);
+          return `
+            <div class="ticket-card-row ${item.is_priority ? 'is-priority' : ''}">
+              <div class="row-left">
+                <span class="row-position">#${index + 1}</span>
+                <div class="row-info">
+                  <span class="row-number">${escapeHtml(split.number)}</span>
+                </div>
+              </div>
+              <div class="row-tags">
+                ${item.is_priority ? `<span class="priority-tag"><i class="fas fa-star"></i> Priority${item.priority_type ? ' · ' + escapeHtml(item.priority_type) : ''}</span>` : ''}
+              </div>
+            </div>
+          `;
+        }).join('');
+      };
+
+      document.getElementById('scheduledList').innerHTML = renderList(
+        schedItems,
+        data.scheduled_full,
+        'No scheduled appointments<br>in queue right now',
+        'far fa-calendar'
+      );
+
+      document.getElementById('walkInList').innerHTML = renderList(
+        walkItems,
+        data.walk_ins_full,
+        'No walk-in tickets<br>waiting right now',
+        'fas fa-ticket-simple'
+      );
+    }
+
+    // ── Tab switcher ─────────────────────────────────────────
+    const container = document.getElementById('queueColumnsContainer');
+    document.querySelectorAll('.view-tab-btn').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.view-tab-btn').forEach(b => b.classList.remove('is-active'));
+        btn.classList.add('is-active');
+        activeView = btn.dataset.view;
+        container.className = `side-by-side-grid mode-${activeView}`;
+      };
+    });
+
+    // ── Load & Action Handlers ──────────────────────────────
+    async function load() {
+      try {
+        const response = await fetch('/api/queueing/display/' + encodeURIComponent(code));
+        if (!response.ok) return;
+        data = await response.json();
+        render();
+      } catch (_) {}
+    }
+
+    async function action(type) {
+      try {
+        if (!token) throw new Error('Please sign in to the Queueing dashboard to manage this monitor.');
+        const lookup = await fetch('/api/queueing/manage/offices/code/' + encodeURIComponent(code), {
+          headers: { Authorization: 'Bearer ' + token }
+        });
+        const officeData = await lookup.json();
+        if (!lookup.ok) throw new Error(officeData.error || 'Office access denied.');
+
+        const response = await fetch('/api/queueing/manage/offices/' + officeData.id + '/next', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+          body: JSON.stringify(type === 'skip' ? { action: 'skip' } : {})
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Action unavailable');
+        await load();
+      } catch (err) {
+        alert(err.message || 'Unable to update queue.');
+      }
+    }
+
+    document.getElementById('call').onclick = () => action('call');
+    document.getElementById('skip').onclick = () => action('skip');
+
+    // ── Fullscreen Toggle ───────────────────────────────────
+    const fullscreenBtn = document.getElementById('fullscreen');
+    fullscreenBtn.onclick = async () => {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await document.documentElement.requestFullscreen();
+      }
+    };
+    const updateFullscreenState = () => {
+      const isFull = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      document.body.classList.toggle('is-fullscreen', isFull);
+      fullscreenBtn.innerHTML = isFull
+        ? '<i class="fas fa-compress"></i><span>Exit Full</span>'
+        : '<i class="fas fa-expand"></i><span>Full screen</span>';
+    };
+    document.addEventListener('fullscreenchange', updateFullscreenState);
+    document.addEventListener('webkitfullscreenchange', updateFullscreenState);
+
+    // ── Keyboard Shortcuts ──────────────────────────────────
+    window.addEventListener('keydown', event => {
+      if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return;
+      if (event.code === 'Space') {
+        event.preventDefault();
+        document.getElementById('call').click();
+      } else if (event.key === 's' || event.key === 'S') {
+        event.preventDefault();
+        document.getElementById('skip').click();
+      } else if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault();
+        fullscreenBtn.click();
+      }
+    });
+
+    // ── Init & Stream ───────────────────────────────────────
+    load();
+    const eventSource = new EventSource('/api/queueing/stream/' + encodeURIComponent(code));
+    eventSource.addEventListener('queue-update', load);
+  </script>
+</body>
+</html>
