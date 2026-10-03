@@ -25,14 +25,22 @@ async function seed() {
     console.log('✅ Schema created');
 
     // Create admin user
-    console.log('🔄 Creating admin user...');
+    console.log('🔄 Creating admin users...');
     const adminHash = await bcrypt.hash('admin123', 12);
     const adminId = uuidv4();
     await pool.query(`
       INSERT INTO users (id, student_number, email, password_hash, first_name, last_name, role, is_verified, is_active)
-      VALUES (?, 'ADMIN-001', 'admin@pupsj.edu.ph', ?, 'Super', 'Admin', 'admin', true, true)
+      VALUES (?, 'ADMIN-001', 'admin@pupsj.edu.ph', ?, 'Admin', 'User', 'admin', true, true)
       ON DUPLICATE KEY UPDATE id=id
     `, [adminId, adminHash]);
+
+    // Create superadmin user
+    const superAdminId = uuidv4();
+    await pool.query(`
+      INSERT INTO users (id, student_number, email, password_hash, first_name, last_name, role, is_verified, is_active)
+      VALUES (?, 'SUPERADMIN-001', 'superadmin@pupsj.edu.ph', ?, 'Super', 'Admin', 'superadmin', true, true)
+      ON DUPLICATE KEY UPDATE id=id
+    `, [superAdminId, adminHash]);
 
     // Create sample faculty
     const facultyHash = await bcrypt.hash('faculty123', 12);
