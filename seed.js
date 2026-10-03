@@ -1,11 +1,24 @@
+const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
-const pool = require('./src/config/database');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config();
 
 async function seed() {
   try {
+    const dbName = process.env.DB_NAME || 'pupsj_hub';
+    console.log(`🔄 Checking database '${dbName}'...`);
+    const initConn = await mysql.createConnection({
+      host: process.env.DB_HOST || 'localhost',
+      port: parseInt(process.env.DB_PORT) || 3306,
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+    });
+    await initConn.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    await initConn.end();
+
+    const pool = require('./src/config/database');
     console.log('🔄 Running database schema...');
     const schema = fs.readFileSync(path.join(__dirname, 'database', 'schema.sql'), 'utf8');
     await pool.query(schema);
