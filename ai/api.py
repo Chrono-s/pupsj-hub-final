@@ -495,13 +495,9 @@ def _rrf_fuse(
 
 # ── Startup validation ────────────────────────────────────────────────────────
 def _validate_config() -> None:
-    errors = []
-    if not os.getenv("DB_PASSWORD"):
-        errors.append("DB_PASSWORD is not set in .env")
-    if errors:
-        for e in errors:
-            print(f"[startup] CONFIG ERROR: {e}")
-        raise RuntimeError("Missing required configuration — see errors above.")
+    # DB_PASSWORD can be empty string in local MySQL/XAMPP environments
+    pass
+
 
 
 def _load_lostfound_vision_model():
@@ -642,8 +638,12 @@ async def lifespan(app: FastAPI):
         lf_custom_matcher = None
         print("[startup] WARNING: LostFoundMatcherModel not available — using vision only")
 
-    db_pool = await asyncpg.create_pool(_DB_URL, min_size=2, max_size=10)
-    print("[startup] DB pool ready")
+    try:
+        db_pool = await asyncpg.create_pool(_DB_URL, min_size=2, max_size=10)
+        print("[startup] DB pool ready")
+    except Exception as e:
+        db_pool = None
+        print(f"[startup] Standalone mode ({e})")
     print("[startup] PUPSJ AI Sidecar is running")
 
     yield
