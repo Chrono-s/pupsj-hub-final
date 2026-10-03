@@ -136,9 +136,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
         p2.logo_image as author_image,
         'Page' as author_role,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM announcements a
       LEFT JOIN pages p2 ON a.page_id = p2.id
@@ -147,6 +146,12 @@ router.get('/:id', authenticateToken, async (req, res) => {
       GROUP BY a.id, p2.name, p2.logo_image
       ORDER BY a.created_at DESC
     `, [req.params.id]);
+    (annRows || []).forEach(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+    });
 
     const [memberRows] = await pool.query(`
       SELECT pm.id as membership_id, pm.user_id, pm.role, pm.created_at,

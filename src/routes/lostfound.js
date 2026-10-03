@@ -31,14 +31,21 @@ function isStrongAutoMatch(best) {
   return best.match_score_raw >= AUTO_MATCH_THRESHOLD;
 }
 
+function normalizeLfImages(item) {
+  if (!item) return item;
+  if (typeof item.images === 'string') {
+    try { item.images = JSON.parse(item.images); } catch (_) { item.images = []; }
+  }
+  if (!Array.isArray(item.images)) item.images = [];
+  return item;
+}
+
 async function fetchLostFoundItemWithImages(client, id) {
   const [rows] = await client.query(
     `SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
       COALESCE(
-        JSON_ARRAYAGG(
-          IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL)
-        ),
-        JSON_ARRAY()
+        CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+        '[]'
       ) as images
      FROM lost_found lf
      LEFT JOIN users u ON lf.reporter_id = u.id
@@ -47,7 +54,7 @@ async function fetchLostFoundItemWithImages(client, id) {
      GROUP BY lf.id, u.first_name, u.last_name`,
     [id]
   );
-  return (rows && rows[0]) || null;
+  return normalizeLfImages((rows && rows[0]) || null);
 }
 
 async function fetchLostFoundCandidates(client, target) {
@@ -55,10 +62,8 @@ async function fetchLostFoundCandidates(client, target) {
   const [rows] = await client.query(
     `SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
       COALESCE(
-        JSON_ARRAYAGG(
-          IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL)
-        ),
-        JSON_ARRAY()
+        CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+        '[]'
       ) as images
      FROM lost_found lf
      LEFT JOIN users u ON lf.reporter_id = u.id
@@ -72,7 +77,7 @@ async function fetchLostFoundCandidates(client, target) {
      LIMIT 60`,
     [oppositeType, target.id]
   );
-  return rows || [];
+  return (rows || []).map(normalizeLfImages);
 }
 
 async function maybeQueueAutoMatch(client, target) {
@@ -127,9 +132,8 @@ router.get('/', authenticateToken, async (req, res) => {
     let query = `
       SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images,
         (
           SELECT JSON_OBJECT(
@@ -143,10 +147,10 @@ router.get('/', authenticateToken, async (req, res) => {
             'contact_info', p.contact_info,
             'status', p.status,
             'reporter_name', COALESCE(CONCAT(pu.first_name, ' ', pu.last_name), 'Unknown'),
-            'images', COALESCE((
-              SELECT JSON_ARRAYAGG(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url))
+            'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+              SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
               FROM lost_found_images pi WHERE pi.lost_found_id = p.id
-            ), JSON_ARRAY())
+            ), ''), ']'), '$')
           )
           FROM lost_found p
           LEFT JOIN users pu ON pu.id = p.reporter_id
@@ -196,6 +200,15 @@ router.get('/', authenticateToken, async (req, res) => {
     params.push(parseInt(limit, 10), parseInt(offset, 10));
 
     const [rows] = await pool.query(query, params);
+    (rows || []).forEach(r => {
+      normalizeLfImages(r);
+      if (typeof r.matched_item === 'string') {
+        try { r.matched_item = JSON.parse(r.matched_item); } catch (_) { r.matched_item = null; }
+      }
+      if (r.matched_item) {
+        normalizeLfImages(r.matched_item);
+      }
+    });
     res.json(rows || []);
   } catch (err) {
     console.error('Get lost/found error:', err);
@@ -320,17 +333,17 @@ router.get('/matches/rejected', authenticateToken, requireRole('admin', 'superad
       SELECT 
         l.id as lost_id, l.item_name as lost_name, l.description as lost_description, l.category as lost_category, l.location_found as lost_location, l.contact_info as lost_contact, l.status as lost_status, l.match_review_status as lost_review_status,
         COALESCE(CONCAT(ul.first_name, ' ', ul.last_name), 'Unknown') as lost_reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', li.id, 'image_url', li.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', li.id, 'image_url', li.image_url) SEPARATOR ',')
           FROM lost_found_images li WHERE li.lost_found_id = l.id
-        ), JSON_ARRAY()) as lost_images,
+        ), ''), ']') as lost_images,
 
         f.id as found_id, f.item_name as found_name, f.description as found_description, f.category as found_category, f.location_found as found_location, f.contact_info as found_contact, f.status as found_status, f.match_review_status as found_review_status,
         COALESCE(CONCAT(uf.first_name, ' ', uf.last_name), 'Unknown') as found_reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi WHERE fi.lost_found_id = f.id
-        ), JSON_ARRAY()) as found_images,
+        ), ''), ']') as found_images,
         
         COALESCE(l.match_score, f.match_score, 0) as match_score,
         GREATEST(l.updated_at, f.updated_at) as rejected_at
@@ -363,7 +376,7 @@ router.get('/matches/rejected', authenticateToken, requireRole('admin', 'superad
           status: row.lost_status,
           match_review_status: row.lost_review_status,
           reporter_name: row.lost_reporter_name,
-          images: row.lost_images
+          images: normalizeLfImages({ images: row.lost_images }).images
         },
         found_item: {
           id: row.found_id,
@@ -375,7 +388,7 @@ router.get('/matches/rejected', authenticateToken, requireRole('admin', 'superad
           status: row.found_status,
           match_review_status: row.found_review_status,
           reporter_name: row.found_reporter_name,
-          images: row.found_images
+          images: normalizeLfImages({ images: row.found_images }).images
         }
       };
     });
@@ -454,11 +467,11 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
   try {
     const [existingResult] = await pool.query(`
       SELECT f.*, CONCAT(uf.first_name, ' ', uf.last_name) as reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi
           WHERE fi.lost_found_id = f.id
-        ), JSON_ARRAY()) as images,
+        ), ''), ']') as images,
         JSON_OBJECT(
           'id', p.id,
           'item_name', p.item_name,
@@ -467,11 +480,11 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
           'location_found', p.location_found,
           'contact_info', p.contact_info,
           'reporter_name', COALESCE(CONCAT(up.first_name, ' ', up.last_name), 'Unknown'),
-          'images', COALESCE((
-            SELECT JSON_ARRAYAGG(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url))
+          'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+            SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
             FROM lost_found_images pi
             WHERE pi.lost_found_id = p.id
-          ), JSON_ARRAY()),
+          ), ''), ']'), '$'),
           'match_review_status', p.match_review_status,
           'status', p.status
         ) as partner
@@ -484,6 +497,14 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
         AND (f.status IN ('matched', 'claimed', 'resolved') OR f.match_review_status = 'pending')
       ORDER BY f.updated_at DESC
     `);
+
+    (existingResult || []).forEach(row => {
+      normalizeLfImages(row);
+      if (typeof row.partner === 'string') {
+        try { row.partner = JSON.parse(row.partner); } catch (_) { row.partner = null; }
+      }
+      if (row.partner) normalizeLfImages(row.partner);
+    });
 
     const matches = (existingResult || []).map(row => {
       let score = row.match_score ? (Number(row.match_score) > 1 ? Number(row.match_score) / 100 : Number(row.match_score)) : 0;
@@ -499,11 +520,11 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
 
     const [openFound] = await pool.query(`
       SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi
           WHERE fi.lost_found_id = lf.id
-        ), JSON_ARRAY()) as images
+        ), ''), ']') as images
       FROM lost_found lf
       LEFT JOIN users u ON lf.reporter_id = u.id
       WHERE lf.type = 'found' AND lf.status = 'open' AND (lf.matched_with IS NULL OR lf.match_review_status = 'rejected')
@@ -511,15 +532,18 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
 
     const [openLost] = await pool.query(`
       SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi
           WHERE fi.lost_found_id = lf.id
-        ), JSON_ARRAY()) as images
+        ), ''), ']') as images
       FROM lost_found lf
       LEFT JOIN users u ON lf.reporter_id = u.id
       WHERE lf.type = 'lost' AND lf.status = 'open' AND (lf.matched_with IS NULL OR lf.match_review_status = 'rejected')
     `);
+
+    (openFound || []).forEach(normalizeLfImages);
+    (openLost || []).forEach(normalizeLfImages);
 
     const matchedLostIds = new Set(matches.map(m => String(m.lost_item?.id)).filter(Boolean));
 
@@ -584,11 +608,11 @@ router.get('/review/pending', authenticateToken, requireRole('admin', 'superadmi
   try {
     const [rows] = await pool.query(`
       SELECT f.*, CONCAT(uf.first_name, ' ', uf.last_name) as reporter_name,
-        COALESCE((
-          SELECT JSON_ARRAYAGG(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url))
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi
           WHERE fi.lost_found_id = f.id
-        ), JSON_ARRAY()) as images,
+        ), ''), ']') as images,
         JSON_OBJECT(
           'id', p.id,
           'item_name', p.item_name,
@@ -597,11 +621,11 @@ router.get('/review/pending', authenticateToken, requireRole('admin', 'superadmi
           'location_found', p.location_found,
           'contact_info', p.contact_info,
           'reporter_name', COALESCE(CONCAT(up.first_name, ' ', up.last_name), 'Unknown'),
-          'images', COALESCE((
-            SELECT JSON_ARRAYAGG(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url))
+          'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+            SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
             FROM lost_found_images pi
             WHERE pi.lost_found_id = p.id
-          ), JSON_ARRAY())
+          ), ''), ']'), '$')
         ) as partner
       FROM lost_found f
       LEFT JOIN users uf ON uf.id = f.reporter_id
@@ -612,6 +636,14 @@ router.get('/review/pending', authenticateToken, requireRole('admin', 'superadmi
         AND f.matched_with IS NOT NULL
       ORDER BY f.updated_at DESC
     `);
+
+    (rows || []).forEach(r => {
+      normalizeLfImages(r);
+      if (typeof r.partner === 'string') {
+        try { r.partner = JSON.parse(r.partner); } catch (_) { r.partner = null; }
+      }
+      if (r.partner) normalizeLfImages(r.partner);
+    });
 
     res.json(rows || []);
   } catch (err) {

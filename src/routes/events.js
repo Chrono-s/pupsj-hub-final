@@ -143,9 +143,8 @@ router.get('/', authenticateToken, async (req, res) => {
       SELECT e.*, CONCAT(u.first_name, ' ', u.last_name) as author_name,
         p.name as page_name, p.logo_image as page_logo,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM events e
       LEFT JOIN users u ON e.author_id = u.id
@@ -157,7 +156,13 @@ router.get('/', authenticateToken, async (req, res) => {
     `;
 
     const [rows] = await pool.query(query, params);
-    let entries = rows || [];
+    let entries = (rows || []).map(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+      return r;
+    });
     const requestedMonth = Number.parseInt(month, 10);
     const requestedYear = Number.parseInt(year, 10);
     if (Number.isInteger(requestedMonth) && Number.isInteger(requestedYear)) {
@@ -328,9 +333,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
       SELECT e.*, CONCAT(u.first_name, ' ', u.last_name) as author_name,
         p.name as page_name, p.logo_image as page_logo,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM events e
       LEFT JOIN users u ON e.author_id = u.id
@@ -344,7 +348,12 @@ router.get('/:id', authenticateToken, async (req, res) => {
     if (!rows || rows.length === 0) {
       return res.status(404).json({ error: 'Event not found' });
     }
-    res.json(rows[0]);
+    const ev = rows[0];
+    if (typeof ev.images === 'string') {
+      try { ev.images = JSON.parse(ev.images); } catch (_) { ev.images = []; }
+    }
+    if (!Array.isArray(ev.images)) ev.images = [];
+    res.json(ev);
   } catch (err) {
     console.error('Get single event error:', err);
     res.status(500).json({ error: 'Failed to fetch event' });
@@ -481,9 +490,8 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), requirePerm
         u.department as author_department,
         p.name as page_name, p.logo_image as page_logo,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ei.id IS NOT NULL, JSON_OBJECT('id', ei.id, 'image_url', ei.image_url, 'display_order', ei.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM events e
       LEFT JOIN users u ON e.author_id = u.id
@@ -493,6 +501,12 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), requirePerm
       GROUP BY e.id, u.first_name, u.last_name, u.role, u.department, p.name, p.logo_image
       ORDER BY e.event_date ASC, e.start_time ASC
     `);
+    (rows || []).forEach(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+    });
     res.json(rows || []);
   } catch (err) {
     console.error('Pending events error:', err);

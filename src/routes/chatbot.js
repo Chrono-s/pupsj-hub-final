@@ -988,32 +988,56 @@ async function getDynamicContent(type) {
     if (type === 'announcements') {
       const result = await pool.query(`
         SELECT a.title, a.content, a.department, a.created_at,
-          COALESCE(JSON_ARRAYAGG(IF(ai.id IS NOT NULL, JSON_OBJECT('image_url', ai.image_url), NULL)), JSON_ARRAY()) as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('image_url', ai.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM announcements a
         LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
         WHERE a.status = 'active'
         GROUP BY a.id ORDER BY a.created_at DESC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        if (typeof r.images === 'string') {
+          try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+        }
+      });
       return result.rows;
     } else if (type === 'events') {
       const result = await pool.query(`
         SELECT e.title, e.description, e.event_date, e.location,
-          COALESCE(JSON_ARRAYAGG(IF(ei.id IS NOT NULL, JSON_OBJECT('image_url', ei.image_url), NULL)), JSON_ARRAY()) as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(ei.id IS NOT NULL, JSON_OBJECT('image_url', ei.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM events e
         LEFT JOIN event_images ei ON ei.event_id = e.id
         WHERE e.status != 'deleted' AND e.event_date >= CURRENT_DATE
         GROUP BY e.id ORDER BY e.event_date ASC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        if (typeof r.images === 'string') {
+          try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+        }
+      });
       return result.rows;
     } else if (type === 'lostfound') {
       const result = await pool.query(`
         SELECT lf.item_name, lf.type, lf.description, lf.location_found,
-          COALESCE(JSON_ARRAYAGG(IF(lfi.id IS NOT NULL, JSON_OBJECT('image_url', lfi.image_url), NULL)), JSON_ARRAY()) as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM lost_found lf
         LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
         WHERE lf.status = 'open'
         GROUP BY lf.id ORDER BY lf.created_at DESC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        if (typeof r.images === 'string') {
+          try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+        }
+      });
       return result.rows;
     }
   } catch (err) {

@@ -337,12 +337,12 @@ router.get('/admin/specializations', authenticateToken, requireRole('admin'), MO
              u.faculty_profile_status, u.faculty_profile_remarks,
              u.faculty_credentials, u.employment_type,
              u.updated_at,
-             COALESCE(
-               (SELECT JSON_ARRAYAGG(fap.program)
+             CONCAT('[', COALESCE(
+               (SELECT GROUP_CONCAT(JSON_QUOTE(fap.program) SEPARATOR ',')
                 FROM faculty_allowed_programs fap
                 WHERE fap.faculty_id = u.id),
-               JSON_ARRAY()
-             ) AS allowed_programs
+               ''
+             ), ']') AS allowed_programs
       FROM users u
       WHERE u.role = 'faculty'`;
 
@@ -353,6 +353,12 @@ router.get('/admin/specializations', authenticateToken, requireRole('admin'), MO
     q += ` ORDER BY u.last_name ASC, u.first_name ASC`;
 
     const [rows] = await pool.query(q, params);
+    (rows || []).forEach(r => {
+      if (typeof r.allowed_programs === 'string') {
+        try { r.allowed_programs = JSON.parse(r.allowed_programs); } catch (_) { r.allowed_programs = []; }
+      }
+      if (!Array.isArray(r.allowed_programs)) r.allowed_programs = [];
+    });
     res.json(rows);
   } catch (err) {
     console.error('[Loading] specializations list error:', err);

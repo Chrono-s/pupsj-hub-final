@@ -108,12 +108,8 @@ router.get('/', authenticateToken, async (req, res) => {
         pg.name as page_name,
         pg.logo_image as page_logo,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ai.id IS NOT NULL,
-              JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order),
-              NULL
-            )
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
@@ -126,6 +122,12 @@ router.get('/', authenticateToken, async (req, res) => {
     `;
 
     const [rows] = await pool.query(query, params);
+    (rows || []).forEach(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+    });
 
     // Count
     const countParams = [];
@@ -364,12 +366,8 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), requirePerm
         pg.name as page_name,
         pg.logo_image as page_logo,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(ai.id IS NOT NULL,
-              JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order),
-              NULL
-            )
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
@@ -379,6 +377,12 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), requirePerm
       GROUP BY a.id, u.first_name, u.last_name, u.role, u.department, pg.name, pg.logo_image
       ORDER BY a.created_at ASC
     `);
+    (rows || []).forEach(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+    });
     res.json(rows);
   } catch (err) {
     console.error('Pending announcements error:', err);

@@ -20,9 +20,8 @@ router.get('/event/:eventId', authenticateToken, async (req, res) => {
       `SELECT f.*, CONCAT(u.first_name, ' ', u.last_name) as user_name,
         u.first_name, u.last_name, u.profile_image as user_profile_image,
         COALESCE(
-          JSON_ARRAYAGG(
-            IF(fi.id IS NOT NULL, JSON_OBJECT('id', fi.id, 'image_url', fi.image_url), NULL)
-          ), JSON_ARRAY()
+          CONCAT('[', GROUP_CONCAT(IF(fi.id IS NOT NULL, JSON_OBJECT('id', fi.id, 'image_url', fi.image_url), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
        FROM feedback f
        LEFT JOIN users u ON f.user_id = u.id
@@ -32,6 +31,12 @@ router.get('/event/:eventId', authenticateToken, async (req, res) => {
        ORDER BY f.created_at DESC`,
       [req.params.eventId]
     );
+    (rows || []).forEach(r => {
+      if (typeof r.images === 'string') {
+        try { r.images = JSON.parse(r.images); } catch (_) { r.images = []; }
+      }
+      if (!Array.isArray(r.images)) r.images = [];
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch feedback' });

@@ -145,9 +145,36 @@ html[data-theme="dark"] .form-control,
 html[data-theme="dark"] .form-select,
 html[data-theme="dark"] textarea.form-input,
 html[data-theme="dark"] textarea.form-control {
-  background-color: var(--bg-card);
-  color: var(--text-primary);
-  border-color: var(--border);
+  background-color: #111010 !important;
+  color: var(--text-primary) !important;
+  border-color: #2e2b2b !important;
+}
+html[data-theme="dark"] .form-input:focus,
+html[data-theme="dark"] .form-control:focus,
+html[data-theme="dark"] .form-select:focus,
+html[data-theme="dark"] textarea.form-input:focus {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 3px rgba(184, 29, 29, 0.25) !important;
+}
+html[data-theme="dark"] select option,
+html[data-theme="dark"] .form-select option {
+  background-color: #1a1919 !important;
+  color: #f5f5f5 !important;
+}
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+select:-webkit-autofill {
+  -webkit-text-fill-color: var(--text-primary) !important;
+  -webkit-box-shadow: 0 0 0px 1000px var(--bg-card) inset !important;
+  transition: background-color 5000s ease-in-out 0s;
+}
+html[data-theme="dark"] input:-webkit-autofill,
+html[data-theme="dark"] input:-webkit-autofill:hover,
+html[data-theme="dark"] input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--text-primary) !important;
+  -webkit-box-shadow: 0 0 0px 1000px #111010 inset !important;
 }
 html[data-theme="dark"] .csv-success { background: var(--success-soft); color: var(--success); border-color: rgba(52, 211, 153, 0.3); }
 html[data-theme="dark"] .csv-error { background: var(--danger-soft); color: var(--danger); border-color: rgba(248, 113, 113, 0.3); }
@@ -1468,17 +1495,24 @@ html[data-theme="dark"] .nav-item.active i {
 /* pupbot hero header — pin to top, never scroll */
 .page-area.no-scroll .pupbot-hero { flex-shrink: 0; }
 .page-header {
-  padding: 22px 150px 16px 32px; /* 150px clears the 40px bell + 40px theme btn + 10px gap + 28px offset + 32px buffer */
+  padding: 20px 32px 16px 32px;
   border-bottom: 1px solid var(--border-light);
   background: var(--bg-card);
   margin-bottom: 24px;
   transition: background 0.2s, border-color 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.page-header > * {
+  max-width: 1400px;
+  width: 100%;
 }
 @media (max-width: 991px) {
-  .page-header { padding: 18px 24px 14px; } /* no bell on mobile — normal padding */
+  .page-header { padding: 18px 24px 14px; }
 }
 html[data-theme="dark"] .page-header {
-  background: var(--bg-primary);
+  background: var(--bg-card);
   border-bottom-color: var(--border);
 }
 .page-title {
@@ -7788,13 +7822,28 @@ html[data-theme="dark"] .auth-screen.force-light {
   color: #5A5A58 !important;
 }
 
-/* Buttons styling under force-light */
+/* Buttons styling under force-light & auth screens */
+.auth-screen .btn-primary,
+.auth-form-panel .btn-primary,
+.auth-card .btn-primary,
 .auth-screen.force-light .btn-primary {
-  background: #880808 !important;
+  width: 100% !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-height: 46px !important;
+  background: var(--primary) !important;
   color: #ffffff !important;
+  border-radius: var(--radius-md) !important;
+  font-weight: 700 !important;
+  box-shadow: 0 4px 14px rgba(136, 8, 8, 0.25) !important;
 }
+.auth-screen .btn-primary:hover,
+.auth-form-panel .btn-primary:hover,
+.auth-card .btn-primary:hover,
 .auth-screen.force-light .btn-primary:hover {
-  background: #6B0606 !important;
+  background: var(--primary-hover) !important;
+  box-shadow: 0 6px 20px rgba(136, 8, 8, 0.35) !important;
 }
 
 /* Auth switch and link styling */
