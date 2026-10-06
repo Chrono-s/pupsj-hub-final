@@ -98,6 +98,50 @@ async function seed() {
           (?, ?, 'lost', 'Blue Water Bottle', 'Stainless steel blue water bottle with PUP sticker. Lost near the canteen area during lunch.', 'Personal Items', 'Canteen Area', 'Contact via PUPSJ HUB'),
           (?, ?, 'found', 'Scientific Calculator', 'Casio fx-991ES found at Room 205 after the Math class. Claim at the guard house.', 'School Supplies', 'Room 205', 'Guard House - Main Gate')
       `, [uuidv4(), sId, uuidv4(), fId]);
+
+      // Sample matched lost & found reports
+      const lostWatchId = uuidv4();
+      const foundWatchId = uuidv4();
+      const lostEarbudsId = uuidv4();
+      const foundEarbudsId = uuidv4();
+      const lostKeysId = uuidv4();
+      const foundKeysId = uuidv4();
+      const lostIdCardId = uuidv4();
+      const foundIdCardId = uuidv4();
+      const lostUmbrellaId = uuidv4();
+      const foundUmbrellaId = uuidv4();
+
+      await pool.query(`
+        INSERT IGNORE INTO lost_found (id, reporter_id, type, item_name, description, category, location_found, contact_info, approved, status, match_review_status, match_score, date_lost_found)
+        VALUES 
+          (?, ?, 'lost', 'black smart watch', 'all black smart watch with rectangular dial', 'Personal Items', 'pup clinic', 'Contact via PUPSJ HUB', true, 'open', 'pending', 1.00, CURDATE() - INTERVAL 2 DAY),
+          (?, ?, 'found', 'All black smart watch', 'with rectangular dial', 'Personal Items', 'pup grounds', 'OSAS Office', true, 'open', 'pending', 1.00, CURDATE() - INTERVAL 1 DAY),
+          (?, ?, 'lost', 'White Wireless Earbuds', 'AirPods Pro 2 in white silicone case with yellow keychain', 'Electronics', 'Library 2nd Floor', 'Contact via PUPSJ HUB', true, 'open', 'pending', 0.85, CURDATE() - INTERVAL 3 DAY),
+          (?, ?, 'found', 'White AirPods Earbuds', 'White earbuds found on study desk in library', 'Electronics', 'Library 2nd Floor', 'Library Desk', true, 'open', 'pending', 0.85, CURDATE() - INTERVAL 2 DAY),
+          (?, ?, 'lost', 'Dorm Key Set', '3 keys with metallic blue carabiner and PUP lanyard', 'Personal Items', 'Gymnasium', 'Contact via PUPSJ HUB', true, 'matched', 'approved', 0.90, CURDATE() - INTERVAL 5 DAY),
+          (?, ?, 'found', 'Set of Keys with Blue Carabiner', 'Keys found on bleachers in the gymnasium', 'Personal Items', 'Gymnasium', 'Guard Post', true, 'matched', 'approved', 0.90, CURDATE() - INTERVAL 4 DAY),
+          (?, ?, 'lost', 'Student ID Card BSIT', 'PUP student ID with green lace', 'Documents', 'Canteen', 'Contact via PUPSJ HUB', true, 'matched', 'approved', 0.95, CURDATE() - INTERVAL 6 DAY),
+          (?, ?, 'found', 'PUP Student ID Card', 'BSIT student ID found on canteen table', 'Documents', 'Canteen', 'Guard Post', true, 'matched', 'approved', 0.95, CURDATE() - INTERVAL 5 DAY),
+          (?, ?, 'lost', 'Black Folding Umbrella', 'Automatic black umbrella with wooden handle', 'Personal Items', 'Room 302', 'Contact via PUPSJ HUB', true, 'open', 'rejected', 0.65, CURDATE() - INTERVAL 7 DAY),
+          (?, ?, 'found', 'Black Compact Umbrella', 'Manual 3-fold umbrella with plastic handle', 'Personal Items', 'Room 304', 'Guard Post', true, 'open', 'rejected', 0.65, CURDATE() - INTERVAL 6 DAY)
+      `, [
+        lostWatchId, sId, foundWatchId, fId,
+        lostEarbudsId, sId, foundEarbudsId, aId,
+        lostKeysId, sId, foundKeysId, fId,
+        lostIdCardId, sId, foundIdCardId, aId,
+        lostUmbrellaId, sId, foundUmbrellaId, fId
+      ]);
+
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [foundWatchId, lostWatchId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [lostWatchId, foundWatchId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [foundEarbudsId, lostEarbudsId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [lostEarbudsId, foundEarbudsId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [foundKeysId, lostKeysId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [lostKeysId, foundKeysId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [foundIdCardId, lostIdCardId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [lostIdCardId, foundIdCardId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [foundUmbrellaId, lostUmbrellaId]);
+      await pool.query(`UPDATE lost_found SET matched_with = ? WHERE id = ?`, [lostUmbrellaId, foundUmbrellaId]);
     }
 
     console.log('✅ Seed data inserted');

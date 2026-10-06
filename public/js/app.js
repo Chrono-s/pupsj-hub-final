@@ -1019,6 +1019,10 @@
                   </div>
                 </section>
 
+                <!-- LONG-FORM SHOWCASE SECTION -->
+                <section class="landing-showcase landing-showcase-intro">
+                  <div class="section-container showcase-grid"><div class="showcase-copy"><span class="section-kicker">One hub. Every campus day.</span><h2 class="section-title">Everything that keeps San Juan moving.</h2><p>From the first announcement to the last class of the day, PUPSJ HUB keeps the essentials close, clear, and easy to use.</p><button class="about-link" onclick="window._guestLogin()">Explore the hub <i class="fas fa-arrow-right"></i></button></div><div class="showcase-visual showcase-visual-collage"><div class="collage-card collage-card-main"><img src="/landing_hero.png" alt="PUP San Juan campus community"></div><div class="collage-card collage-card-small"><i class="fas fa-bullhorn"></i><strong>Campus updates</strong><span>Always within reach</span></div><div class="collage-badge"><strong>01</strong><span>Stay connected</span></div></div></div>
+                </section>
                 <!-- FEATURES SECTION -->
                 <section class="landing-features" id="features">
                   <div class="section-container">
@@ -1058,6 +1062,9 @@
                   </div>
                 </section>
 
+                <section class="landing-showcase landing-showcase-soft">
+                  <div class="section-container showcase-grid showcase-grid-reverse"><div class="showcase-visual showcase-visual-dashboard"><div class="mini-dashboard"><div class="mini-dashboard-head"><span>Today at PUP San Juan</span><i class="fas fa-ellipsis-h"></i></div><div class="mini-dashboard-row"><i class="fas fa-calendar-alt"></i><span>Class schedules</span><strong>View</strong></div><div class="mini-dashboard-row"><i class="fas fa-file-alt"></i><span>Document templates</span><strong>Open</strong></div><div class="mini-dashboard-row"><i class="fas fa-robot"></i><span>PUPBot AI assistant</span><strong>Chat</strong></div></div></div><div class="showcase-copy"><span class="section-kicker">Designed around you</span><h2 class="section-title">A calmer way to navigate campus.</h2><p>No more jumping between links, group chats, and scattered files. Your everyday campus tools live together in one thoughtful experience.</p><div class="showcase-points"><span><i class="fas fa-check"></i> Clear and organized</span><span><i class="fas fa-check"></i> Built for the PUP community</span><span><i class="fas fa-check"></i> Available wherever you are</span></div></div></div>
+                </section>
                 <!-- ABOUT SECTION -->
                 <section class="landing-about" id="about" style="padding: 80px 0; border-top: 1px solid var(--border);">
                   <div class="section-container" style="max-width: 800px; margin: 0 auto; text-align: center;">
@@ -3822,11 +3829,14 @@
 
     // Build the matches dashboard content
     let matchDashboardHtml = '';
-    if (isAdmin && (state.lostFoundReviews.length > 0 || state.lostFoundRejected.length > 0)) {
-      const pendingCount = state.lostFoundReviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length;
-      const approvedCount = state.lostFoundReviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length;
-      const claimedCount = state.lostFoundReviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length;
-      const rejectedCount = state.lostFoundRejected.length;
+    if (isAdmin) {
+      const reviews = Array.isArray(state.lostFoundReviews) ? state.lostFoundReviews : [];
+      const rejected = Array.isArray(state.lostFoundRejected) ? state.lostFoundRejected : [];
+
+      const pendingCount = reviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length;
+      const approvedCount = reviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length;
+      const claimedCount = reviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length;
+      const rejectedCount = rejected.length;
 
       matchDashboardHtml = `
         <div class="card lf-review-queue">
@@ -3853,21 +3863,21 @@
 
           <div class="lf-review-list">
             ${(() => {
-              const pendingMatches = state.lostFoundReviews.filter(m => 
+              const pendingMatches = reviews.filter(m => 
                 (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') &&
                 m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed'
               );
 
-              const approvedMatches = state.lostFoundReviews.filter(m => 
+              const approvedMatches = reviews.filter(m => 
                 m.found_item?.match_review_status === 'approved' && 
                 m.found_item?.status === 'matched'
               );
 
-              const claimedMatches = state.lostFoundReviews.filter(m => 
+              const claimedMatches = reviews.filter(m => 
                 m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed'
               );
 
-              const rejectedMatches = state.lostFoundRejected;
+              const rejectedMatches = rejected;
 
               const currentTabList = state.activeMatchTab === 'pending' ? pendingMatches 
                                     : state.activeMatchTab === 'approved' ? approvedMatches 
