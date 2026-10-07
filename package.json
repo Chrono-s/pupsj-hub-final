@@ -11,6 +11,7 @@
     "start": "concurrently -n \"server,ai\" -c \"cyan,yellow\" \"node src/server.js\" \"node scripts/start-ai.js\"",
     "dev": "concurrently -n \"server,ai\" -c \"cyan,yellow\" \"tsx watch src/server.js\" \"node scripts/start-ai.js --reload\"",
     "seed": "node seed.js",
+    "setup:ai": "node scripts/setup-ai.js",
     "server": "tsx src/server.js",
     "ai": "node scripts/start-ai.js --reload"
   },
