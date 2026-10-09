@@ -8633,95 +8633,63 @@ a, button, select, input, textarea, .nav-item, .card, .sched-row, .btn-icon {
 }
 
 /* ==========================================================================
-   FORCE LIGHT MODE ON LOGIN & REGISTER PAGE
+   ADAPTABLE AUTH SCREEN STYLES (Light & Dark Theme Support)
    ========================================================================== */
 
-/* Redefine variables inside force-light container to lock them into light mode */
-.auth-screen.force-light {
-  --primary: #880808 !important;
-  --primary-hover: #6B0606 !important;
-  --primary-light: #FBEAEA !important;
-  --primary-soft: rgba(136, 8, 8, 0.08) !important;
-  --color-primary: #880808 !important;
-  --accent: #880808 !important;
-  --accent-light: #A81B1B !important;
-  --accent-dark: #5C0505 !important;
-  --accent-soft: rgba(136, 8, 8, 0.15) !important;
-  --bg-primary: #FAFAF9 !important;
-  --bg-secondary: #F1F1F0 !important;
-  --bg-card: #FFFFFF !important;
-  --bg-soft: #FBEAEA !important;
-  --text-primary: #1C1517 !important;
-  --text-secondary: #5A5A58 !important;
-  --text-muted: #6B7280 !important;
-  --text-light: #9CA3AF !important;
-  --text-on-primary: #FFFFFF !important;
-  --border: #E5E5E5 !important;
-  --border-light: #F3F4F6 !important;
-  --border-primary: rgba(136, 8, 8, 0.15) !important;
-  background: #ffffff !important;
+.auth-screen {
+  background: var(--bg-primary);
 }
 
-/* Double-override standard dark-theme selector to guarantee light backgrounds */
-html[data-theme="dark"] .auth-screen.force-light {
-  background: #ffffff !important;
+.auth-form-panel {
+  background: var(--bg-card) !important;
+  border-right: 1px solid var(--border) !important;
+  color: var(--text-primary) !important;
 }
 
-/* Left split panel login form styling */
-.auth-screen.force-light .auth-form-panel {
-  background: #ffffff !important;
-  border-right: 1px solid #e8e0d8 !important;
-  color: #1C1517 !important;
-}
-.auth-screen.force-light .auth-form-inner {
-  background: #ffffff !important;
-}
-.auth-screen.force-light .auth-card {
-  background: #ffffff !important;
-  color: #1C1517 !important;
-}
-.auth-screen.force-light .auth-card h2 {
-  color: #1C1517 !important;
-}
-.auth-screen.force-light .auth-card .subtitle {
-  color: #5A5A58 !important;
+.auth-form-inner {
+  background: var(--bg-card) !important;
 }
 
-/* Form fields input and select elements styling under force-light */
-.auth-screen.force-light .form-input,
-.auth-screen.force-light textarea.form-input {
-  background: #ffffff !important;
-  color: #1C1517 !important;
-  border-color: #E5E5E5 !important;
-}
-.auth-screen.force-light .form-select {
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  appearance: none;
-  background-color: #ffffff !important;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23880808' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E") !important;
-  background-repeat: no-repeat !important;
-  background-position: right 14px center !important;
-  background-size: 14px !important;
-  padding-right: 36px !important;
-  color: #1C1517 !important;
-  border-color: #E5E5E5 !important;
-}
-.auth-screen.force-light .form-input:focus,
-.auth-screen.force-light .form-select:focus {
-  border-color: #880808 !important;
-  box-shadow: 0 0 0 3px rgba(136, 8, 8, 0.15) !important;
-}
-.auth-screen.force-light .form-group label,
-.auth-screen.force-light .form-label {
-  color: #5A5A58 !important;
+.auth-card {
+  background: var(--bg-card) !important;
+  color: var(--text-primary) !important;
 }
 
-/* Buttons styling under force-light & auth screens */
+.auth-card h2 {
+  color: var(--text-primary) !important;
+}
+
+.auth-card .subtitle {
+  color: var(--text-secondary) !important;
+}
+
+.auth-form-panel .form-input,
+.auth-form-panel textarea.form-input {
+  background: var(--bg-secondary) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border) !important;
+}
+
+.auth-form-panel .form-select {
+  background-color: var(--bg-secondary) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border) !important;
+}
+
+.auth-form-panel .form-input:focus,
+.auth-form-panel .form-select:focus {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 3px var(--primary-soft) !important;
+}
+
+.auth-form-panel .form-group label,
+.auth-form-panel .form-label {
+  color: var(--text-secondary) !important;
+}
+
 .auth-screen .btn-primary,
 .auth-form-panel .btn-primary,
-.auth-card .btn-primary,
-.auth-screen.force-light .btn-primary {
+.auth-card .btn-primary {
   width: 100% !important;
   display: flex !important;
   align-items: center !important;
@@ -8731,64 +8699,90 @@ html[data-theme="dark"] .auth-screen.force-light {
   color: #ffffff !important;
   border-radius: var(--radius-md) !important;
   font-weight: 700 !important;
-  box-shadow: 0 4px 14px rgba(136, 8, 8, 0.25) !important;
+  box-shadow: 0 4px 14px var(--primary-soft) !important;
 }
+
 .auth-screen .btn-primary:hover,
 .auth-form-panel .btn-primary:hover,
-.auth-card .btn-primary:hover,
-.auth-screen.force-light .btn-primary:hover {
+.auth-card .btn-primary:hover {
   background: var(--primary-hover) !important;
-  box-shadow: 0 6px 20px rgba(136, 8, 8, 0.35) !important;
+  box-shadow: 0 6px 20px rgba(184, 29, 29, 0.35) !important;
 }
 
-/* Auth switch and link styling */
-.auth-screen.force-light .auth-switch {
-  color: #5A5A58 !important;
-}
-.auth-screen.force-light .auth-switch a,
-.auth-screen.force-light .auth-forgot-link a {
-  color: #880808 !important;
+.auth-switch {
+  color: var(--text-secondary) !important;
 }
 
-/* Role tab controls inside force-light login */
-.auth-screen.force-light .auth-role-tab {
-  background: #F1F1F0 !important;
-  color: #5A5A58 !important;
-  border: 1px solid #E5E5E5 !important;
+.auth-switch a,
+.auth-forgot-link a {
+  color: var(--primary) !important;
 }
-.auth-screen.force-light .auth-role-tab.active {
-  background: #880808 !important;
+
+.auth-back-btn {
+  color: var(--text-secondary) !important;
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: color 0.2s ease;
+}
+
+.auth-back-btn:hover {
+  color: var(--primary) !important;
+}
+
+.auth-role-tab {
+  background: var(--bg-soft) !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid var(--border) !important;
+}
+
+.auth-role-tab.active {
+  background: var(--primary) !important;
   color: #ffffff !important;
-  border-color: #880808 !important;
-}
-.auth-screen.force-light .auth-role-tab:hover:not(.active) {
-  background: #E5E5E5 !important;
+  border-color: var(--primary) !important;
 }
 
-/* Right side panel remains blood red/burgundy gradient - never goes dark */
-.auth-screen.force-light .auth-brand-panel {
+.auth-role-tab:hover:not(.active) {
+  background: var(--border) !important;
+}
+
+.auth-brand-panel {
   background: linear-gradient(145deg, #6B0606 0%, #880808 50%, #4A0404 100%) !important;
 }
-.auth-screen.force-light .auth-brand-deco {
+
+html[data-theme="dark"] .auth-brand-panel {
+  background: linear-gradient(145deg, #380808 0%, #200404 50%, #100202 100%) !important;
+}
+
+.auth-brand-deco {
   opacity: 0.15 !important;
 }
-.auth-screen.force-light .auth-brand-title {
+
+.auth-brand-title {
   color: #ffffff !important;
 }
-.auth-screen.force-light .auth-brand-title span {
-  color: #FFB81C !important; /* Gold accent color */
+
+.auth-brand-title span {
+  color: #FFB81C !important;
 }
-.auth-screen.force-light .auth-brand-sub {
+
+.auth-brand-sub {
   color: rgba(255, 255, 255, 0.8) !important;
 }
-.auth-screen.force-light .auth-brand-feature {
+
+.auth-brand-feature {
   background: rgba(255, 255, 255, 0.1) !important;
   color: #ffffff !important;
 }
-.auth-screen.force-light .auth-brand-feature i {
+
+.auth-brand-feature i {
   color: #FFB81C !important;
 }
-.auth-screen.force-light .auth-brand-feature:hover {
+
+.auth-brand-feature:hover {
   background: rgba(255, 255, 255, 0.2) !important;
 }
 
@@ -14087,8 +14081,286 @@ html[data-theme="dark"] .queue-delete-appt-btn {
 .landing-page .navbar-actions .btn-text-link { border-color: rgba(133,15,24,.25); color: var(--lp-primary); }
 .landing-page .navbar-actions .btn-text-link:hover { background: rgba(133,15,24,.06); color: var(--lp-primary); }
 .landing-page .navbar-actions > .btn-primary { background: var(--lp-primary) !important; color: #fff !important; }
-.landing-page .navbar-actions > .btn-primary:hover { background: var(--lp-primary-deep, #5d0710) !important; color: #fff !important; }
 .landing-page .landing-hero::before { background: rgba(214,166,74,.08); }
+
+/* Explicit light mode contrast guarantees */
+.landing-page .hero-title { color: #1F1B1A !important; }
+.landing-page .hero-subtitle { color: #880808 !important; }
+.landing-page .hero-body { color: #55504C !important; }
+.landing-page .nav-login-btn { background: var(--primary) !important; border-color: var(--primary) !important; color: #fff !important; font-size: 12.5px !important; font-weight: 600 !important; padding: 7px 16px !important; border-radius: 6px !important; }
+.landing-page .nav-login-btn:hover { background: var(--primary-hover) !important; }
+.landing-page .nav-guest-btn { border: 1.5px solid var(--primary) !important; color: var(--primary) !important; background: transparent !important; font-size: 12.5px !important; font-weight: 600 !important; padding: 7px 16px !important; border-radius: 6px !important; }
+.landing-page .nav-guest-btn:hover { background: var(--primary-soft) !important; }
+
+/* In-app theme-aware helper pills */
+.icon-pill-primary {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--primary-soft) !important;
+  color: var(--primary) !important;
+}
+
+.queue-office-delete {
+  width: 35px;
+  border: 1px solid var(--border) !important;
+  border-left: 0 !important;
+  border-radius: 0 9px 9px 0;
+  background: var(--danger-soft) !important;
+  color: var(--danger) !important;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.queue-office-delete:hover {
+  background: var(--danger) !important;
+  color: #FFFFFF !important;
+}
+
+/* ══════════════════════════════════════════════════════════
+   LANDING PAGE — COMPREHENSIVE DARK THEME RULES
+   ══════════════════════════════════════════════════════════ */
+html[data-theme="dark"] .landing-page {
+  --lp-primary: #B81D1D !important;
+  --lp-primary-deep: #8C1010 !important;
+  --lp-gold: #FFC72C !important;
+  --lp-ink: #F5F5F5 !important;
+  --lp-muted: #A0A0A0 !important;
+  --lp-paper: #0B0A0A !important;
+  --lp-line: #262424 !important;
+  background: #0B0A0A !important;
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-navbar {
+  background: rgba(14, 13, 13, 0.90) !important;
+  border-color: #262424 !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6) !important;
+}
+
+html[data-theme="dark"] .landing-page .brand-mark {
+  background: rgba(184, 29, 29, 0.18) !important;
+  border-color: rgba(184, 29, 29, 0.35) !important;
+}
+
+html[data-theme="dark"] .landing-page .brand-copy strong,
+html[data-theme="dark"] .landing-page .navbar-brand span {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .navbar-menu .nav-link {
+  color: #A0A0A0 !important;
+}
+
+html[data-theme="dark"] .landing-page .navbar-menu .nav-link:hover,
+html[data-theme="dark"] .landing-page .navbar-menu .nav-link.active {
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .navbar-actions .btn-text-link {
+  color: #A0A0A0 !important;
+  border-color: #2E2B2B !important;
+}
+
+html[data-theme="dark"] .landing-page .navbar-actions .btn-text-link:hover {
+  color: #FFFFFF !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-theme-btn {
+  background: #1C1A1A !important;
+  border: 1px solid #2E2B2B !important;
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .nav-login-btn,
+html[data-theme="dark"] .landing-page .navbar-actions > .btn-primary {
+  background: #B81D1D !important;
+  border-color: #B81D1D !important;
+  color: #FFFFFF !important;
+}
+
+html[data-theme="dark"] .landing-page .nav-login-btn:hover,
+html[data-theme="dark"] .landing-page .navbar-actions > .btn-primary:hover {
+  background: #D82C2C !important;
+}
+
+html[data-theme="dark"] .landing-page .nav-guest-btn,
+html[data-theme="dark"] .landing-page .navbar-actions > .btn-outlined {
+  border: 1.5px solid #B81D1D !important;
+  color: #F5F5F5 !important;
+  background: rgba(184, 29, 29, 0.12) !important;
+}
+
+html[data-theme="dark"] .landing-page .nav-guest-btn:hover,
+html[data-theme="dark"] .landing-page .navbar-actions > .btn-outlined:hover {
+  background: rgba(184, 29, 29, 0.25) !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-hero {
+  background: linear-gradient(180deg, #150A0B 0%, #0B0A0A 68%, #0B0A0A 100%) !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-hero::before {
+  background: rgba(214, 166, 74, 0.04) !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-label,
+html[data-theme="dark"] .landing-page .section-kicker,
+html[data-theme="dark"] .landing-page .about-link {
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-title,
+html[data-theme="dark"] .landing-page .section-title,
+html[data-theme="dark"] .landing-page .feature-name,
+html[data-theme="dark"] .landing-page .hero-stat-card strong {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-subtitle {
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-body,
+html[data-theme="dark"] .landing-page .section-intro p,
+html[data-theme="dark"] .landing-page .feature-desc,
+html[data-theme="dark"] .landing-page .showcase-copy p,
+html[data-theme="dark"] .landing-page .about-container p {
+  color: #A0A0A0 !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-ctas .btn-primary {
+  background: #B81D1D !important;
+  border-color: #B81D1D !important;
+  color: #FFFFFF !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-ctas .btn-primary:hover {
+  background: #D82C2C !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-ctas .btn-outlined {
+  border-color: #B81D1D !important;
+  color: #F5F5F5 !important;
+  background: rgba(184, 29, 29, 0.12) !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-ctas .btn-outlined:hover {
+  background: rgba(184, 29, 29, 0.25) !important;
+}
+
+html[data-theme="dark"] .landing-page .hero-image-frame {
+  background: #161515 !important;
+  border-color: #262424 !important;
+  box-shadow: 0 16px 34px rgba(0, 0, 0, 0.7) !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-features,
+html[data-theme="dark"] .landing-page .landing-about {
+  background: #111010 !important;
+  border-top-color: #222020 !important;
+}
+
+html[data-theme="dark"] .landing-page .features-grid {
+  background: #222020 !important;
+  border-color: #222020 !important;
+}
+
+html[data-theme="dark"] .landing-page .feature-card {
+  background: #161515 !important;
+  border-color: #222020 !important;
+}
+
+html[data-theme="dark"] .landing-page .feature-card:hover {
+  background: #201E1E !important;
+}
+
+html[data-theme="dark"] .landing-page .feature-icon {
+  background: rgba(184, 29, 29, 0.18) !important;
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-showcase-intro {
+  background: #0B0A0A !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-showcase-soft {
+  background: #111010 !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard {
+  background: #161515 !important;
+  border-color: #262424 !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard-head {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard-row {
+  border-top-color: #222020 !important;
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard-row:hover {
+  background: #201E1E !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard-row i {
+  background: rgba(184, 29, 29, 0.18) !important;
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dashboard-row span {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .mini-dash-btn {
+  background: #201E1E !important;
+  border-color: #2E2B2B !important;
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .collage-card-main,
+html[data-theme="dark"] .landing-page .collage-card-small {
+  background: #161515 !important;
+  border-color: #262424 !important;
+}
+
+html[data-theme="dark"] .landing-page .collage-card-small strong {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .collage-card-small span {
+  color: #A0A0A0 !important;
+}
+
+html[data-theme="dark"] .landing-page .collage-card-small i {
+  color: #E83C3C !important;
+}
+
+html[data-theme="dark"] .landing-page .collage-badge {
+  background: #201E1E !important;
+  border-color: #2E2B2B !important;
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .landing-footer {
+  background: #080808 !important;
+  border-top: 1px solid #1C1A1A !important;
+}
+
+html[data-theme="dark"] .landing-page .footer-brand {
+  color: #F5F5F5 !important;
+}
+
+html[data-theme="dark"] .landing-page .footer-container p,
+html[data-theme="dark"] .landing-page .footer-status {
+  color: #777777 !important;
+}
 
 /* ==========================================================================
    MASTER RESPONSIVE & FLUID ALIGNMENT ENGINE (Mobile, Phablet, Tablet)

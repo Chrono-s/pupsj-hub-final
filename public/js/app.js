@@ -584,6 +584,9 @@
       ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
       : mode;
     document.documentElement.setAttribute('data-theme', resolved);
+    document.querySelectorAll('.landing-theme-btn i, .theme-toggle-btn i').forEach(icon => {
+      icon.className = resolved === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+    });
   }
   function setTheme(mode) {
     localStorage.setItem('pupsj_theme', mode);
@@ -599,9 +602,6 @@
     const current = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
     const next = current === 'dark' ? 'light' : 'dark';
     setTheme(next);
-    document.querySelectorAll('.landing-theme-btn i, .theme-toggle-btn i').forEach(icon => {
-      icon.className = next === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
-    });
     showToast(`${next === 'dark' ? 'Dark' : 'Light'} mode enabled`, 'info');
   };
   applyTheme(getStoredTheme());
@@ -956,8 +956,8 @@
 
     const isWide = (authMode === 'register');
     return `
-    <div class="auth-screen${isWide ? ' auth-screen--wide' : ''} force-light">
-      <!-- LEFT: White form panel -->
+    <div class="auth-screen${isWide ? ' auth-screen--wide' : ''}">
+      <!-- LEFT: Form panel -->
       <div class="auth-form-panel" style="position: relative;">
         <!-- Elegantly placed Back button -->
         <a href="#" class="auth-back-btn" onclick="event.preventDefault(); window._closeAuthView()">
@@ -997,7 +997,7 @@
 
     // ── Special full-screen auth states ──
     if (authMode === 'verifying') {
-      return `<div class="auth-screen auth-status-screen force-light">
+      return `<div class="auth-screen auth-status-screen">
         <div class="auth-status-card">
           <div class="auth-status-icon spin"><i class="fas fa-circle-notch"></i></div>
           <h2>Verifying Your Email…</h2>
@@ -1006,7 +1006,7 @@
       </div>`;
     }
     if (authMode === 'verify-success') {
-      return `<div class="auth-screen auth-status-screen force-light">
+      return `<div class="auth-screen auth-status-screen">
         <div class="auth-status-card success">
           <div class="auth-status-icon"><i class="fas fa-check-circle"></i></div>
           <h2>Email Verified!</h2>
@@ -1040,8 +1040,8 @@
                       <i class="${document.documentElement.getAttribute('data-theme') === 'dark' ? 'fas fa-sun' : 'fas fa-moon'}"></i>
                     </button>
                     <a href="#" class="btn-text-link" onclick="event.preventDefault(); window._openAuthView('register')">Sign up</a>
-                    <button class="btn btn-primary" onclick="window._openAuthView('login')" style="background: #880808 !important; border-color: #880808 !important; color: #fff !important; font-size: 13px; font-weight: 600; padding: 8px 18px; border-radius: 6px;">Log In</button>
-                    <button class="btn btn-outlined" onclick="window._guestLogin()" style="border: 1.5px solid #880808 !important; color: #880808 !important; background: transparent !important; font-size: 13px; font-weight: 600; padding: 8px 18px; border-radius: 6px;">Guest Access</button>
+                    <button class="btn btn-primary nav-login-btn" onclick="window._openAuthView('login')">Log In</button>
+                    <button class="btn btn-outlined nav-guest-btn" onclick="window._guestLogin()">Guest Access</button>
                   </div>
                 </div>
               </header>
@@ -14345,8 +14345,8 @@
       const offices = await api('/api/queueing/manage/offices');
       const admins = superadmin ? await api('/api/queueing/manage/admins') : [];
       pageArea.innerHTML = `<div class="page-header"><p style="margin:0 0 5px;color:var(--primary);font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Queue operations</p><h1 class="page-title">Office Queueing</h1><p class="page-subtitle">Choose an office, then manage its live queue and scheduled visitors.</p></div><div class="page-content" style="display:grid;gap:18px;">
-        ${superadmin ? `<section class="card" style="padding:22px 24px;"><div style="display:flex;align-items:flex-start;gap:12px;"><span style="width:38px;height:38px;display:grid;place-items:center;flex:0 0 38px;border-radius:10px;background:#fff0f0;color:#880808;"><i class="fas fa-plus"></i></span><div><p style="margin:0 0 3px;color:#880808;font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Administration</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">Add an office</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Create an office and optionally assign its queue manager.</p></div></div><div style="display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto;gap:10px;margin-top:18px;"><input id="queueOfficeName" class="form-input" placeholder="Office name, e.g. OSAS"><select id="queueOfficeAdmin" class="form-input form-select"><option value="">Assign later</option>${admins.map(a=>`<option value="${a.id}">${escHtml(a.first_name)}${a.department?' · '+escHtml(a.department):''}</option>`).join('')}</select><button id="queueAddOffice" class="btn btn-primary">Add office</button></div></section>` : ''}
-        <section class="card" style="padding:22px 24px;"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;"><div><p style="margin:0 0 3px;color:#880808;font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Step 1</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">${superadmin ? 'Choose an office to manage' : 'Your assigned offices'}</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Select an office to open its queue workspace.</p></div><span style="width:38px;height:38px;display:grid;place-items:center;border-radius:10px;background:#fff0f0;color:#880808;"><i class="fas fa-building"></i></span></div><div id="queueOfficeButtons" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;">${offices.map(o=>`<div style="display:flex;align-items:stretch;"><button class="btn btn-secondary queue-office-btn" data-id="${o.id}" data-code="${escHtml(o.code)}" data-name="${escHtml(o.name)}" style="border-radius:9px 0 0 9px;"><i class="fas fa-building"></i> ${escHtml(o.name)}</button>${superadmin?`<button class="queue-office-delete" data-id="${o.id}" data-name="${escHtml(o.name)}" title="Delete ${escHtml(o.name)}" aria-label="Delete ${escHtml(o.name)}" style="width:35px;border:1px solid #ecd4d4;border-left:0;border-radius:0 9px 9px 0;background:#fff7f7;color:#9d1616;cursor:pointer;"><i class="fas fa-trash"></i></button>`:''}</div>`).join('') || '<p style="margin:0;color:var(--text-secondary);font-size:13px;">No office is assigned to this account.</p>'}</div></section>
+        ${superadmin ? `<section class="card" style="padding:22px 24px;"><div style="display:flex;align-items:flex-start;gap:12px;"><span class="icon-pill-primary" style="flex:0 0 38px;"><i class="fas fa-plus"></i></span><div><p style="margin:0 0 3px;color:var(--primary);font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Administration</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">Add an office</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Create an office and optionally assign its queue manager.</p></div></div><div style="display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto;gap:10px;margin-top:18px;"><input id="queueOfficeName" class="form-input" placeholder="Office name, e.g. OSAS"><select id="queueOfficeAdmin" class="form-input form-select"><option value="">Assign later</option>${admins.map(a=>`<option value="${a.id}">${escHtml(a.first_name)}${a.department?' · '+escHtml(a.department):''}</option>`).join('')}</select><button id="queueAddOffice" class="btn btn-primary">Add office</button></div></section>` : ''}
+        <section class="card" style="padding:22px 24px;"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;"><div><p style="margin:0 0 3px;color:var(--primary);font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Step 1</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">${superadmin ? 'Choose an office to manage' : 'Your assigned offices'}</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Select an office to open its queue workspace.</p></div><span class="icon-pill-primary"><i class="fas fa-building"></i></span></div><div id="queueOfficeButtons" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;">${offices.map(o=>`<div style="display:flex;align-items:stretch;"><button class="btn btn-secondary queue-office-btn" data-id="${o.id}" data-code="${escHtml(o.code)}" data-name="${escHtml(o.name)}" style="border-radius:9px 0 0 9px;"><i class="fas fa-building"></i> ${escHtml(o.name)}</button>${superadmin?`<button class="queue-office-delete" data-id="${o.id}" data-name="${escHtml(o.name)}" title="Delete ${escHtml(o.name)}" aria-label="Delete ${escHtml(o.name)}"><i class="fas fa-trash"></i></button>`:''}</div>`).join('') || '<p style="margin:0;color:var(--text-secondary);font-size:13px;">No office is assigned to this account.</p>'}</div></section>
         <section class="card" id="queuePanel" style="padding:24px;"><div style="display:flex;gap:12px;align-items:center;color:var(--text-secondary);"><i class="fas fa-arrow-up-right-dots" style="color:var(--primary);"></i><span>Select an office above to open its live queue workspace.</span></div></section></div>`;
       if (superadmin) document.getElementById('queueAddOffice').onclick = async () => { const name=document.getElementById('queueOfficeName').value.trim(); if(!name)return; await api('/api/queueing/manage/offices',{method:'POST',body:JSON.stringify({name,manager_user_id:document.getElementById('queueOfficeAdmin').value||null})}); renderQueueing(); };
       document.querySelectorAll('.queue-office-btn').forEach(btn => {
