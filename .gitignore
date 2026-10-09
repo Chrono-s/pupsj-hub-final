@@ -180,8 +180,8 @@ fix_css.py
 restore.py
 scratch/
 
-# IDE & AI Assistant metadata
-.claude/
+# IDE & Editor metadata
 .cursor/
-.codex-runlogs/
+.idea/
+.vscode/
 

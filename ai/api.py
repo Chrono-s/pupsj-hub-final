@@ -108,7 +108,6 @@ CACHE_MAX     = 500
 
 # Circuit breakers — track recent failures per provider
 _GROQ_FAILURES:   deque = deque(maxlen=10)
-_GEMINI_FAILURES: deque = deque(maxlen=10)
 CB_WINDOW    = 60   # seconds to look back
 CB_THRESHOLD = 3    # failures in window → skip that provider
 
@@ -766,7 +765,7 @@ async def lifespan(app: FastAPI):
         if retriever is None:
             print(
                 "[startup] WARNING: handbook_retriever.pkl not found.\n"
-                "  Chatbot will work with Gemini only (no handbook context).\n"
+                "  Chatbot will work with LLM only (no handbook context).\n"
                 "  Run:  python ai/ingest.py <handbook.pdf>"
             )
         else:

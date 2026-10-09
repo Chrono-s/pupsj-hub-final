@@ -130,7 +130,7 @@ class HandbookRetriever:
     def retrieve_section(self, query: str, broad_top_k: int = 25) -> tuple[list[dict], bool]:
         """
         For broad queries ("everything about X"), retrieve a larger pool of
-        chunks and return them sorted in document order so Gemini sees the
+        chunks and return them sorted in document order so the model sees the
         content as a coherent, flowing section rather than scattered snippets.
 
         Uses broad_top_k=25 to capture multi-sub-section content
@@ -138,13 +138,13 @@ class HandbookRetriever:
         DISCIPLINARY SANCTIONS + several sub-headings).
 
         Returns (results, True) — always signals broad mode so the prompt
-        instructs Gemini to be comprehensive.
+        instructs the LLM to be comprehensive.
         """
         results = self.retrieve(query, top_k=broad_top_k)
         if not results:
             return [], False
 
-        # Sort by chunk index (document order) so Gemini reads them
+        # Sort by chunk index (document order) so the LLM reads them
         # in the same sequence they appear in the handbook
         results_sorted = sorted(results, key=lambda r: r["chunk_index"])
         return results_sorted, True
