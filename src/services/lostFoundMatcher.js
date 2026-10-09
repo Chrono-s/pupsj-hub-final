@@ -13,8 +13,16 @@ const BRAND_WORDS = new Set([
   'nike','adidas','puma','jansport','apple','samsung','huawei','oppo','vivo','realme','asus','acer','dell','hp','lenovo','aquaflask','hydroflask','tiger','tupperware'
 ]);
 const ITEM_TYPE_WORDS = new Set([
-  'tumbler','bottle','wallet','document','folder','envelope','notebook','id','card','umbrella','flashdrive','usb','phone','charger','bag','backpack','pencilcase','eyeglasses','keys','key','jacket'
+  'tumbler','bottle','wallet','watch','document','folder','envelope','notebook','id','card',
+  'umbrella','flashdrive','usb','phone','charger','bag','backpack','pencilcase','eyeglasses',
+  'glasses','spectacles','keys','key','jacket','ring','necklace','earring','earrings','bracelet',
+  'cap','hat','shoes','sandals','slippers','calculator','camera','headphones','earphones','airpods',
+  'powerbank','laptop','tablet','ipad','book','planner','pouch','lanyard','thermos','fan',
 ]);
+
+// Combined set of all "attribute" words — excluded from raw keyword matching
+// so they are never double-counted (they are scored separately by attributeOverlapScore)
+const ATTRIBUTE_WORDS = new Set([...COLOR_WORDS, ...BRAND_WORDS, ...ITEM_TYPE_WORDS]);
 
 function extractKeywords(text) {
   if (!text) return [];
@@ -23,6 +31,12 @@ function extractKeywords(text) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+}
+
+// Keywords stripped of color/brand/type words — used for name/description overlap scoring
+// to prevent those words from being counted both here AND in attributeOverlapScore
+function extractContentKeywords(text) {
+  return extractKeywords(text).filter(w => !ATTRIBUTE_WORDS.has(w));
 }
 
 function intersection(arr1, arr2) {
@@ -73,37 +87,41 @@ function computeHeuristicMatchScore(item1, item2) {
   const category1 = normalizeLooseText(item1.category);
   const category2 = normalizeLooseText(item2.category);
   if (category1 && category2) {
-    if (category1 === category2) score += 35;
-    else score -= 5;
+    // Reduced from +35 → +20: category alone should not dominate the score
+    if (category1 === category2) score += 20;
+    else score -= 15; // Stronger penalty for mismatched categories
   }
 
-  const name1 = extractKeywords(item1.item_name || '');
-  const name2 = extractKeywords(item2.item_name || '');
-  const desc1 = extractKeywords(item1.description || '');
-  const desc2 = extractKeywords(item2.description || '');
+  // Use content-only keywords (color/brand/type words excluded) so they are
+  // not double-counted here AND in the attributeOverlapScore calls below
+  const name1 = extractContentKeywords(item1.item_name || '');
+  const name2 = extractContentKeywords(item2.item_name || '');
+  const desc1 = extractContentKeywords(item1.description || '');
+  const desc2 = extractContentKeywords(item2.description || '');
 
-  // Name direct matching
+  // Name direct matching — highest signal
   const nameCommon = intersection(name1, name2);
-  score += Math.min(nameCommon.length * 25, 50);
+  score += Math.min(nameCommon.length * 30, 60);
 
   // Description direct matching
   const descCommon = intersection(desc1, desc2);
-  score += Math.min(descCommon.length * 6, 30);
+  score += Math.min(descCommon.length * 6, 24);
 
-  // Cross-matching name words in the other item's total words (name + description)
+  // Cross-matching: name word of one item appears in other item's name or description
   const words1 = new Set([...name1, ...desc1]);
   const words2 = new Set([...name2, ...desc2]);
 
   const name1InItem2 = name1.filter(w => words2.has(w));
   const name2InItem1 = name2.filter(w => words1.has(w));
   if (name1InItem2.length > 0 || name2InItem1.length > 0) {
-    score += 20; // Cross-match bonus (e.g. name of one is mentioned in description of other)
+    score += 15; // Reduced from 20: cross-match is a weaker signal
   }
 
-  // Any common words across name/description (overall overlap)
+  // Overall word overlap — only count if more than 1 word overlaps to avoid
+  // false positives from common short words
   const overallCommon = intersection([...words1], [...words2]);
-  if (overallCommon.length > 0) {
-    score += Math.min(overallCommon.length * 15, 50);
+  if (overallCommon.length > 1) {
+    score += Math.min(overallCommon.length * 10, 30);
   }
 
   score += attributeOverlapScore(
@@ -121,8 +139,8 @@ function computeHeuristicMatchScore(item1, item2) {
   score += attributeOverlapScore(
     extractAttributeTokens(item1, ITEM_TYPE_WORDS),
     extractAttributeTokens(item2, ITEM_TYPE_WORDS),
-    16,
-    14
+    20, // Slightly higher: item type is a strong signal
+    18
   );
 
   const codes1 = extractCodeTokens(item1);
@@ -135,16 +153,17 @@ function computeHeuristicMatchScore(item1, item2) {
     const loc1 = extractKeywords(item1.location_found);
     const loc2 = extractKeywords(item2.location_found);
     const locCommon = intersection(loc1, loc2);
-    score += Math.min(locCommon.length * 12, 20);
+    // Reduced from 12/max 20 → 8/max 12: same location is weak evidence on its own
+    score += Math.min(locCommon.length * 8, 12);
   }
 
   const date1 = item1.date_lost_found || item1.date_reported || item1.created_at;
   const date2 = item2.date_lost_found || item2.date_reported || item2.created_at;
   const daysApart = daysBetween(date1, date2);
   if (daysApart != null) {
-    if (daysApart <= 3) score += 10;
-    else if (daysApart <= 7) score += 6;
-    else if (daysApart <= 14) score += 3;
+    if (daysApart <= 3) score += 8;
+    else if (daysApart <= 7) score += 4;
+    else if (daysApart <= 14) score += 2;
   }
 
   return Math.max(0, Math.min(Math.round(score), 100));
@@ -299,19 +318,46 @@ async function rankLostFoundCandidates(target, candidates, options = {}) {
         && normalizeLooseText(candidate.category)
         && normalizeLooseText(normalizedTarget.category) !== normalizeLooseText(candidate.category);
 
-      let combined = heuristicRaw;
+      // Detect clear item-type mismatch (e.g. wallet vs watch, phone vs bottle)
+      // If both items have a known item type and those types differ, it's a hard mismatch
+      const targetTypes = extractAttributeTokens(normalizedTarget, ITEM_TYPE_WORDS);
+      const candidateTypes = extractAttributeTokens(candidate, ITEM_TYPE_WORDS);
+      const hasTypeMismatch = targetTypes.size > 0 && candidateTypes.size > 0
+        && ![...targetTypes].some(t => candidateTypes.has(t));
+
+      // Use a weighted average of available signals instead of Math.max.
+      // Math.max was causing one over-confident sub-scorer to inflate the total.
+      let totalWeight = 0;
+      let weightedSum = 0;
+
+      // Heuristic is always available — weight 1.0
+      weightedSum += heuristicRaw * 1.0;
+      totalWeight += 1.0;
+
       if (typeof structuredRaw === 'number') {
-        combined = Math.max(combined, structuredRaw);
+        weightedSum += structuredRaw * 1.2; // ML structured gets slightly more trust
+        totalWeight += 1.2;
       }
       if (typeof visionRaw === 'number') {
-        combined = Math.max(combined, visionRaw);
+        weightedSum += visionRaw * 1.0;
+        totalWeight += 1.0;
       }
       if (imageAnalysisUsed && typeof imagePairRaw === 'number') {
-        combined = Math.max(combined, imagePairRaw);
+        weightedSum += imagePairRaw * 1.5; // Image-to-image comparison is most reliable
+        totalWeight += 1.5;
       }
 
-      if (categoryMismatch && combined < 0.6) {
-        combined -= 0.05;
+      let combined = weightedSum / totalWeight;
+
+      // Hard penalty: if item types are clearly different (wallet vs watch, phone vs bottle, etc.),
+      // crush the score so they will never match.
+      if (hasTypeMismatch) {
+        combined = Math.min(combined * 0.2, 0.15);
+      }
+
+      // Penalty for category mismatch (applies up to 0.75 to catch high-scoring cases)
+      if (categoryMismatch && combined < 0.75) {
+        combined -= 0.15;
       }
 
       const normalizedScore = round4(combined);

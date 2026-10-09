@@ -44,6 +44,8 @@
     adminUsersDept: 'All',
     adminSelectedAllowedIds: new Set(),
     lostFoundReviews: [],
+    lostFoundRejected: [],
+    lfMatchIndex: 0,
     sectionSchedules: [],
     lfMatches: null,
     lfMatchingId: null,
@@ -209,12 +211,28 @@
       try { data = JSON.parse(text); } catch (_) {
         throw new Error(res.ok ? 'Invalid server response' : `Server error ${res.status}`);
       }
-      if (!res.ok) throw new Error(data.error || 'Request failed');
+      if (!res.ok) {
+        const e = new Error(data.error || 'Request failed');
+        e.status = res.status;
+        e.responseData = data; // preserve full body (conflict details, recommendations, etc.)
+        throw e;
+      }
       return data;
     } catch (err) {
       if (err.message === 'Authentication required' || err.message === 'Invalid or expired token') {
+        const wasLoggedIn = !!state.user;
         state.user = null;
-        render();
+        sessionStorage.removeItem('pupsj_token');
+        localStorage.removeItem('pupsj_token');
+        if (window._studentQueueInterval) {
+          clearInterval(window._studentQueueInterval);
+          window._studentQueueInterval = null;
+        }
+        stopNotificationsPolling();
+        if (typeof stopLocatorPolling === 'function') stopLocatorPolling();
+        if (wasLoggedIn) {
+          render();
+        }
       }
       throw err;
     }
@@ -232,8 +250,19 @@
       return data;
     } catch (err) {
       if (err.message === 'Authentication required' || err.message === 'Invalid or expired token') {
+        const wasLoggedIn = !!state.user;
         state.user = null;
-        render();
+        sessionStorage.removeItem('pupsj_token');
+        localStorage.removeItem('pupsj_token');
+        if (window._studentQueueInterval) {
+          clearInterval(window._studentQueueInterval);
+          window._studentQueueInterval = null;
+        }
+        stopNotificationsPolling();
+        if (typeof stopLocatorPolling === 'function') stopLocatorPolling();
+        if (wasLoggedIn) {
+          render();
+        }
       }
       throw err;
     }
@@ -503,8 +532,29 @@
   function formatTime(t) {
     if (!t) return '';
     const [h, m] = t.split(':');
-    const hr = parseInt(h);
-    return `${hr > 12 ? hr - 12 : hr || 12}:${m} ${hr >= 12 ? 'PM' : 'AM'}`;
+    const hr = parseInt(h, 10);
+    if (isNaN(hr)) return t;
+    const ampm = hr >= 12 ? 'PM' : 'AM';
+    const hour12 = hr % 12 || 12;
+    return `${hour12}:${m || '00'} ${ampm}`;
+  }
+
+  function normalizeImages(images) {
+    if (!images) return [];
+    if (typeof images === 'string') {
+      try { images = JSON.parse(images); } catch (_) { return []; }
+    }
+    if (!Array.isArray(images)) return [];
+    return images
+      .map(img => {
+        if (!img) return null;
+        if (typeof img === 'string') return { image_url: img };
+        if (typeof img === 'object' && (img.image_url || img.url)) {
+          return { ...img, image_url: img.image_url || img.url };
+        }
+        return null;
+      })
+      .filter(Boolean);
   }
 
   function getInitials(name) {
@@ -545,6 +595,15 @@
       if (getStoredTheme() === 'system') applyTheme('system');
     });
   }
+  window._toggleTheme = () => {
+    const current = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    const next = current === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    document.querySelectorAll('.landing-theme-btn i, .theme-toggle-btn i').forEach(icon => {
+      icon.className = next === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
+    });
+    showToast(`${next === 'dark' ? 'Dark' : 'Light'} mode enabled`, 'info');
+  };
   applyTheme(getStoredTheme());
 
   // Renders an avatar — profile picture if available, initials fallback
@@ -628,7 +687,9 @@
       stopNotificationsPolling();
       app.innerHTML = renderAuth();
       bindAuthEvents();
-      startCarouselAutoplay();
+      if (!state.authViewActive) {
+        startCarouselAutoplay();
+      }
     } else {
       stopCarouselAutoplay();
       app.innerHTML = renderLayout();
@@ -670,11 +731,26 @@
   let carouselTimer = null;
 
   function getCarouselSlides() {
+    if (state.systemSettings?.landing_carousel_slides) {
+      try {
+        const parsed = typeof state.systemSettings.landing_carousel_slides === 'string'
+          ? JSON.parse(state.systemSettings.landing_carousel_slides)
+          : state.systemSettings.landing_carousel_slides;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.map(s => ({
+            image: s.image || '/landing_hero.png',
+            title: s.title || `${state.systemSettings?.app_title || 'PUPSJ HUB'}`,
+            subtitle: s.subtitle || ''
+          }));
+        }
+      } catch (e) {}
+    }
+
     const heroRaw = state.systemSettings?.app_landing_hero || '/landing_hero.png';
     const heroImages = heroRaw.split(',').map(u => u.trim()).filter(Boolean);
     
     const defaultSlideTitles = [
-      { title: `${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')} Main Campus`, subtitle: 'San Juan Campus building & landmarks' },
+      { title: `${state.systemSettings?.app_title || 'PUPSJ HUB'} Main Campus`, subtitle: 'San Juan Campus building & landmarks' },
       { title: 'Interactive Portal', subtitle: 'Keep track of all campus announcements & event calendars' },
       { title: 'Smart PUPBot AI', subtitle: 'Interact with our smart campus companion anytime' },
       { title: 'Campus Community', subtitle: 'Connect with student organizations and committees' },
@@ -693,13 +769,52 @@
     }
 
     return [
-      { image: '/landing_hero.png', title: `${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')} Main Campus`, subtitle: 'San Juan Campus building & landmarks' }
+      { image: '/landing_hero.png', title: `${state.systemSettings?.app_title || 'PUPSJ HUB'} Main Campus`, subtitle: 'San Juan Campus building & landmarks' }
     ];
+  }
+
+  const DEFAULT_LANDING_FEATURES = [
+    { icon: 'fas fa-bullhorn', title: 'Announcements', desc: 'Stay updated with real-time official school announcements, news, and notifications.' },
+    { icon: 'fas fa-calendar-alt', title: 'Event Calendar', desc: 'Explore school activities, student organization events, and campus updates.' },
+    { icon: 'fas fa-search-location', title: 'Lost & Found', desc: 'Report lost property or easily locate found items on campus.' },
+    { icon: 'fas fa-clock', title: 'Class Schedules', desc: 'Quickly lookup student class schedules and room assignments.' },
+    { icon: 'fas fa-robot', title: 'PUPBot AI', desc: 'Chat with our smart AI student assistant for inquiries and academic guides.' },
+    { icon: 'fas fa-folder-open', title: 'Document Templates', desc: 'Download official school templates, guidelines, and faculty papers.' }
+  ];
+
+  function getLandingFeatures() {
+    if (state.systemSettings?.landing_features_json) {
+      try {
+        const parsed = typeof state.systemSettings.landing_features_json === 'string'
+          ? JSON.parse(state.systemSettings.landing_features_json)
+          : state.systemSettings.landing_features_json;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      } catch (e) {}
+    }
+    return DEFAULT_LANDING_FEATURES;
+  }
+
+  function renderFeatureCards() {
+    const features = getLandingFeatures();
+    return features.map((f, i) => `
+      <div class="feature-card">
+        <div class="feature-icon"><i class="${f.icon || 'fas fa-star'}"></i></div>
+        <h3 class="feature-name">${escHtml(f.title || '')}</h3>
+        <p class="feature-desc">${escHtml(f.desc || '')}</p>
+      </div>
+    `).join('');
   }
 
   function startCarouselAutoplay() {
     stopCarouselAutoplay();
+    if (state.authViewActive) return;
     carouselTimer = setInterval(() => {
+      if (state.authViewActive) {
+        stopCarouselAutoplay();
+        return;
+      }
       const slides = getCarouselSlides();
       if (slides.length <= 1) return;
       activeSlide = (activeSlide + 1) % slides.length;
@@ -749,24 +864,25 @@
 
   function renderCarousel() {
     const slides = getCarouselSlides();
+    const currentIdx = Math.min(activeSlide, Math.max(0, slides.length - 1));
     return `
       <div class="carousel-container" style="overflow: hidden; position: relative; border-radius: 12px;">
-        <div class="carousel-track" style="display: flex; transition: transform 0.6s cubic-bezier(0.25, 1, 0.5, 1); transform: translateX(-${activeSlide * 100}%);">
+        <div class="carousel-track" style="display: flex; transition: transform 0.6s cubic-bezier(0.25, 1, 0.5, 1); transform: translateX(-${currentIdx * 100}%);">
           ${slides.map(slide => `
             <div class="carousel-slide" style="min-width: 100%; box-sizing: border-box; position: relative;">
-              <img src="${slide.image}" alt="${slide.title}" style="width: 100%; display: block; object-fit: cover;">
+              <img src="${slide.image}" alt="${escHtml(slide.title)}" style="width: 100%; display: block; object-fit: cover;">
               <div class="carousel-caption">
-                <h4>${slide.title}</h4>
-                <p>${slide.subtitle}</p>
+                <h4>${escHtml(slide.title)}</h4>
+                <p>${escHtml(slide.subtitle)}</p>
               </div>
             </div>
           `).join('')}
         </div>
         ${slides.length > 1 ? `
-          <button class="carousel-arrow prev" onclick="window._prevSlide()"><i class="fas fa-chevron-left"></i></button>
-          <button class="carousel-arrow next" onclick="window._nextSlide()"><i class="fas fa-chevron-right"></i></button>
+          <button type="button" class="carousel-arrow prev" onclick="window._prevSlide()" aria-label="Previous Slide"><i class="fas fa-chevron-left"></i></button>
+          <button type="button" class="carousel-arrow next" onclick="window._nextSlide()" aria-label="Next Slide"><i class="fas fa-chevron-right"></i></button>
           <div class="carousel-indicators">
-            ${slides.map((_, i) => `<span class="indicator ${activeSlide === i ? 'active' : ''}" onclick="window._setSlide(${i})"></span>`).join('')}
+            ${slides.map((_, i) => `<span class="indicator ${currentIdx === i ? 'active' : ''}" onclick="window._setSlide(${i})"></span>`).join('')}
           </div>
         ` : ''}
       </div>
@@ -782,15 +898,17 @@
     const formsSlide = document.querySelector('.slide-forms');
 
     if (track && formsSlide) {
-      // Render correct panel dynamically before sliding
-      formsSlide.innerHTML = renderAuthPanel();
-      bindAuthEvents();
-
-      // Temporarily hide panel scrollbar to avoid visual layout scroll shifting during translation
-      const panel = formsSlide.querySelector('.auth-form-panel');
-      if (panel) {
-        panel.style.overflowY = 'hidden';
-        setTimeout(() => { panel.style.overflowY = 'auto'; }, 600);
+      if (track.classList.contains('slide-active')) {
+        // If already showing auth view, smoothly switch modes instead of tearing the DOM
+        if (mode && typeof switchAuthMode === 'function') {
+          switchAuthMode(mode);
+        }
+        return;
+      }
+      if (!formsSlide.querySelector('.auth-card') || formsSlide.dataset.authMode !== authMode) {
+        formsSlide.innerHTML = renderAuthPanel();
+        formsSlide.dataset.authMode = authMode;
+        bindAuthEvents();
       }
 
       requestAnimationFrame(() => {
@@ -804,15 +922,13 @@
 
   window._closeAuthView = () => {
     state.authViewActive = false;
+    state.resetToken = '';
+    sessionStorage.removeItem('pupsj_reset_token');
     startCarouselAutoplay();
 
     const track = document.querySelector('.auth-track');
     if (track) {
-      // Temporarily hide scrollbar of the form panel to prevent visual scrollbar slide glitch!
-      const panel = track.querySelector('.auth-form-panel');
-      if (panel) {
-        panel.style.overflowY = 'hidden';
-      }
+      // Keep scrollbar layout stable to prevent glitching
 
       track.classList.remove('slide-active');
     } else {
@@ -830,6 +946,8 @@
     } else if (authMode === 'register') {
       showRoleTabs = true;
       formContent = `<div class="auth-card">${renderRegister()}</div>`;
+    } else if (authMode === 'verify' || authMode === 'registered' || authMode === 'verify-error') {
+      formContent = `<div class="auth-card">${renderVerifyOtp()}</div>`;
     } else if (authMode === 'forgot-password') {
       formContent = `<div class="auth-card">${renderForgotPassword()}</div>`;
     } else if (authMode === 'reset-password') {
@@ -866,6 +984,14 @@
   }
 
   function renderAuth() {
+    // Clear all authenticated background timers when rendering auth screens
+    if (window._studentQueueInterval) {
+      clearInterval(window._studentQueueInterval);
+      window._studentQueueInterval = null;
+    }
+    stopNotificationsPolling();
+    if (typeof stopLocatorPolling === 'function') stopLocatorPolling();
+
     // Force body overflow to hidden when rendering auth views to handle transition correctly
     document.body.style.overflow = 'hidden';
 
@@ -874,8 +1000,8 @@
       return `<div class="auth-screen auth-status-screen force-light">
         <div class="auth-status-card">
           <div class="auth-status-icon spin"><i class="fas fa-circle-notch"></i></div>
-          <h2>Verifying your email…</h2>
-          <p>Please wait a moment.</p>
+          <h2>Verifying Your Email…</h2>
+          <p>Please wait a moment while we activate your account.</p>
         </div>
       </div>`;
     }
@@ -886,27 +1012,6 @@
           <h2>Email Verified!</h2>
           <p>${escHtml(state.verifyMessage || 'Your email has been verified successfully.')}</p>
           <button class="auth-submit-btn" onclick="window._authGoLogin()">Go to Login</button>
-        </div>
-      </div>`;
-    }
-    if (authMode === 'verify-error') {
-      return `<div class="auth-screen auth-status-screen force-light">
-        <div class="auth-status-card error">
-          <div class="auth-status-icon"><i class="fas fa-exclamation-circle"></i></div>
-          <h2>Verification Failed</h2>
-          <p>${escHtml(state.verifyMessage || 'Invalid or expired verification link.')}</p>
-          <button class="auth-submit-btn" onclick="window._authGoLogin()">Back to Login</button>
-        </div>
-      </div>`;
-    }
-    if (authMode === 'registered') {
-      return `<div class="auth-screen auth-status-screen force-light">
-        <div class="auth-status-card success">
-          <div class="auth-status-icon"><i class="fas fa-envelope-open-text"></i></div>
-          <h2>Check Your Email!</h2>
-          <p>We sent a verification link to <strong>${escHtml(state.registeredEmail || 'your email')}</strong>. Click the link to activate your account before logging in.</p>
-          <p class="auth-status-note">Didn't receive it? Check your spam folder or <a id="resendVerificationLink" href="#">resend the email</a>.</p>
-          <button class="auth-submit-btn" onclick="window._authGoLogin()">Back to Login</button>
         </div>
       </div>`;
     }
@@ -931,6 +1036,9 @@
                     <a href="#about" class="nav-link">About</a>
                   </nav>
                   <div class="navbar-actions">
+                    <button class="landing-theme-btn" onclick="window._toggleTheme()" title="Toggle Dark/Light Mode" aria-label="Toggle theme">
+                      <i class="${document.documentElement.getAttribute('data-theme') === 'dark' ? 'fas fa-sun' : 'fas fa-moon'}"></i>
+                    </button>
                     <a href="#" class="btn-text-link" onclick="event.preventDefault(); window._openAuthView('register')">Sign up</a>
                     <button class="btn btn-primary" onclick="window._openAuthView('login')" style="background: #880808 !important; border-color: #880808 !important; color: #fff !important; font-size: 13px; font-weight: 600; padding: 8px 18px; border-radius: 6px;">Log In</button>
                     <button class="btn btn-outlined" onclick="window._guestLogin()" style="border: 1.5px solid #880808 !important; color: #880808 !important; background: transparent !important; font-size: 13px; font-weight: 600; padding: 8px 18px; border-radius: 6px;">Guest Access</button>
@@ -943,13 +1051,13 @@
                 <section class="landing-hero" id="home">
                   <div class="hero-container">
                     <div class="hero-content">
-                      <span class="hero-label">ABOUT US</span>
-                      <h1 class="hero-title">${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')}</h1>
-                      <h2 class="hero-subtitle">${escHtml(state.systemSettings?.app_title_subtitle || 'San Juan Campus Hub')}</h2>
-                      <p class="hero-body">Welcome to the complete campus progressive web application. Access class schedules, stay updated with campus announcements, report or find lost items, download academic forms & templates, and interact with our smart AI companion, PUPBot.</p>
+                      <span class="hero-label">${escHtml(state.systemSettings?.landing_hero_kicker || 'ABOUT US')}</span>
+                      <h1 class="hero-title">${escHtml(state.systemSettings?.landing_hero_title || state.systemSettings?.app_title || 'PUPSJ HUB')}</h1>
+                      <h2 class="hero-subtitle">${escHtml(state.systemSettings?.landing_hero_subtitle || state.systemSettings?.app_title_subtitle || 'San Juan Campus Hub')}</h2>
+                      <p class="hero-body">${escHtml(state.systemSettings?.landing_hero_body || 'Welcome to the complete campus progressive web application. Access class schedules, stay updated with campus announcements, report or find lost items, download academic forms & templates, and interact with our smart AI companion, PUPBot.')}</p>
                       <div class="hero-ctas">
-                        <button class="btn btn-primary btn-lg" onclick="window._guestLogin()">Explore as Guest</button>
-                        <button class="btn btn-outlined btn-lg" onclick="window._openAuthView('login')">Log In / Sign Up</button>
+                        <button class="btn btn-primary btn-lg" onclick="window._guestLogin()">${escHtml(state.systemSettings?.landing_hero_cta_primary || 'Explore as Guest')}</button>
+                        <button class="btn btn-outlined btn-lg" onclick="window._openAuthView('login')">${escHtml(state.systemSettings?.landing_hero_cta_secondary || 'Log In / Sign Up')}</button>
                       </div>
                     </div>
                     <div class="hero-graphics">
@@ -960,57 +1068,92 @@
                   </div>
                 </section>
 
+                <!-- LONG-FORM SHOWCASE SECTION -->
+                <section class="landing-showcase landing-showcase-intro">
+                  <div class="section-container showcase-grid">
+                    <div class="showcase-copy">
+                      <span class="section-kicker">${escHtml(state.systemSettings?.landing_showcase1_kicker || 'One hub. Every campus day.')}</span>
+                      <h2 class="section-title">${escHtml(state.systemSettings?.landing_showcase1_title || 'Everything that keeps San Juan moving.')}</h2>
+                      <p>${escHtml(state.systemSettings?.landing_showcase1_desc || 'From the first announcement to the last class of the day, PUPSJ HUB keeps the essentials close, clear, and easy to use.')}</p>
+                      <button class="about-link" onclick="window._guestLogin()">${escHtml(state.systemSettings?.landing_showcase1_btn_text || 'Explore the hub')} <i class="fas fa-arrow-right"></i></button>
+                    </div>
+                    <div class="showcase-visual showcase-visual-collage">
+                      <div class="collage-card collage-card-main">
+                        <img src="${state.systemSettings?.landing_showcase1_image || '/landing_hero.png'}" alt="PUP San Juan campus community">
+                      </div>
+                      <div class="collage-card collage-card-small">
+                        <i class="fas fa-bullhorn"></i>
+                        <strong>${escHtml(state.systemSettings?.landing_showcase1_badge_title || 'Campus updates')}</strong>
+                        <span>${escHtml(state.systemSettings?.landing_showcase1_badge_desc || 'Always within reach')}</span>
+                      </div>
+                      <div class="collage-badge">
+                        <strong>${escHtml(state.systemSettings?.landing_showcase1_badge_num || '01')}</strong>
+                        <span>${escHtml(state.systemSettings?.landing_showcase1_badge_sub || 'Stay connected')}</span>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
                 <!-- FEATURES SECTION -->
                 <section class="landing-features" id="features">
                   <div class="section-container">
-                    <h2 class="section-title">Features</h2>
+                    <h2 class="section-title">${escHtml(state.systemSettings?.landing_features_title || 'Features')}</h2>
                     <div class="features-grid">
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-bullhorn"></i></div>
-                        <h3 class="feature-name">Announcements</h3>
-                        <p class="feature-desc">Stay updated with real-time official school announcements, news, and notifications.</p>
+                      ${renderFeatureCards()}
+                    </div>
+                  </div>
+                </section>
+
+                <section class="landing-showcase landing-showcase-soft">
+                  <div class="section-container showcase-grid showcase-grid-reverse">
+                    <div class="showcase-visual showcase-visual-dashboard">
+                      <div class="mini-dashboard">
+                        <div class="mini-dashboard-head">
+                          <span>${escHtml(state.systemSettings?.landing_showcase2_dash_title || 'Today at PUP San Juan')}</span>
+                          <i class="fas fa-ellipsis-h"></i>
+                        </div>
+                        <div class="mini-dashboard-row clickable-dash-row" onclick="window._guestLogin('announcements')" title="View Campus Announcements" role="button" tabindex="0">
+                          <i class="fas fa-bullhorn"></i>
+                          <span>${escHtml(state.systemSettings?.landing_showcase2_row1 || 'Campus announcements')}</span>
+                          <button type="button" class="mini-dash-btn" onclick="event.stopPropagation(); window._guestLogin('announcements')">View</button>
+                        </div>
+                        <div class="mini-dashboard-row clickable-dash-row" onclick="window._guestLogin('documents')" title="Open Document Templates" role="button" tabindex="0">
+                          <i class="fas fa-folder-open"></i>
+                          <span>${escHtml(state.systemSettings?.landing_showcase2_row2 || 'Document templates')}</span>
+                          <button type="button" class="mini-dash-btn" onclick="event.stopPropagation(); window._guestLogin('documents')">Open</button>
+                        </div>
+                        <div class="mini-dashboard-row clickable-dash-row" onclick="window._guestLogin('chatbot')" title="Chat with PUPBot AI" role="button" tabindex="0">
+                          <i class="fas fa-robot"></i>
+                          <span>${escHtml(state.systemSettings?.landing_showcase2_row3 || 'PUPBot AI assistant')}</span>
+                          <button type="button" class="mini-dash-btn" onclick="event.stopPropagation(); window._guestLogin('chatbot')">Chat</button>
+                        </div>
                       </div>
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-calendar-alt"></i></div>
-                        <h3 class="feature-name">Event Calendar</h3>
-                        <p class="feature-desc">Explore school activities, student organization events, and campus updates.</p>
-                      </div>
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-search-location"></i></div>
-                        <h3 class="feature-name">Lost & Found</h3>
-                        <p class="feature-desc">Report lost property or easily locate found items on campus.</p>
-                      </div>
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-clock"></i></div>
-                        <h3 class="feature-name">Class Schedules</h3>
-                        <p class="feature-desc">Quickly lookup student class schedules and room assignments.</p>
-                      </div>
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-robot"></i></div>
-                        <h3 class="feature-name">PUPBot AI</h3>
-                        <p class="feature-desc">Chat with our smart AI student assistant for inquiries and academic guides.</p>
-                      </div>
-                      <div class="feature-card">
-                        <div class="feature-icon"><i class="fas fa-folder-open"></i></div>
-                        <h3 class="feature-name">Document Templates</h3>
-                        <p class="feature-desc">Download official school templates, guidelines, and faculty papers.</p>
+                    </div>
+                    <div class="showcase-copy">
+                      <span class="section-kicker">${escHtml(state.systemSettings?.landing_showcase2_kicker || 'Designed around you')}</span>
+                      <h2 class="section-title">${escHtml(state.systemSettings?.landing_showcase2_title || 'A calmer way to navigate campus.')}</h2>
+                      <p>${escHtml(state.systemSettings?.landing_showcase2_desc || 'No more jumping between links, group chats, and scattered files. Your everyday campus tools live together in one thoughtful experience.')}</p>
+                      <div class="showcase-points">
+                        <span><i class="fas fa-check"></i> ${escHtml(state.systemSettings?.landing_showcase2_point1 || 'Clear and organized')}</span>
+                        <span><i class="fas fa-check"></i> ${escHtml(state.systemSettings?.landing_showcase2_point2 || 'Built for the PUP community')}</span>
+                        <span><i class="fas fa-check"></i> ${escHtml(state.systemSettings?.landing_showcase2_point3 || 'Available wherever you are')}</span>
                       </div>
                     </div>
                   </div>
                 </section>
 
                 <!-- ABOUT SECTION -->
-                <section class="landing-about" id="about" style="background: #fafafa; padding: 80px 0; border-top: 1px solid #eaeaea;">
+                <section class="landing-about" id="about" style="padding: 80px 0; border-top: 1px solid var(--border);">
                   <div class="section-container" style="max-width: 800px; margin: 0 auto; text-align: center;">
-                    <h2 class="section-title" style="margin-bottom: 24px;">About PUPSJ HUB</h2>
-                    <p style="font-size: 15px; color: #555; line-height: 1.8; margin-bottom: 0;">${escHtml(state.systemSettings?.app_description || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.')}</p>
+                    <h2 class="section-title" style="margin-bottom: 24px;">${escHtml(state.systemSettings?.landing_about_title || ('About ' + (state.systemSettings?.app_title || 'PUPSJ HUB')))}</h2>
+                    <p style="font-size: 15px; color: var(--text-secondary); line-height: 1.8; margin-bottom: 0;">${escHtml(state.systemSettings?.landing_about_desc || state.systemSettings?.app_description || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.')}</p>
                   </div>
                 </section>
 
                 <!-- FOOTER -->
                 <footer class="landing-footer">
                   <div class="footer-container">
-                    <p>&copy; 2026 PUPSJ HUB. All Rights Reserved. Dedicated to Academic Excellence.</p>
+                    <p>${escHtml(state.systemSettings?.landing_footer_text || '© 2026 PUPSJ HUB. All Rights Reserved. Dedicated to Academic Excellence.')}</p>
                   </div>
                 </footer>
               </div>
@@ -1027,7 +1170,66 @@
   }
 
   // Global helpers for onclick
-  window._authGoLogin = () => { authMode = 'login'; render(); };
+  window._authGoLogin = () => {
+    authMode = 'login';
+    state.authViewActive = true;
+    render();
+  };
+
+  window._handleOtpVerify = async (inputId) => {
+    const el = document.getElementById(inputId);
+    const code = (el ? el.value : '').trim().replace(/\s+/g, '');
+    if (!code) {
+      showToast('Please enter your 6-digit verification code', 'warning');
+      return;
+    }
+    authMode = 'verifying';
+    render();
+    try {
+      const data = await api('/api/auth/verify-email', {
+        method: 'POST',
+        body: JSON.stringify({
+          token: code,
+          email: state.registeredEmail || ''
+        })
+      });
+      if (data.token && data.user) {
+        sessionStorage.setItem('pupsj_token', data.token);
+        localStorage.removeItem('pupsj_token');
+        state.user = data.user;
+        showToast(`${getGreeting()}, ${state.user.first_name}! Your email is verified and you are now logged in.`, 'success');
+        render();
+        return;
+      }
+      authMode = 'verify-success';
+      state.verifyMessage = data.message || 'Email verified successfully!';
+    } catch (err) {
+      authMode = 'verify-error';
+      state.verifyMessage = err.message || 'Verification failed. Please check the code and try again.';
+    }
+    render();
+  };
+
+  window._handleManualVerify = window._handleOtpVerify;
+
+  window._promptResendVerification = async () => {
+    const defaultEmail = state.registeredEmail || '';
+    const email = prompt('Enter your registered email or student number to resend code:', defaultEmail);
+    if (!email || !email.trim()) return;
+    try {
+      const res = await api('/api/auth/resend-verification', {
+        method: 'POST',
+        body: JSON.stringify({ email: email.trim() })
+      });
+      if (res.email) state.registeredEmail = res.email;
+      showToast(res.message || 'Verification code resent! Please check your inbox.', 'success');
+      authMode = 'registered';
+      render();
+    } catch (err) {
+      showToast(err.message || 'Failed to resend verification email', 'error');
+    }
+  };
+
   window._togglePasswordVisibility = (inputId, btn) => {
     const input = document.getElementById(inputId);
     if (!input) return;
@@ -1063,11 +1265,10 @@
     inner.classList.remove('auth-content-in');
     inner.classList.add('auth-content-out');
 
-    // Temporarily hide scrollbar of the form panel to prevent visual scrollbar slide glitch!
+    // Keep overflow smooth during mode transition
     const panel = document.querySelector('.auth-form-panel');
     if (panel) {
-      panel.style.overflowY = 'hidden';
-      setTimeout(() => { panel.style.overflowY = 'auto'; }, 400); // restore after width transition completes!
+      panel.scrollTop = 0;
     }
 
     // ── Step 2: trigger panel width CSS transition immediately ──
@@ -1106,7 +1307,11 @@
       // Swap card content
       const card = inner.querySelector('.auth-card');
       if (card) {
-        card.innerHTML = newMode === 'login' ? renderLogin() : renderRegister();
+        if (newMode === 'login') card.innerHTML = renderLogin();
+        else if (newMode === 'register') card.innerHTML = renderRegister();
+        else if (newMode === 'verify') card.innerHTML = renderVerifyOtp();
+        else if (newMode === 'forgot-password') card.innerHTML = renderForgotPassword();
+        else if (newMode === 'reset-password') card.innerHTML = renderResetPassword();
       }
 
       // Re-bind all auth events
@@ -1127,20 +1332,66 @@
       <h2>Login</h2>
       <p class="subtitle">Enter your account details</p>
       <div class="auth-error" id="authError"></div>
-      <div class="form-group">
-        <label>Email</label>
-        <input type="email" class="form-input" id="loginEmail" placeholder="you@pupsj.edu.ph" autocomplete="email">
-      </div>
-      <div class="form-group">
-        <label>Password</label>
-        <div class="auth-password-wrapper">
-          <input type="password" class="form-input" id="loginPassword" placeholder="Enter your password" autocomplete="current-password">
-          <button type="button" class="toggle-password-btn" onclick="window._togglePasswordVisibility('loginPassword', this)"><i class="far fa-eye"></i></button>
+      <form id="loginForm" method="post" action="#" onsubmit="return false;" autocomplete="on">
+        <div class="form-group">
+          <label for="loginEmail">Email</label>
+          <input type="email" class="form-input" id="loginEmail" name="email" placeholder="you@pupsj.edu.ph" autocomplete="username email" required>
         </div>
-        <div class="auth-forgot-link"><a id="forgotPasswordLink">Forgot Password?</a></div>
-      </div>
-      <button class="btn btn-primary" id="loginBtn"><i class="fas fa-sign-in-alt"></i> Login</button>
+        <div class="form-group">
+          <label for="loginPassword">Password</label>
+          <div class="auth-password-wrapper">
+            <input type="password" class="form-input" id="loginPassword" name="password" placeholder="Enter your password" autocomplete="current-password" required>
+            <button type="button" class="toggle-password-btn" onclick="window._togglePasswordVisibility('loginPassword', this)"><i class="far fa-eye"></i></button>
+          </div>
+          <div class="auth-forgot-link" style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+            <a id="switchToVerifyFromLogin" href="#" style="color:var(--primary, #800000); font-size:12px; font-weight:700;"><i class="fas fa-shield-alt" style="margin-right:3px;"></i> Enter 6-Digit Code</a>
+            <a id="forgotPasswordLink" href="#">Forgot Password?</a>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" id="loginBtn"><i class="fas fa-sign-in-alt"></i> Login</button>
+      </form>
       <p class="auth-switch">Don't have an account? <a id="switchToRegister">Sign up</a></p>`;
+  }
+
+  function renderVerifyOtp() {
+    const targetEmail = state.registeredEmail || '';
+    return `
+      <h2>Verify Your Email</h2>
+      <p class="subtitle">Enter the 6-digit verification code sent to your email</p>
+      <div class="auth-error" id="authError"></div>
+      <div class="auth-success" id="authSuccess"></div>
+      
+      ${targetEmail ? `
+        <div class="auth-verify-banner">
+          <div style="display:flex; align-items:center; gap:10px; min-width:0;">
+            <i class="fas fa-envelope-circle-check auth-verify-banner-icon"></i>
+            <div style="min-width:0;">
+              <div class="auth-verify-banner-label">Verification Code Sent To</div>
+              <div class="auth-verify-banner-email" id="verifyTargetEmailDisplay">${escHtml(targetEmail)}</div>
+            </div>
+          </div>
+          <button type="button" id="editRegInfoBtn" class="auth-verify-edit-btn">Edit</button>
+        </div>
+        <input type="hidden" id="verifyEmailInput" value="${escHtml(targetEmail)}">
+      ` : `
+        <div class="form-group">
+          <label for="verifyEmailInput">Email or Student / Faculty ID</label>
+          <input type="text" class="form-input" id="verifyEmailInput" placeholder="you@pupsj.edu.ph or 2024-00001-SJ-0" value="${escHtml(targetEmail)}" autocomplete="username email">
+        </div>
+      `}
+
+      <div class="form-group">
+        <label for="verifyOtpInput" style="font-weight:700; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; color:var(--text-primary);">6-Digit Verification Code</label>
+        <div class="auth-password-wrapper" style="display:block;">
+          <input type="text" class="form-input auth-otp-input" id="verifyOtpInput" maxlength="6" inputmode="numeric" pattern="[0-9]*" placeholder="123456" autofocus autocomplete="one-time-code">
+        </div>
+      </div>
+      <button type="button" class="btn btn-primary btn-block" id="verifyOtpBtn" style="margin-top:8px;"><i class="fas fa-check-circle"></i> Verify & Complete Registration</button>
+      <div class="auth-resend-row">
+        <span style="font-size:13px; color:var(--text-secondary);">Didn't receive the code?</span>
+        <button type="button" id="verifyResendBtn" class="auth-resend-btn">Resend Code</button>
+      </div>
+      <p class="auth-switch" style="margin-top:16px;">Already have an account? <a id="switchToLoginFromVerify">Sign In</a></p>`;
   }
 
   function renderForgotPassword() {
@@ -1150,8 +1401,8 @@
       <div class="auth-error" id="authError"></div>
       <div class="auth-success" id="authSuccess"></div>
       <div class="form-group">
-        <label>Email</label>
-        <input type="email" class="form-input" id="fpEmail" placeholder="you@pupsj.edu.ph" autocomplete="email">
+        <label>Email or ID Number</label>
+        <input type="text" class="form-input" id="fpEmail" placeholder="you@pupsj.edu.ph or 2024-00001-SJ-0" autocomplete="username">
       </div>
       <button class="btn btn-primary" id="fpBtn"><i class="fas fa-paper-plane"></i> Send Reset Link</button>
       <p class="auth-switch">Remember your password? <a id="switchToLogin">Sign In</a></p>`;
@@ -1164,13 +1415,20 @@
       <div class="auth-error" id="authError"></div>
       <div class="form-group">
         <label>New Password</label>
-        <input type="password" class="form-input" id="rpPassword" placeholder="Min. 6 characters" autocomplete="new-password">
+        <div class="auth-password-wrapper">
+          <input type="password" class="form-input" id="rpPassword" placeholder="Min. 6 characters" autocomplete="new-password">
+          <button type="button" class="toggle-password-btn" onclick="window._togglePasswordVisibility('rpPassword', this)"><i class="far fa-eye"></i></button>
+        </div>
       </div>
       <div class="form-group">
         <label>Confirm Password</label>
-        <input type="password" class="form-input" id="rpConfirm" placeholder="Repeat new password" autocomplete="new-password">
+        <div class="auth-password-wrapper">
+          <input type="password" class="form-input" id="rpConfirm" placeholder="Repeat new password" autocomplete="new-password">
+          <button type="button" class="toggle-password-btn" onclick="window._togglePasswordVisibility('rpConfirm', this)"><i class="far fa-eye"></i></button>
+        </div>
       </div>
-      <button class="btn btn-primary" id="rpBtn"><i class="fas fa-lock"></i> Set New Password</button>`;
+      <button class="btn btn-primary" id="rpBtn"><i class="fas fa-lock"></i> Set New Password</button>
+      <p class="auth-switch">Remember your password? <a id="switchToLogin">Sign In</a></p>`;
   }
 
   // Returns ONLY the fields relevant to the chosen role — no hidden clutter.
@@ -1197,6 +1455,14 @@
         <div class="form-group">
           <label>Faculty Number</label>
           <input type="text" class="form-input" id="regStudentNum" placeholder="2024-00001-SJ-0" oninput="this.value=this.value.toUpperCase()" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="form-group">
+          <label>Employment Type <span class="req">*</span></label>
+          <select class="form-input form-select" id="regEmploymentType">
+            <option value="">Select</option>
+            <option value="full_time">Full Time</option>
+            <option value="part_time">Part Time</option>
+          </select>
         </div>
         <div class="form-group">
           <label>Email</label>
@@ -1278,34 +1544,49 @@
         ${renderRegisterFields('student')}
       </div>
       <button class="btn btn-primary" id="registerBtn"><i class="fas fa-user-plus"></i> Create Account</button>
-      <p class="auth-switch">Already have an account? <a id="switchToLogin">Sign In</a></p>`;
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px;">
+        <p class="auth-switch" style="margin:0;">Already have an account? <a id="switchToLogin">Sign In</a></p>
+        <a id="switchToVerifyFromRegister" href="#" style="color:var(--primary, #800000); font-size:12px; font-weight:700;"><i class="fas fa-shield-alt" style="margin-right:3px;"></i> Have a code?</a>
+      </div>`;
   }
 
   function bindAuthEvents() {
     const switchToReg = document.getElementById('switchToRegister');
     const switchToLog = document.getElementById('switchToLogin');
-    // Use switchAuthMode for login↔register to get the sliding width animation.
-    // Fall back to render() for any other mode (forgot-password → login, etc.)
+    const switchToVerifyFromLog = document.getElementById('switchToVerifyFromLogin');
+    const switchToVerifyFromReg = document.getElementById('switchToVerifyFromRegister');
+    const switchToLogFromVerify = document.getElementById('switchToLoginFromVerify');
+
     if (switchToReg) switchToReg.onclick = () => switchAuthMode('register');
-    if (switchToLog) {
-      switchToLog.onclick = () => {
-        if (authMode === 'register') {
-          switchAuthMode('login');
-        } else {
-          authMode = 'login'; render();
-        }
-      };
-    }
+    if (switchToLog) switchToLog.onclick = () => switchAuthMode('login');
+    if (switchToVerifyFromLog) switchToVerifyFromLog.onclick = (e) => { e.preventDefault(); switchAuthMode('verify'); };
+    if (switchToVerifyFromReg) switchToVerifyFromReg.onclick = (e) => { e.preventDefault(); switchAuthMode('verify'); };
+    if (switchToLogFromVerify) switchToLogFromVerify.onclick = (e) => { e.preventDefault(); switchAuthMode('login'); };
 
     // Forgot Password link on login form
     const forgotLink = document.getElementById('forgotPasswordLink');
-    if (forgotLink) forgotLink.onclick = (e) => { e.preventDefault(); authMode = 'forgot-password'; render(); };
+    if (forgotLink) forgotLink.onclick = (e) => { e.preventDefault(); switchAuthMode('forgot-password'); };
 
+    const loginForm = document.getElementById('loginForm');
+    if (loginForm) {
+      loginForm.onsubmit = (e) => {
+        e.preventDefault();
+        handleLogin();
+      };
+    }
     const loginBtn = document.getElementById('loginBtn');
     if (loginBtn) loginBtn.onclick = handleLogin;
 
     const registerBtn = document.getElementById('registerBtn');
     if (registerBtn) registerBtn.onclick = handleRegister;
+
+    // Verify OTP form submit & resend
+    const verifyOtpBtn = document.getElementById('verifyOtpBtn');
+    if (verifyOtpBtn) verifyOtpBtn.onclick = handleVerifyOtp;
+    const verifyResendBtn = document.getElementById('verifyResendBtn');
+    if (verifyResendBtn) verifyResendBtn.onclick = handleResendOtp;
+    const editRegBtn = document.getElementById('editRegInfoBtn');
+    if (editRegBtn) editRegBtn.onclick = () => switchAuthMode('register');
 
     // Forgot password form submit
     const fpBtn = document.getElementById('fpBtn');
@@ -1359,33 +1640,168 @@
       bindRegisterFields();
     }
 
-    // Enter key on login password
+    // Enter key on login inputs
+    const loginEm = document.getElementById('loginEmail');
+    if (loginEm) loginEm.onkeydown = (e) => { if (e.key === 'Enter') handleLogin(); };
     const loginPw = document.getElementById('loginPassword');
     if (loginPw) loginPw.onkeydown = (e) => { if (e.key === 'Enter') handleLogin(); };
+
+    // Enter key on verify OTP inputs
+    const verifyOtpIn = document.getElementById('verifyOtpInput');
+    if (verifyOtpIn) verifyOtpIn.onkeydown = (e) => { if (e.key === 'Enter') handleVerifyOtp(); };
+    const verifyEmailIn = document.getElementById('verifyEmailInput');
+    if (verifyEmailIn) verifyEmailIn.onkeydown = (e) => { if (e.key === 'Enter') handleVerifyOtp(); };
 
     // Enter key on forgot password
     const fpEmail = document.getElementById('fpEmail');
     if (fpEmail) fpEmail.onkeydown = (e) => { if (e.key === 'Enter') handleForgotPassword(); };
+
+    // Enter key on reset password
+    const rpPassword = document.getElementById('rpPassword');
+    if (rpPassword) rpPassword.onkeydown = (e) => { if (e.key === 'Enter') handleResetPassword(); };
+    const rpConfirm = document.getElementById('rpConfirm');
+    if (rpConfirm) rpConfirm.onkeydown = (e) => { if (e.key === 'Enter') handleResetPassword(); };
+  }
+
+  async function handleVerifyOtp() {
+    const emailInput = document.getElementById('verifyEmailInput');
+    const otpInput = document.getElementById('verifyOtpInput');
+    const errEl = document.getElementById('authError');
+    const sucEl = document.getElementById('authSuccess');
+    const btn = document.getElementById('verifyOtpBtn');
+
+    const email = (emailInput ? emailInput.value : state.registeredEmail || '').trim();
+    const code = (otpInput ? otpInput.value : '').trim().replace(/\s+/g, '');
+
+    if (!code) {
+      if (errEl) { errEl.textContent = 'Please enter your 6-digit verification code'; errEl.classList.add('show'); }
+      if (otpInput) otpInput.focus();
+      return;
+    }
+    if (errEl) errEl.classList.remove('show');
+    if (sucEl) sucEl.classList.remove('show');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verifying...';
+    }
+
+    try {
+      const data = await api('/api/auth/verify-email', {
+        method: 'POST',
+        body: JSON.stringify({ token: code, email })
+      });
+      if (data.token && data.user) {
+        sessionStorage.setItem('pupsj_token', data.token);
+        localStorage.removeItem('pupsj_token');
+        state.user = data.user;
+        showToast(`${getGreeting()}, ${state.user.first_name}! Your email is verified and you are now logged in.`, 'success');
+        render();
+        return;
+      }
+      showToast(data.message || 'Email verified successfully! You can now log in.', 'success');
+      switchAuthMode('login');
+    } catch (err) {
+      if (errEl) {
+        errEl.textContent = err.message || 'Verification failed. Please check the code and try again.';
+        errEl.classList.add('show');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-check-circle"></i> Verify & Complete Registration';
+      }
+    }
+  }
+
+  async function handleResendOtp() {
+    const emailInput = document.getElementById('verifyEmailInput');
+    const errEl = document.getElementById('authError');
+    const sucEl = document.getElementById('authSuccess');
+    const resendBtn = document.getElementById('verifyResendBtn');
+
+    const email = (emailInput ? emailInput.value : state.registeredEmail || '').trim();
+    if (!email) {
+      if (errEl) { errEl.textContent = 'Please enter your email or student number to resend the code'; errEl.classList.add('show'); }
+      if (emailInput) emailInput.focus();
+      return;
+    }
+
+    if (errEl) errEl.classList.remove('show');
+    if (resendBtn) {
+      resendBtn.disabled = true;
+      resendBtn.textContent = 'Sending…';
+    }
+
+    try {
+      const res = await api('/api/auth/resend-verification', {
+        method: 'POST',
+        body: JSON.stringify({ email })
+      });
+      if (res.email) {
+        state.registeredEmail = res.email;
+        if (emailInput) emailInput.value = res.email;
+        const displayEl = document.getElementById('verifyTargetEmailDisplay');
+        if (displayEl) displayEl.textContent = res.email;
+      }
+      if (sucEl) {
+        sucEl.textContent = res.message || 'A new 6-digit verification code has been sent to your email.';
+        sucEl.classList.add('show');
+      }
+      showToast('Verification code resent! Please check your inbox.', 'success');
+      if (resendBtn) {
+        resendBtn.textContent = 'Sent!';
+        setTimeout(() => {
+          if (resendBtn) {
+            resendBtn.disabled = false;
+            resendBtn.textContent = 'Resend Code';
+          }
+        }, 10000);
+      }
+    } catch (err) {
+      if (errEl) {
+        errEl.textContent = err.message || 'Failed to resend verification code';
+        errEl.classList.add('show');
+      }
+      if (resendBtn) {
+        resendBtn.disabled = false;
+        resendBtn.textContent = 'Resend Code';
+      }
+    }
   }
 
   async function handleForgotPassword() {
     const email = document.getElementById('fpEmail')?.value.trim();
     const errEl = document.getElementById('authError');
     const sucEl = document.getElementById('authSuccess');
-    if (!email) { errEl.textContent = 'Please enter your email'; errEl.classList.add('show'); return; }
+    if (!email) {
+      if (errEl) { errEl.textContent = 'Please enter your email or ID number'; errEl.classList.add('show'); }
+      return;
+    }
     const btn = document.getElementById('fpBtn');
     try {
-      errEl.classList.remove('show');
-      if (btn) btn.disabled = true;
+      if (errEl) errEl.classList.remove('show');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+      }
       await api('/api/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) });
-      sucEl.textContent = 'If that email is registered, a reset link has been sent. Please check your inbox.';
-      sucEl.classList.add('show');
-      errEl.classList.remove('show');
-      if (btn) btn.disabled = false;
+      if (sucEl) {
+        sucEl.textContent = 'If that email is registered, a reset link has been sent. Please check your inbox.';
+        sucEl.classList.add('show');
+      }
+      if (errEl) errEl.classList.remove('show');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Reset Link';
+      }
     } catch (err) {
-      errEl.textContent = err.message;
-      errEl.classList.add('show');
-      if (btn) btn.disabled = false;
+      if (errEl) {
+        errEl.textContent = err.message || 'Failed to send reset link';
+        errEl.classList.add('show');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-paper-plane"></i> Send Reset Link';
+      }
     }
   }
 
@@ -1393,22 +1809,44 @@
     const password = document.getElementById('rpPassword')?.value;
     const confirm  = document.getElementById('rpConfirm')?.value;
     const errEl    = document.getElementById('authError');
-    if (!password || !confirm) { errEl.textContent = 'Please fill in both fields'; errEl.classList.add('show'); return; }
-    if (password !== confirm) { errEl.textContent = 'Passwords do not match'; errEl.classList.add('show'); return; }
-    if (password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.classList.add('show'); return; }
+    if (!password || !confirm) {
+      if (errEl) { errEl.textContent = 'Please fill in both fields'; errEl.classList.add('show'); }
+      return;
+    }
+    if (password !== confirm) {
+      if (errEl) { errEl.textContent = 'Passwords do not match'; errEl.classList.add('show'); }
+      return;
+    }
+    if (password.length < 6) {
+      if (errEl) { errEl.textContent = 'Password must be at least 6 characters'; errEl.classList.add('show'); }
+      return;
+    }
+    if (!state.resetToken) {
+      if (errEl) { errEl.textContent = 'Invalid or missing reset token. Please request a new link.'; errEl.classList.add('show'); }
+      return;
+    }
     const btn = document.getElementById('rpBtn');
     try {
-      errEl.classList.remove('show');
-      if (btn) btn.disabled = true;
+      if (errEl) errEl.classList.remove('show');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Resetting...';
+      }
       await api('/api/auth/reset-password', { method: 'POST', body: JSON.stringify({ token: state.resetToken, password }) });
-      showToast('Password reset! You can now log in.', 'success');
+      showToast('Password reset successfully! You can now log in.', 'success');
       state.resetToken = '';
+      sessionStorage.removeItem('pupsj_reset_token');
       authMode = 'login';
-      render();
+      switchAuthMode('login');
     } catch (err) {
-      errEl.textContent = err.message;
-      errEl.classList.add('show');
-      if (btn) btn.disabled = false;
+      if (errEl) {
+        errEl.textContent = err.message || 'Failed to reset password';
+        errEl.classList.add('show');
+      }
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-lock"></i> Set New Password';
+      }
     }
   }
 
@@ -1434,12 +1872,26 @@
       document.getElementById('loginBtn').disabled = true;
       const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
       sessionStorage.setItem('pupsj_token', data.token);
+      localStorage.removeItem('pupsj_token');
       state.user = data.user;
       showToast(`${getGreeting()}, ${state.user.first_name}! Welcome back to PUPSJ HUB.`, 'success');
       render();
     } catch (err) {
-      errEl.textContent = err.message;
-      errEl.classList.add('show');
+      if (err.responseData?.code === 'EMAIL_NOT_VERIFIED' || (err.message && err.message.toLowerCase().includes('verify your email'))) {
+        state.registeredEmail = email;
+        switchAuthMode('verify');
+        setTimeout(() => {
+          const authErr = document.getElementById('authError');
+          if (authErr) {
+            authErr.textContent = 'Please enter the 6-digit verification code sent to your email before logging in.';
+            authErr.classList.add('show');
+          }
+        }, 250);
+        showToast('Please enter the 6-digit code sent to your email.', 'warning');
+      } else {
+        errEl.textContent = err.message;
+        errEl.classList.add('show');
+      }
       document.getElementById('loginBtn').disabled = false;
     }
   }
@@ -1453,6 +1905,7 @@
       year_level: document.getElementById('regYearLevel')?.value,
       section: document.getElementById('regSection')?.value,
       student_type: document.getElementById('regStudentType')?.value,
+      employment_type: document.getElementById('regEmploymentType')?.value,
       email: document.getElementById('regEmail')?.value.trim(),
       password: document.getElementById('regPassword')?.value,
       role: document.getElementById('regRole')?.value,
@@ -1463,20 +1916,40 @@
     const requiredFields = ['first_name', 'last_name', 'student_number', 'email', 'password', 'role'];
     if (fields.role === 'student') {
       requiredFields.push('year_level', 'section', 'student_type');
+    } else if (fields.role === 'faculty') {
+      requiredFields.push('employment_type');
     }
     if (requiredFields.some(key => !fields[key]) || !regConfirmPassword) { errEl.textContent = 'Please fill in all fields'; errEl.classList.add('show'); return; }
     if (fields.password !== regConfirmPassword) { errEl.textContent = 'Passwords do not match'; errEl.classList.add('show'); return; }
     if (fields.password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.classList.add('show'); return; }
     try {
       errEl.classList.remove('show');
+      const registerBtn = document.getElementById('registerBtn');
+      if (registerBtn) {
+        registerBtn.disabled = true;
+        registerBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating Account...';
+      }
       const regData = await api('/api/auth/register', { method: 'POST', body: JSON.stringify(fields) });
-      // Show the "check your email" screen
       state.registeredEmail = fields.email;
-      authMode = 'registered';
-      render();
+      switchAuthMode('verify');
+      setTimeout(() => {
+        const sucEl = document.getElementById('authSuccess');
+        if (sucEl) {
+          sucEl.textContent = `Registration successful! A 6-digit code has been sent to ${fields.email}. Enter it below to activate your account.`;
+          sucEl.classList.add('show');
+        }
+      }, 250);
+      showToast('Registration successful! Please enter the 6-digit code sent to your email.', 'success');
     } catch (err) {
-      errEl.textContent = err.message;
-      errEl.classList.add('show');
+      if (errEl) {
+        errEl.textContent = err.message;
+        errEl.classList.add('show');
+      }
+      const registerBtn = document.getElementById('registerBtn');
+      if (registerBtn) {
+        registerBtn.disabled = false;
+        registerBtn.innerHTML = '<i class="fas fa-user-plus"></i> Create Account';
+      }
     }
   }
 
@@ -1489,6 +1962,8 @@
     const isSuperAdmin = u.role === 'superadmin';
     const isAdmin = u.role === 'admin' || isSuperAdmin;
     const isFaculty = u.role === 'faculty' || isAdmin;
+    // Module access for admins. Superadmin implicitly has every module.
+    const canMod = (m) => isSuperAdmin || (Array.isArray(u.modules) && u.modules.includes(m));
 
     const roleLabel = u.role === 'superadmin' ? 'Super Admin' : (u.role === 'admin' ? 'Admin' : u.role.charAt(0).toUpperCase() + u.role.slice(1));
     const roleBadgeHtml = u.role === 'superadmin'
@@ -1502,24 +1977,40 @@
         <div class="sidebar-header">
           <div class="sidebar-brand">
             <div class="sidebar-brand-icon"><img src="${state.systemSettings?.app_logo || '/icons/pup_logo.png'}" alt="PUP Logo"></div>
-            <div><h2>${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')}</h2><small>San Juan Campus</small></div>
+            <div class="sidebar-brand-text">
+              <h2>${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')}</h2>
+              <small>San Juan Campus</small>
+            </div>
+          </div>
+          <div class="sidebar-header-actions">
+            <button class="sidebar-btn-icon theme-toggle-btn" onclick="window._toggleTheme()" title="Toggle Dark/Light Mode" aria-label="Toggle theme">
+              <i class="${document.documentElement.getAttribute('data-theme') === 'dark' ? 'fas fa-sun' : 'fas fa-moon'}"></i>
+            </button>
+            ${isGuest ? '' : `
+            <button class="sidebar-btn-icon notification-bell-btn" id="desktopNotificationsBtn" title="Notifications" aria-label="Notifications" style="position: relative;">
+              <i class="fas fa-bell"></i>
+              ${renderNotificationBadge('desktopNotificationBadge', 'top-bell-badge')}
+            </button>
+            `}
           </div>
         </div>
         <div class="sidebar-nav">
           ${isAdmin ? `
             <div class="nav-section-label">Administration</div>
             <div class="nav-item" data-page="admin-dashboard"><i class="fas fa-chart-pie"></i> Dashboard</div>
+            ${canMod('queueing') ? `<div class="nav-item" data-page="queueing"><i class="fas fa-ticket-alt"></i> Queueing</div>` : ''}
+            ${canMod('loading_requests') ? `<div class="nav-item" data-page="admin-loading"><i class="fas fa-chalkboard-teacher"></i> Course Preference <span class="nav-badge is-hidden" id="badge-admin-loading">0</span></div>` : ''}
             ${isSuperAdmin ? `
               <div class="nav-item" data-page="admin-users"><i class="fas fa-users-cog"></i> Manage Users</div>
               <div class="nav-item" data-page="system-maintenance"><i class="fas fa-tools"></i> System Maintenance</div>
             ` : ''}
-            
+
             <div class="nav-section-label">Main</div>
             <div class="nav-item active" data-page="announcements"><i class="fas fa-bullhorn"></i> Announcements <span class="nav-badge is-hidden" id="badge-announcements">0</span></div>
             ${isGuest ? '' : `<div class="nav-item" data-page="events"><i class="fas fa-calendar-alt"></i> Event Calendar <span class="nav-badge is-hidden" id="badge-events">0</span></div>`}
-            <div class="nav-item" data-page="lostfound"><i class="fas fa-search-location"></i> Lost & Found <span class="nav-badge is-hidden" id="badge-lostfound">0</span></div>
+            ${canMod('lost_found') ? `<div class="nav-item" data-page="lostfound"><i class="fas fa-search-location"></i> Lost & Found <span class="nav-badge is-hidden" id="badge-lostfound">0</span></div>` : ''}
             ${isGuest ? '' : `
-              ${isFaculty ? `<div class="nav-item" data-page="teaching"><i class="fas fa-clock"></i> Teaching Schedule <span class="nav-badge is-hidden" id="badge-teaching">0</span></div>` : `<div class="nav-item" data-page="section-schedules"><i class="fas fa-clock"></i> Class Schedules <span class="nav-badge is-hidden" id="badge-section-schedules">0</span></div>`}
+              <div class="nav-item" data-page="teaching"><i class="fas fa-clock"></i> Class Schedules <span class="nav-badge is-hidden" id="badge-teaching">0</span></div>
             `}
             <div class="nav-item" data-page="chatbot"><i class="fas fa-robot"></i> PUPBot</div>
             <div class="nav-item" data-page="documents"><i class="fas fa-folder-open"></i> Document Templates</div>
@@ -1527,9 +2018,14 @@
             <div class="nav-section-label">Main</div>
             <div class="nav-item active" data-page="announcements"><i class="fas fa-bullhorn"></i> Announcements <span class="nav-badge is-hidden" id="badge-announcements">0</span></div>
             ${isGuest ? '' : `<div class="nav-item" data-page="events"><i class="fas fa-calendar-alt"></i> Event Calendar <span class="nav-badge is-hidden" id="badge-events">0</span></div>`}
+            <div class="nav-item" data-page="queueing"><i class="fas fa-ticket-alt"></i> Queueing</div>
             <div class="nav-item" data-page="lostfound"><i class="fas fa-search-location"></i> Lost & Found <span class="nav-badge is-hidden" id="badge-lostfound">0</span></div>
             ${isGuest ? '' : `
-              ${isFaculty ? `<div class="nav-item" data-page="teaching"><i class="fas fa-clock"></i> Teaching Schedule <span class="nav-badge is-hidden" id="badge-teaching">0</span></div>` : `<div class="nav-item" data-page="section-schedules"><i class="fas fa-clock"></i> Class Schedules <span class="nav-badge is-hidden" id="badge-section-schedules">0</span></div>`}
+              ${u.role === 'faculty' ? `
+                <div class="nav-item" data-page="teaching"><i class="fas fa-chalkboard-teacher"></i> Course Preference <span class="nav-badge is-hidden" id="badge-teaching">0</span></div>
+              ` : `
+                <div class="nav-item" data-page="section-schedules"><i class="fas fa-clock"></i> Class Schedules <span class="nav-badge is-hidden" id="badge-section-schedules">0</span></div>
+              `}
             `}
             <div class="nav-item" data-page="chatbot"><i class="fas fa-robot"></i> PUPBot</div>
             <div class="nav-item" data-page="documents"><i class="fas fa-folder-open"></i> Document Templates</div>
@@ -1552,15 +2048,6 @@
 
       <!-- MAIN -->
       <div class="main-content">
-        <!-- Desktop Header (Premium top-right corner bar) -->
-        <div class="desktop-top-header">
-          ${isGuest ? '' : `
-          <button class="btn-icon notification-bell-btn" id="desktopNotificationsBtn" title="Notifications">
-            <i class="fas fa-bell"></i>
-            ${renderNotificationBadge('desktopNotificationBadge', 'top-bell-badge')}
-          </button>
-          `}
-        </div>
 
         <!-- Mobile Header -->
         <div class="top-header">
@@ -1570,6 +2057,9 @@
             ${escHtml(state.systemSettings?.app_title || 'PUPSJ HUB')}
           </div>
           <div class="top-header-actions">
+            <button class="btn-icon theme-toggle-btn" onclick="window._toggleTheme()" title="Toggle Dark/Light Mode">
+              <i class="${document.documentElement.getAttribute('data-theme') === 'dark' ? 'fas fa-sun' : 'fas fa-moon'}"></i>
+            </button>
             ${isGuest ? '' : `
             <button class="btn-icon notification-bell-btn" id="mobileNotifications" title="Notifications">
               <i class="fas fa-bell"></i>
@@ -1581,7 +2071,7 @@
         </div>
 
         ${isGuest ? `
-        <div class="guest-banner" style="background: #FFFBEB; border-bottom: 1.5px solid #F59E0B; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 500; color: #B45309; z-index: 100;">
+        <div class="guest-banner">
           <div style="display: flex; align-items: center; gap: 8px;">
             <i class="fas fa-info-circle" style="font-size: 16px; color: #F59E0B;"></i>
             <span>You are browsing as a guest. Login or Register for full access.</span>
@@ -1782,11 +2272,17 @@
     const doLogout = async () => {
       await api('/api/auth/logout', { method: 'POST' });
       sessionStorage.removeItem('pupsj_token');
+      localStorage.removeItem('pupsj_token');
       sessionStorage.removeItem('ann_search_query');
       sessionStorage.removeItem('ann_date_filter');
       sessionStorage.removeItem('ann_custom_start');
       sessionStorage.removeItem('ann_custom_end');
+      if (window._studentQueueInterval) {
+        clearInterval(window._studentQueueInterval);
+        window._studentQueueInterval = null;
+      }
       stopNotificationsPolling();
+      if (typeof stopLocatorPolling === 'function') stopLocatorPolling();
       state.user = null;
       state.currentPage = 'announcements';
       state.announcementSearchQuery = '';
@@ -1841,6 +2337,15 @@
       page = 'announcements';
     }
     if (page === 'admin-dashboard' && !isAdmin) {
+      page = 'announcements';
+    }
+    // Module-gated admin pages: require the module (superadmin always allowed)
+    const hasMod = (m) => isSuperAdmin || (Array.isArray(state.user?.modules) && state.user.modules.includes(m));
+    if (page === 'admin-loading' && !(isAdmin && hasMod('loading_requests'))) {
+      page = 'announcements';
+    }
+    if (page === 'lostfound' && isAdmin && !hasMod('lost_found')) {
+      showToast('You do not have access to Lost & Found.', 'error');
       page = 'announcements';
     }
 
@@ -1907,7 +2412,10 @@
       case 'events': loadEvents(true); break;
       case 'lostfound': loadLostFound(true); break;
       case 'schedules': loadSchedules(true); break;
-      case 'teaching': loadSchedules(true); break;
+      case 'teaching':
+        if (state.user.role === 'faculty') renderLoadingPage();
+        else loadSchedules(true);
+        break;
       case 'section-schedules': loadSectionSchedules(); break;
       case 'chatbot':
         renderChatbot();
@@ -1928,6 +2436,8 @@
       case 'notifications': loadNotifications(true); break;
       case 'profile': loadProfile(); break;
       case 'admin-dashboard': loadAdminDashboard(); break;
+      case 'admin-loading': renderAdminLoading(); break;
+      case 'queueing': (['student', 'faculty', 'guest'].includes(state.user.role) ? renderStudentQueueing() : renderQueueing()); break;
       case 'admin-users': loadAdminUsers(); break;
       case 'system-maintenance': loadSystemMaintenance(); break;
       default: loadAnnouncements();
@@ -2027,7 +2537,7 @@
 
     // ── Media grid builder (Facebook-style) ──
     function buildMediaGrid(images) {
-      const imgs = images.filter(img => img.id);
+      const imgs = normalizeImages(images);
       if (imgs.length === 0) return '';
       const n = imgs.length;
       const cls = n === 1 ? 'ann-media-single'
@@ -2096,7 +2606,8 @@
         return '<div class="empty-state"><i class="fas fa-search-minus"></i><h3>No announcements found</h3><p>Try adjusting your search query or date filters</p></div>';
       }
       return posts.map(a => {
-        const hasImg = a.images && a.images.length > 0 && a.images[0].id;
+        const normImgs = normalizeImages(a.images);
+        const hasImg = normImgs.length > 0;
         const displayName = a.page_name || a.author_name || 'Unknown';
         const displayImage = a.page_name ? a.page_logo : a.author_image;
         const displayRole = a.page_name ? 'Page' : a.author_role;
@@ -2130,16 +2641,19 @@
           </div>
 
           <!-- Full-width media (viewport-height-constrained) -->
-          ${hasImg ? buildMediaGrid(a.images) : ''}
+          ${hasImg ? buildMediaGrid(normImgs) : ''}
 
           <!-- Footer action bar -->
           <div class="ann-post-footer">
             <div class="ann-post-footer-left">
               <span class="ann-footer-time"><i class="fas fa-clock"></i> ${timeAgo(a.created_at)}</span>
-              ${hasImg ? `<span class="ann-footer-imgcount"><i class="fas fa-image"></i> ${a.images.length}</span>` : ''}
+              ${hasImg ? `<span class="ann-footer-imgcount"><i class="fas fa-image"></i> ${normImgs.length}</span>` : ''}
             </div>
-            ${(isFacultyOrAdmin || a.author_id === state.user.id) ? `
+            ${(isFacultyOrAdmin || a.author_id === state.user.id || (a.page_id && state.myPages && state.myPages.some(p => p.id === a.page_id))) ? `
             <div class="ann-post-footer-right">
+              <button class="ann-action-edit" onclick="window._editAnnouncement('${a.id}')">
+                <i class="fas fa-edit"></i> Edit
+              </button>
               <button class="ann-action-del" onclick="window._deleteAnnouncement('${a.id}')">
                 <i class="fas fa-trash-alt"></i> Delete
               </button>
@@ -2165,6 +2679,7 @@
               const displayName = a.page_name || a.author_name || 'Unknown';
               const displayImage = a.page_name ? a.page_logo : a.author_image;
               const _rc = getAvatarColor(displayName);
+              const rImgs = normalizeImages(a.images);
               return `
               <div class="ann-recent-item" onclick="document.getElementById('ann-post-${a.id}')?.scrollIntoView({behavior:'smooth',block:'start'})">
                 <div class="ann-recent-item-info">
@@ -2174,8 +2689,8 @@
                     <span class="ann-recent-meta">${escHtml(displayName)} · ${timeAgo(a.created_at)}</span>
                   </div>
                 </div>
-                ${a.images && a.images.length > 0 && a.images[0].id
-                  ? `<img class="ann-recent-thumb" src="${a.images[0].image_url}" alt="">`
+                ${rImgs.length > 0
+                  ? `<img class="ann-recent-thumb" src="${rImgs[0].image_url}" alt="">`
                   : ''}
               </div>`;}).join('')}
         </div>
@@ -2355,6 +2870,15 @@
     }
 
   }
+
+  window._editAnnouncement = (id) => {
+    let ann = (state.announcements || []).find(a => a.id === id);
+    if (!ann && state.currentPageProfile && state.currentPageProfile.announcements) {
+      ann = state.currentPageProfile.announcements.find(a => a.id === id);
+    }
+    if (!ann) return;
+    openModal('announcement', ann);
+  };
 
   window._deleteAnnouncement = async (id) => {
     if (!await window.showSystemConfirm('Delete this announcement?')) return;
@@ -2571,7 +3095,8 @@
       ? announcements.map(a => {
           const displayName = page.name;
           const displayImage = page.logo_image;
-          const hasImg = a.images && a.images.length > 0 && a.images[0].id;
+          const normImgs = normalizeImages(a.images);
+          const hasImg = normImgs.length > 0;
           return `
             <article class="card ann-post" data-ann-id="${a.id}">
               <div class="ann-post-header">
@@ -2589,11 +3114,21 @@
             </h3>
                 <p class="ann-post-text">${escHtml(a.content)}</p>
               </div>
-              ${hasImg ? `<div class="ann-media-grid ann-media-single"><div class="ann-media-cell" onclick="window._openImageViewer('${a.images[0].image_url}')"><img src="${a.images[0].image_url}" alt="photo"></div></div>` : ''}
+              ${hasImg ? `<div class="ann-media-grid ann-media-single"><div class="ann-media-cell" onclick="window._openImageViewer('${normImgs[0].image_url}')"><img src="${normImgs[0].image_url}" alt="photo"></div></div>` : ''}
               <div class="ann-post-footer">
                 <div class="ann-post-footer-left">
                   <span class="ann-footer-time"><i class="fas fa-clock"></i> ${timeAgo(a.created_at)}</span>
+                  ${hasImg ? `<span class="ann-footer-imgcount"><i class="fas fa-image"></i> ${normImgs.length}</span>` : ''}
                 </div>
+                ${(canPost || canManage || isSuperAdmin || a.author_id === state.user.id) ? `
+                <div class="ann-post-footer-right">
+                  <button class="ann-action-edit" onclick="window._editAnnouncement('${a.id}')">
+                    <i class="fas fa-edit"></i> Edit
+                  </button>
+                  <button class="ann-action-del" onclick="window._deleteAnnouncement('${a.id}')">
+                    <i class="fas fa-trash-alt"></i> Delete
+                  </button>
+                </div>` : ''}
               </div>
             </article>`;
         }).join('')
@@ -2807,6 +3342,9 @@
     pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Event Calendar</h1><p class="page-subtitle">Upcoming campus activities</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;
 
     try {
+      if (state.user.role === 'student' && state.myPages.length === 0) {
+        await loadMyPages();
+      }
       const data = await api(`/api/events?month=${state.calendarMonth + 1}&year=${state.calendarYear}`);
       state.events = data;
       pageLoadedAt.events = Date.now();
@@ -2891,7 +3429,7 @@
     for (let i = startDay - 1; i > 0; i--) {
       calendarCells += `<div class="calendar-day other-month"><span class="cal-day-num">${prevLast - i + 1}</span></div>`;
     }
-    // Current month — with inline event chips
+    // Current month — with inline event chips & day data attribute
     for (let d = 1; d <= lastDay.getDate(); d++) {
       const isToday = d === today.getDate() && state.calendarMonth === today.getMonth() && state.calendarYear === today.getFullYear();
       const dayEvents = eventsByDay[d] || [];
@@ -2900,7 +3438,7 @@
         `<div class="cal-event-chip" onclick="event.stopPropagation();window._openEventDetail('${e.id}')" title="${escHtml(e.title)}">${escHtml(e.title)}</div>`
       ).join('');
       const moreHtml = dayEvents.length > 2 ? `<div class="cal-event-more">+${dayEvents.length - 2} more</div>` : '';
-      calendarCells += `<div class="calendar-day${isToday ? ' today' : ''}${hasEvent ? ' has-event' : ''}">
+      calendarCells += `<div class="calendar-day${isToday ? ' today' : ''}${hasEvent ? ' has-event' : ''}" data-day="${d}">
         <span class="cal-day-num">${d}</span>
         ${hasEvent ? `<div class="cal-day-events">${chipsHtml}${moreHtml}</div>` : ''}
       </div>`;
@@ -2914,24 +3452,87 @@
       }
     }
 
+    // Chronologically sorted events for the current month
+    const sortedMonthEvents = (state.events || []).slice().sort((a, b) => {
+      const diff = new Date(a.event_date).getTime() - new Date(b.event_date).getTime();
+      if (diff !== 0) return diff;
+      return (a.start_time || '').localeCompare(b.start_time || '');
+    });
+
+    const monthlyEventsHtml = `
+      <div class="calendar-monthly-events-section" id="calendarMonthlyEvents">
+        <div class="calendar-events-section-header">
+          <div class="calendar-events-section-title">
+            <i class="fas fa-calendar-alt"></i>
+            <h3>Events in ${months[state.calendarMonth]} ${state.calendarYear}</h3>
+          </div>
+          <span class="calendar-events-count-badge">${sortedMonthEvents.length} ${sortedMonthEvents.length === 1 ? 'Event' : 'Events'}</span>
+        </div>
+
+        ${sortedMonthEvents.length === 0 ? `
+          <div class="card calendar-empty-card">
+            <div class="empty-state" style="padding: 24px 16px;">
+              <i class="fas fa-calendar-times" style="font-size: 32px; opacity: 0.45; color: var(--text-light); margin-bottom: 8px;"></i>
+              <h4 style="margin: 0 0 4px; font-size: 15px; font-weight: 700; color: var(--text-primary);">No Events This Month</h4>
+              <p style="margin: 0; font-size: 12.5px; color: var(--text-secondary);">There are no scheduled campus activities for ${months[state.calendarMonth]} ${state.calendarYear}.</p>
+            </div>
+          </div>
+        ` : `
+          <div class="calendar-events-list">
+            ${sortedMonthEvents.map(ev => {
+              const evDate = new Date(ev.event_date);
+              const dayNum = evDate.getDate();
+              const monthShort = months[evDate.getMonth()].slice(0, 3).toUpperCase();
+              const dayNamesShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+              const dayName = dayNamesShort[evDate.getDay()];
+              const timeStr = ev.start_time ? `${formatTime(ev.start_time)}${ev.end_time ? ' – ' + formatTime(ev.end_time) : ''}` : '';
+              return `
+                <div class="card calendar-event-card" data-event-id="${ev.id}" data-day="${dayNum}" onclick="window._openEventDetail('${ev.id}')">
+                  <div class="cal-event-date-pill">
+                    <span class="cal-event-month-short">${monthShort}</span>
+                    <strong class="cal-event-day-num">${dayNum}</strong>
+                    <span class="cal-event-day-name">${dayName}</span>
+                  </div>
+                  <div class="cal-event-info">
+                    <div class="cal-event-topline">
+                      <h4 class="cal-event-title">${escHtml(ev.title)}</h4>
+                      ${ev.department ? `<span class="cal-event-dept-badge">${escHtml(ev.department)}</span>` : ''}
+                    </div>
+                    <div class="cal-event-meta">
+                      ${timeStr ? `<span><i class="far fa-clock"></i> ${escHtml(timeStr)}</span>` : ''}
+                      ${ev.location ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(ev.location)}</span>` : ''}
+                    </div>
+                    ${ev.description ? `<p class="cal-event-desc">${escHtml(ev.description)}</p>` : ''}
+                  </div>
+                  <div class="cal-event-arrow">
+                    <i class="fas fa-chevron-right"></i>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        `}
+      </div>
+    `;
+
     let html = `
       <div class="page-header" style="display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;">
         <div>
           <h1 class="page-title">Event Calendar</h1>
           <p class="page-subtitle">Campus activities & events</p>
         </div>
-        ${isFacultyOrAdmin ? `
-          <div class="event-header-actions">
-            ${(state.user.role === 'faculty' || state.user.role === 'admin' || state.user.role === 'superadmin') ? `
-              <button class="btn btn-secondary" id="btnArchivedEvents" style="border-radius: 9999px; padding: 10px 20px; display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; cursor: pointer; transition: all 0.2s;">
-                <i class="fas fa-archive"></i> Archived Events
-              </button>
-            ` : ''}
-            <button class="btn btn-primary" id="btnCreateEvent" style="background: #880808; border: none; color: #fff; border-radius: 9999px; padding: 10px 20px; display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(136,8,8,0.25);">
-              <i class="fas fa-plus"></i> Create Event
+        <div class="event-header-actions">
+          ${isFacultyOrAdmin ? `
+            <button class="btn btn-secondary" id="btnArchivedEvents" style="border-radius: 9999px; padding: 10px 20px; display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; cursor: pointer; transition: all 0.2s;">
+              <i class="fas fa-archive"></i> Archived Events
             </button>
-          </div>
-        ` : ''}
+          ` : ''}
+          ${state.user.role !== 'student' || state.myPages.length > 0 ? `
+            <button class="btn btn-primary" id="btnCreateEvent" style="background: #880808; border: none; color: #fff; border-radius: 9999px; padding: 10px 20px; display: inline-flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(136,8,8,0.25);">
+              <i class="fas fa-plus"></i> ${state.user.role === 'student' ? 'Post Event' : 'Create Event'}
+            </button>
+          ` : ''}
+        </div>
       </div>
       <div class="page-content">
         <div class="card" style="padding:20px;margin-bottom:20px;">
@@ -2964,7 +3565,7 @@
           </div>
           <div class="calendar-grid">${calendarCells}</div>
         </div>
-        ${state.events.length === 0 ? '<div class="empty-state"><i class="fas fa-calendar-times"></i><h3>No events this month</h3><p>Check back later for upcoming events.</p></div>' : ''}
+        ${monthlyEventsHtml}
       </div>`;
 
     pageArea.innerHTML = html;
@@ -3027,6 +3628,22 @@
       if (mm) mm.classList.remove('show');
       if (ym) ym.classList.remove('show');
     });
+
+    // Day cell selection & smooth scroll to event card
+    document.querySelectorAll('.calendar-day[data-day]').forEach(cell => {
+      cell.onclick = () => {
+        const day = parseInt(cell.dataset.day);
+        document.querySelectorAll('.calendar-day').forEach(c => c.classList.remove('cal-day-selected'));
+        cell.classList.add('cal-day-selected');
+        const targetCard = document.querySelector(`.calendar-event-card[data-day="${day}"]`);
+        if (targetCard) {
+          targetCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          targetCard.classList.add('cal-event-highlight');
+          setTimeout(() => targetCard.classList.remove('cal-event-highlight'), 1800);
+        }
+      };
+    });
+
     const btnCreateEvent = document.getElementById('btnCreateEvent');
     if (btnCreateEvent) btnCreateEvent.onclick = () => openModal('event');
     const btnArchivedEvents = document.getElementById('btnArchivedEvents');
@@ -3170,7 +3787,8 @@
     const pageArea = document.getElementById('pageArea');
     const d = new Date(event.event_date);
     const dateStr = d.toLocaleDateString('en-PH', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-    const hasImages = event.images && event.images.length > 0 && event.images[0].id;
+    const normEventImages = normalizeImages(event.images);
+    const hasImages = normEventImages.length > 0;
     const avgRating = parseFloat(summary.average_rating) || 0;
     const totalFeedback = parseInt(summary.total) || 0;
 
@@ -3239,13 +3857,13 @@
         <div class="card event-detail-card">
           ${hasImages ? `
           <div class="event-detail-images">
-            ${event.images.map(img => `<img src="${img.image_url}" alt="event" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
+            ${normEventImages.map(img => `<img src="${img.image_url}" alt="event" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
           </div>` : ''}
           <div class="event-detail-body">
             <div class="event-detail-date"><i class="fas fa-calendar-alt"></i> ${dateStr}</div>
             ${event.start_time ? `<div class="event-detail-time"><i class="fas fa-clock"></i> ${formatTime(event.start_time)}${event.end_time ? ' - ' + formatTime(event.end_time) : ''}</div>` : ''}
             ${event.location ? `<div class="event-detail-location"><i class="fas fa-map-marker-alt"></i> ${escHtml(event.location)}</div>` : ''}
-            <div class="event-detail-author"><i class="fas fa-user"></i> Posted by ${escHtml(event.author_name || 'Unknown')}</div>
+            <div class="event-detail-author"><i class="fas fa-user"></i> Posted by ${escHtml(event.author_name || 'Unknown')}${event.page_name ? ` <span style="margin-left:6px;background:var(--bg-soft,#f3f4f6);border:1px solid var(--border);border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;color:var(--text-secondary);display:inline-flex;align-items:center;gap:5px;">${event.page_logo ? `<img src="${event.page_logo}" style="width:14px;height:14px;border-radius:50%;object-fit:cover;">` : '<i class="fas fa-flag" style="font-size:10px;"></i>'} ${escHtml(event.page_name)}</span>` : ''}</div>
             ${event.status === 'pending' ? '<div><span class="status-pill status-pending">Pending Approval</span></div>' : ''}
             ${event.status === 'rejected' ? `<div><span class="status-pill status-rejected" title="${escHtml(event.rejection_reason || 'Rejected by admin')}">Rejected</span></div>` : ''}
             ${event.description ? `<p class="event-detail-desc">${escHtml(event.description)}</p>` : ''}
@@ -3345,7 +3963,9 @@
           <!-- Feedback List -->
           <div class="feedback-list">
             ${feedback.length === 0 ? '<div class="empty-state" style="padding:24px;"><i class="fas fa-comments" style="font-size:36px;"></i><h3>No feedback yet</h3><p>Be the first to share your thoughts!</p></div>' :
-            feedback.map(fb => `
+            feedback.map(fb => {
+              const fbImgs = normalizeImages(fb.images);
+              return `
               <div class="card feedback-card">
                 <div class="feedback-card-header">
                   ${renderAvatar(fb.user_name || 'U', fb.user_profile_image, 'feedback-avatar')}
@@ -3354,14 +3974,20 @@
                     <div class="feedback-card-time">${timeAgo(fb.created_at)}</div>
                   </div>
                   <div class="feedback-card-rating">${renderStars(fb.rating)}</div>
-                  ${(fb.user_id === state.user.id || state.user.role === 'admin' || state.user.role === 'superadmin') ? '<button class="btn-icon" onclick="window._deleteFeedback(\'' + fb.id + '\',\' ' + event.id + '\')" title="Delete feedback" style="margin-left:auto;color:var(--danger);"><i class="fas fa-trash"></i></button>' : ''}
+                  ${(fb.user_id === state.user.id || state.user.role === 'admin' || state.user.role === 'superadmin') ? `
+                    <div style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                      <button class="btn-icon" onclick="window._editFeedback('${fb.id}','${event.id}')" title="Edit review" style="color:var(--text-secondary);"><i class="fas fa-edit"></i></button>
+                      <button class="btn-icon" onclick="window._deleteFeedback('${fb.id}','${event.id}')" title="Delete feedback" style="color:var(--danger);"><i class="fas fa-trash-alt"></i></button>
+                    </div>
+                  ` : ''}
                 </div>
                 ${fb.comment ? `<p class="feedback-card-text">${escHtml(fb.comment)}</p>` : ''}
-                ${fb.images && fb.images.length > 0 && fb.images[0].id ? `
+                ${fbImgs.length > 0 ? `
                 <div class="feedback-card-images">
-                  ${fb.images.map(img => `<img src="${img.image_url}" alt="feedback" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
+                  ${fbImgs.map(img => `<img src="${img.image_url}" alt="feedback" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
                 </div>` : ''}
-              </div>`).join('')}
+              </div>`;
+            }).join('')}
           </div>
         `}
       </div>`;
@@ -3460,6 +4086,12 @@
       };
     }
   }
+
+  window._editFeedback = (feedbackId, eventId) => {
+    const fb = (state.eventFeedback || []).find(f => f.id === feedbackId);
+    if (!fb) return;
+    openModal('feedback-edit', { ...fb, eventId });
+  };
 
   window._deleteFeedback = async (feedbackId, eventId) => {
     if (!await window.showSystemConfirm('Delete this feedback?')) return;
@@ -3609,9 +4241,12 @@
 
     try {
       // Student and guest are restricted to lost-only; client also locks to 'lost'
-      const isRestrictedRole = state.user.role === 'student' || state.user.role === 'guest';
+      const isLFAdmin = state.user && (state.user.role === 'admin' || state.user.role === 'superadmin');
+      if (!isLFAdmin) {
+        state.filters.lfType = 'lost';
+      }
       let lfQuery = '';
-      if (isRestrictedRole) {
+      if (!isLFAdmin) {
         lfQuery = '?type=lost';
       } else if (state.filters.lfType === 'archived') {
         lfQuery = '?status=archived';
@@ -3622,11 +4257,12 @@
       }
       const data = await api(`/api/lost-found${lfQuery}`);
       state.lostFound = data;
-      const isLFAdmin = state.user.role === 'admin' || state.user.role === 'superadmin';
       if (isLFAdmin) {
         state.lostFoundReviews = await api('/api/lost-found/matches/all').catch(() => []);
+        state.lostFoundRejected = await api('/api/lost-found/matches/rejected').catch(() => []);
       } else {
         state.lostFoundReviews = [];
+        state.lostFoundRejected = [];
       }
       pageLoadedAt.lostfound = Date.now();
       renderLostFoundPage();
@@ -3644,8 +4280,8 @@
 
   function renderLostFoundPage() {
     const pageArea = document.getElementById('pageArea');
-    const isRestrictedRole = state.user.role === 'student' || state.user.role === 'guest';
-    const isAdmin = state.user.role === 'admin' || state.user.role === 'superadmin';
+    const isAdmin = state.user && (state.user.role === 'admin' || state.user.role === 'superadmin');
+    const isRestrictedRole = !isAdmin;
     const canPost = true;
     if (!state.activeMatchTab) state.activeMatchTab = 'pending';
 
@@ -3653,139 +4289,334 @@
 
     // Build the matches dashboard content
     let matchDashboardHtml = '';
-    if (isAdmin && state.lostFoundReviews.length > 0) {
+    if (isAdmin) {
+      const reviews = Array.isArray(state.lostFoundReviews) ? state.lostFoundReviews : [];
+      const rejected = Array.isArray(state.lostFoundRejected) ? state.lostFoundRejected : [];
+
+      const pendingCount = reviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length;
+      const approvedCount = reviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length;
+      const claimedCount = reviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length;
+      const rejectedCount = rejected.length;
+
       matchDashboardHtml = `
-        <div class="card lf-review-queue" style="margin-bottom: 24px; padding: 24px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg-card);">
-          <div class="lf-review-head" style="margin-bottom: 18px;">
-            <h3 style="font-size: 18px; font-weight: 700; color: var(--text-primary); margin-bottom: 6px;"><i class="fas fa-magic" style="color: var(--primary);"></i> AI Matches & Claim Dashboard</h3>
-            <p style="font-size: 13px; color: var(--text-secondary); margin: 0;">Review suggested matches, approve verified matches, and track item claims.</p>
+        <div class="card lf-review-queue">
+          <div class="lf-review-head">
+            <h3><i class="fas fa-magic" style="color: var(--primary);"></i> AI Matches &amp; Claim Dashboard</h3>
+            <p>Review suggested matches, approve verified matches, and track item claims.</p>
           </div>
           
-          <div class="lf-match-dashboard-tabs" style="display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px;">
-            <button class="btn btn-sm ${state.activeMatchTab === 'pending' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('pending')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Matched by AI (${state.lostFoundReviews.filter(m => (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') && m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed').length})
+          <div class="lf-match-dashboard-tabs">
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'pending' ? 'active' : ''}" onclick="window._changeActiveMatchTab('pending')">
+              Matched by AI (${pendingCount})
             </button>
-            <button class="btn btn-sm ${state.activeMatchTab === 'approved' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('approved')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Approved Matches (${state.lostFoundReviews.filter(m => m.found_item?.match_review_status === 'approved' && m.found_item?.status === 'matched').length})
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'approved' ? 'active' : ''}" onclick="window._changeActiveMatchTab('approved')">
+              Approved Matches (${approvedCount})
             </button>
-            <button class="btn btn-sm ${state.activeMatchTab === 'claimed' ? 'btn-primary' : 'btn-secondary'}" onclick="window._changeActiveMatchTab('claimed')" style="font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 6px;">
-              Claimed Items (${state.lostFoundReviews.filter(m => m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed').length})
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'claimed' ? 'active' : ''}" onclick="window._changeActiveMatchTab('claimed')">
+              Claimed Items (${claimedCount})
+            </button>
+            <button class="lf-match-pill-tab ${state.activeMatchTab === 'rejected' ? 'active' : ''}" onclick="window._changeActiveMatchTab('rejected')">
+              Rejected (${rejectedCount})
+              ${rejectedCount > 0 ? `<span class="lf-match-badge-counter">${rejectedCount}</span>` : ''}
             </button>
           </div>
 
-          <div class="lf-review-list" style="display: flex; flex-direction: column; gap: 16px;">
+          <div class="lf-review-list">
             ${(() => {
-              const pendingMatches = state.lostFoundReviews.filter(m => 
+              const pendingMatches = reviews.filter(m => 
                 (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') &&
                 m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed'
               );
 
-              const approvedMatches = state.lostFoundReviews.filter(m => 
+              const approvedMatches = reviews.filter(m => 
                 m.found_item?.match_review_status === 'approved' && 
                 m.found_item?.status === 'matched'
               );
 
-              const claimedMatches = state.lostFoundReviews.filter(m => 
+              const claimedMatches = reviews.filter(m => 
                 m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed'
               );
 
+              const rejectedMatches = rejected;
+
               const currentTabList = state.activeMatchTab === 'pending' ? pendingMatches 
                                     : state.activeMatchTab === 'approved' ? approvedMatches 
+                                    : state.activeMatchTab === 'rejected' ? rejectedMatches
                                     : claimedMatches;
                                       
               if (currentTabList.length === 0) {
                 return `<div class="empty-state" style="padding: 24px 0; text-align: center; color: var(--text-secondary);">
                   <i class="fas fa-search-location" style="font-size: 24px; margin-bottom: 8px; opacity: 0.5;"></i>
-                  <p style="font-size: 13px; margin: 0;">No items found in this category.</p>
+                  <p style="font-size: 13px; margin: 0;">${state.activeMatchTab === 'rejected' ? 'No rejected matches. Good work!' : 'No items found in this category.'}</p>
                 </div>`;
               }
+
+              // Ensure valid index bounds
+              const maxIdx = currentTabList.length - 1;
+              if (typeof state.lfMatchIndex !== 'number' || state.lfMatchIndex < 0) state.lfMatchIndex = 0;
+              if (state.lfMatchIndex > maxIdx) state.lfMatchIndex = maxIdx;
+              const currentIndex = state.lfMatchIndex;
+              const review = currentTabList[currentIndex];
               
-              return currentTabList.map(review => {
-                const lost = review.lost_item;
-                const found = review.found_item;
-                const score = review.match_score || 0;
-                const normalizedScore = score > 1 ? score / 100 : score;
-                const pct = Math.round(normalizedScore * 80);
-                
-                return `
-                  <div class="lf-review-card" style="border: 1px solid var(--border); border-radius: 10px; padding: 20px; background: var(--bg-primary); display: flex; flex-direction: column; gap: 16px; transition: all 0.2s ease;">
-                    <!-- Card Header: Match Score / Status -->
-                    <div class="lf-review-card-hdr" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 10px;">
-                      <span class="match-score-badge" style="font-size: 12px; font-weight: 700; background: var(--primary-soft); color: var(--primary); padding: 4px 10px; border-radius: 999px; display: flex; align-items: center; gap: 6px;">
-                        <i class="fas fa-chart-line"></i> AI Match Score: ${pct}%
-                      </span>
-                      <span class="lf-status-badge ${state.activeMatchTab}" style="font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 4px 10px; border-radius: 4px; ${
-                        state.activeMatchTab === 'pending' ? 'background: #fef3c7; color: #d97706;' 
-                        : state.activeMatchTab === 'approved' ? 'background: #dbeafe; color: #2563eb;' 
-                        : 'background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe;'
-                      }">
-                        ${state.activeMatchTab === 'pending' ? 'Pending Review' : state.activeMatchTab === 'approved' ? 'Approved' : 'Claimed'}
-                      </span>
+              const lost = review.lost_item;
+              const found = review.found_item;
+              const score = review.match_score || 0;
+              const normalizedScore = score > 1 ? score / 100 : score;
+              const pct = Math.round(normalizedScore * 100);
+              
+              return `
+                <!-- Top Arrow Navigation Bar -->
+                <div class="lf-match-nav-bar">
+                  <div style="display: flex; align-items: center; gap: 10px;">
+                    <span class="lf-match-count-badge">
+                      <i class="fas fa-layer-group" style="font-size: 10px;"></i> Match ${currentIndex + 1} of ${currentTabList.length}
+                    </span>
+                    <span class="lf-match-key-hint">
+                      <i class="far fa-keyboard" style="opacity: 0.7;"></i> Use <kbd>←</kbd> <kbd>→</kbd> arrow keys to scroll
+                    </span>
+                  </div>
+                  <div style="display: flex; align-items: center; gap: 6px;">
+                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match (← Left Arrow)">
+                      <i class="fas fa-chevron-left"></i> Prev
+                    </button>
+                    <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match (→ Right Arrow)">
+                      Next <i class="fas fa-chevron-right"></i>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="lf-review-card">
+                  <!-- Card Header: Match Score / Status -->
+                  <div class="lf-review-card-hdr">
+                    <span class="lf-match-score-pill">
+                      <i class="fas fa-chart-line"></i> AI Match Score: ${pct}%
+                    </span>
+                    <span class="lf-match-status-badge ${state.activeMatchTab}">
+                      ${state.activeMatchTab === 'pending' ? 'Pending Review' : state.activeMatchTab === 'approved' ? 'Approved' : state.activeMatchTab === 'rejected' ? 'Rejected' : 'Claimed'}
+                    </span>
+                  </div>
+                  
+                  <!-- Side by Side Columns -->
+                  <div class="lf-review-columns">
+                    <!-- Found Item Column (Left) -->
+                    <div class="lf-review-side">
+                      <div class="lf-review-label">
+                        <i class="far fa-dot-circle"></i> Found Item Report
+                      </div>
+                      <h4>${escHtml(found.item_name)}</h4>
+                      <p>${escHtml(found.description || '')}</p>
+                      <div class="lf-card-meta">
+                        ${found.category ? `<span><i class="fas fa-tag"></i> ${escHtml(found.category)}</span>` : ''}
+                        ${found.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(found.location_found)}</span>` : ''}
+                        ${found.reporter_name ? `<span><i class="fas fa-user-tie"></i> Reporter: ${escHtml(found.reporter_name)}</span>` : ''}
+                      </div>
+                      ${(() => {
+                        const fImgs = normalizeImages(found.images);
+                        return fImgs.length > 0 ? `
+                          <div class="lf-card-images">
+                            ${fImgs.map(img => `<img src="${img.image_url}" alt="found item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
+                          </div>` : '';
+                      })()}
                     </div>
                     
-                    <!-- Side by Side Columns -->
-                    <div class="lf-review-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
-                      <!-- Found Item Column (Left) -->
-                      <div class="lf-review-side" style="display: flex; flex-direction: column; gap: 8px;">
-                        <div class="lf-review-label" style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--primary);">
-                          <i class="fas fa-eye"></i> Found Item Report
-                        </div>
-                        <h4 style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0;">${escHtml(found.item_name)}</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin: 0;">${escHtml(found.description || '')}</p>
-                        <div class="lf-card-meta" style="display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--text-muted);">
-                          ${found.category ? `<span><i class="fas fa-tag"></i> ${escHtml(found.category)}</span>` : ''}
-                          ${found.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(found.location_found)}</span>` : ''}
-                          ${found.reporter_name ? `<span><i class="fas fa-user-tie"></i> Reporter: ${escHtml(found.reporter_name)}</span>` : ''}
-                        </div>
-                        ${found.images && found.images.length > 0 && found.images[0].id ? `
-                          <div class="lf-card-images" style="display: flex; gap: 6px; margin-top: 6px; overflow-x: auto; padding-bottom: 4px;">
-                            ${found.images.map(img => `<img src="${img.image_url}" alt="found item" onclick="window._openImageViewer('${img.image_url}')" style="width: 50px; height: 50px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border);">`).join('')}
-                          </div>` : ''}
+                    <!-- Lost Item Column (Right) -->
+                    <div class="lf-review-side" style="border-left: 1px dotted var(--border); padding-left: 20px;">
+                      <div class="lf-review-label">
+                        <i class="fas fa-search"></i> Matched Lost Report
                       </div>
-                      
-                      <!-- Lost Item Column (Right) -->
-                      <div class="lf-review-side" style="display: flex; flex-direction: column; gap: 8px; border-left: 1px dashed var(--border); padding-left: 20px;">
-                        <div class="lf-review-label" style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--primary);">
-                          <i class="fas fa-search"></i> Matched Lost Report
-                        </div>
-                        <h4 style="font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0;">${escHtml(lost.item_name)}</h4>
-                        <p style="font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin: 0;">${escHtml(lost.description || '')}</p>
-                        <div class="lf-card-meta" style="display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--text-muted);">
-                          ${lost.category ? `<span><i class="fas fa-tag"></i> ${escHtml(lost.category)}</span>` : ''}
-                          ${lost.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(lost.location_found)}</span>` : ''}
-                          ${lost.reporter_name ? `<span><i class="fas fa-user"></i> Poster: ${escHtml(lost.reporter_name)}</span>` : ''}
-                        </div>
-                        ${lost.images && lost.images.length > 0 && lost.images[0].id ? `
-                          <div class="lf-card-images" style="display: flex; gap: 6px; margin-top: 6px; overflow-x: auto; padding-bottom: 4px;">
-                            ${lost.images.map(img => `<img src="${img.image_url}" alt="lost item" onclick="window._openImageViewer('${img.image_url}')" style="width: 50px; height: 50px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border);">`).join('')}
-                          </div>` : ''}
+                      <h4>${escHtml(lost.item_name)}</h4>
+                      <p>${escHtml(lost.description || '')}</p>
+                      <div class="lf-card-meta">
+                        ${lost.category ? `<span><i class="fas fa-tag"></i> ${escHtml(lost.category)}</span>` : ''}
+                        ${lost.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(lost.location_found)}</span>` : ''}
+                        ${lost.reporter_name ? `<span><i class="fas fa-user"></i> Poster: ${escHtml(lost.reporter_name)}</span>` : ''}
                       </div>
+                      ${(() => {
+                        const lImgs = normalizeImages(lost.images);
+                        return lImgs.length > 0 ? `
+                          <div class="lf-card-images">
+                            ${lImgs.map(img => `<img src="${img.image_url}" alt="lost item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
+                          </div>` : '';
+                      })()}
                     </div>
-                    
-                    <!-- Action Buttons -->
-                    <div class="lf-review-actions" style="display: flex; justify-content: flex-end; align-items: center; gap: 10px; border-top: 1px solid var(--border); padding-top: 12px;">
+                  </div>
+                  
+                  <!-- Action Buttons -->
+                  <div class="lf-review-actions">
+                    <div style="display: flex; gap: 6px;">
+                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(-1)" ${currentIndex <= 0 ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Previous Match">
+                        <i class="fas fa-chevron-left"></i> Prev
+                      </button>
+                      <button class="btn btn-sm btn-secondary" onclick="window._navigateLFMatch(1)" ${currentIndex >= maxIdx ? 'disabled style="opacity: 0.45; cursor: not-allowed;"' : ''} title="Next Match">
+                        Next <i class="fas fa-chevron-right"></i>
+                      </button>
+                    </div>
+
+                    <div style="display: flex; align-items: center; gap: 10px;">
                       ${state.activeMatchTab === 'pending' ? `
-                        <button class="btn btn-success btn-sm" onclick="window._decideLostFoundReview('${found.id}','approve','${lost.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-check"></i> Approve Match</button>
-                        <button class="btn btn-danger btn-sm" onclick="window._decideLostFoundReview('${found.id}','reject','${lost.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-times"></i> Reject Match</button>
+                        <button class="btn btn-success btn-sm" onclick="window._decideLostFoundReview('${found.id}','approve','${lost.id}')"><i class="fas fa-check"></i> Approve Match</button>
+                        <button class="btn btn-danger btn-sm" onclick="window._decideLostFoundReview('${found.id}','reject','${lost.id}')"><i class="fas fa-times"></i> Reject Match</button>
                       ` : state.activeMatchTab === 'approved' ? `
-                        <button class="btn btn-success btn-sm" onclick="window._claimLostFoundMatch('${lost.id}','${found.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px; background: #166534 !important; border-color: #166534 !important;"><i class="fas fa-hand-holding-heart"></i> Claimed</button>
+                        <button class="btn btn-success btn-sm" onclick="window._claimLostFoundMatch('${lost.id}','${found.id}')" style="background: #166534 !important; border-color: #166534 !important;"><i class="fas fa-hand-holding-heart"></i> Claimed</button>
+                      ` : state.activeMatchTab === 'rejected' ? `
+                        <span style="font-size: 12px; color: var(--text-secondary); margin-right: 6px;"><i class="fas fa-info-circle"></i> Previously rejected — re-open if this was a mistake</span>
+                        <button class="btn btn-secondary btn-sm" onclick="window._reopenLostFoundMatch('${found.id}','${lost.id}')"><i class="fas fa-undo"></i> Re-open for Review</button>
                       ` : `
-                        <span style="font-size: 13px; color: #166534; font-weight: 600; display: flex; align-items: center; gap: 6px; margin-right: auto;"><i class="fas fa-check-circle"></i> Handed over and resolved</span>
-                        <button class="btn btn-secondary btn-sm" onclick="window._unclaimLostFoundMatch('${lost.id}','${found.id}')" style="font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px;"><i class="fas fa-undo"></i> Unclaim</button>
+                        <span style="font-size: 13px; color: #166534; font-weight: 600; display: flex; align-items: center; gap: 6px; margin-right: 6px;"><i class="fas fa-check-circle"></i> Handed over and resolved</span>
+                        <button class="btn btn-secondary btn-sm" onclick="window._unclaimLostFoundMatch('${lost.id}','${found.id}')"><i class="fas fa-undo"></i> Unclaim</button>
                       `}
                     </div>
                   </div>
-                `;
-              }).join('');
+                </div>
+              `;
             })()}
           </div>
         </div>
       `;
     }
 
+    // Filter items: only unresolved lost items can be seen in student account, guest and faculty
+    const displayLostFound = state.lostFound.filter(item => {
+      if (!isAdmin) {
+        if (item.type !== 'lost') return false;
+        if (['resolved', 'claimed', 'closed', 'deleted'].includes(item.status) || item.is_archived) return false;
+        if (item.matched_item && ['resolved', 'claimed', 'closed'].includes(item.matched_item.status)) return false;
+        if (item.matched_with && (item.status === 'resolved' || item.status === 'claimed')) return false;
+      }
+      return true;
+    });
+
     // Build the items list content
+    const renderedCards = displayLostFound.map(item => {
+      const isResolved = item.status === 'resolved' || item.status === 'claimed';
+      if (!isAdmin && (item.type !== 'lost' || isResolved)) {
+        return '';
+      }
+      const canManage = item.reporter_id === state.user.id || state.user.role === 'admin' || state.user.role === 'superadmin';
+      const canResolve = (state.user.role === 'admin' || state.user.role === 'superadmin') && !isResolved && item.type === 'found';
+      const showPendingHintAdmin = isAdmin && item.match_review_status === 'pending';
+      const showPendingHintUser = !isAdmin && item.reporter_id === state.user.id && item.match_review_status === 'pending';
+      const showApprovedHint = item.match_review_status === 'approved' || item.status === 'matched';
+      
+      let statusBadge = '';
+      if (item.status === 'resolved') {
+        statusBadge = '<span class="lf-status-badge lf-status-badge--resolved"><i class="fas fa-check-circle"></i> Resolved</span>';
+      } else if (item.status === 'claimed') {
+        statusBadge = '<span class="lf-status-badge lf-status-badge--claimed"><i class="fas fa-hand-holding-heart"></i> Claimed</span>';
+      } else if (item.status === 'deleted') {
+        statusBadge = '<span class="lf-status-badge lf-status-badge--deleted"><i class="fas fa-trash-alt"></i> Deleted</span>';
+      } else if (item.status === 'matched') {
+        statusBadge = '<span class="lf-status-badge lf-status-badge--matched"><i class="fas fa-link"></i> Match Found</span>';
+      }
+
+      if (isResolved && item.matched_item) {
+        if (!isAdmin) return '';
+        const match = item.matched_item;
+        return `
+          <div class="card lf-card lf-card--resolved lf-card-pair" style="padding: 20px; border: 1px solid var(--border); margin-bottom: 16px; border-radius: 12px; background: var(--bg-card);">
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom: 1px dashed var(--border); padding-bottom: 12px; margin-bottom: 14px;">
+              <span style="font-size: 13px; font-weight: 700; color: #15803d; display: flex; align-items: center; gap: 6px;">
+                <i class="fas fa-check-circle"></i> Resolved Match Pair (Handed Over & Closed)
+              </span>
+              <span class="lf-resolved-badge"><i class="fas fa-hand-holding-heart"></i> Matched & Resolved</span>
+            </div>
+            <div class="lf-pair-columns" style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+              <!-- Left: Found Item -->
+              <div class="lf-pair-subcard" style="background: var(--bg-primary); padding: 14px; border-radius: 8px; border: 1px solid var(--border);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+                  <span class="lf-type-badge found" style="font-size: 10px;">Found Item</span>
+                  <span style="font-size: 11px; color: var(--text-light);"><i class="fas fa-clock"></i> ${timeAgo(item.created_at)}</span>
+                </div>
+                <h4 style="margin:0 0 6px; font-size: 15px; color: var(--text-primary); text-decoration: line-through; opacity: 0.75;">${escHtml(item.item_name)}</h4>
+                <p style="font-size: 13px; color: var(--text-secondary); margin: 0 0 8px;">${escHtml(item.description || 'No description')}</p>
+                <div class="lf-card-meta" style="font-size: 11px;">
+                  ${item.category ? `<span><i class="fas fa-tag"></i> ${escHtml(item.category)}</span>` : ''}
+                  ${item.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(item.location_found)}</span>` : ''}
+                  ${item.reporter_name ? `<span><i class="fas fa-user-tie"></i> Reporter: ${escHtml(item.reporter_name)}</span>` : ''}
+                </div>
+                ${(() => {
+                  const itmImgs = normalizeImages(item.images);
+                  return itmImgs.length > 0 ? `
+                  <div class="lf-card-images" style="margin-top: 8px;">
+                    ${itmImgs.map(img => `<img src="${img.image_url}" alt="item" onclick="window._openImageViewer('${img.image_url}')" style="width: 44px; height: 44px; object-fit: cover; border-radius: 6px; cursor: pointer;">`).join('')}
+                  </div>` : '';
+                })()}
+              </div>
+
+              <!-- Right: Lost Item -->
+              <div class="lf-pair-subcard" style="background: var(--bg-primary); padding: 14px; border-radius: 8px; border: 1px solid var(--border);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+                  <span class="lf-type-badge lost" style="font-size: 10px;">Matched Lost Report</span>
+                  <span style="font-size: 11px; color: var(--text-light);"><i class="fas fa-calendar"></i> ${match.date_lost_found ? new Date(match.date_lost_found).toLocaleDateString('en-US', {month: 'short', day: 'numeric'}) : 'Reported'}</span>
+                </div>
+                <h4 style="margin:0 0 6px; font-size: 15px; color: var(--text-primary); text-decoration: line-through; opacity: 0.75;">${escHtml(match.item_name)}</h4>
+                <p style="font-size: 13px; color: var(--text-secondary); margin: 0 0 8px;">${escHtml(match.description || 'No description')}</p>
+                <div class="lf-card-meta" style="font-size: 11px;">
+                  ${match.category ? `<span><i class="fas fa-tag"></i> ${escHtml(match.category)}</span>` : ''}
+                  ${match.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(match.location_found)}</span>` : ''}
+                  ${match.reporter_name ? `<span><i class="fas fa-user"></i> Poster: ${escHtml(match.reporter_name)}</span>` : ''}
+                </div>
+                ${(() => {
+                  const mImgs = normalizeImages(match.images);
+                  return mImgs.length > 0 ? `
+                  <div class="lf-card-images" style="margin-top: 8px;">
+                    ${mImgs.map(img => `<img src="${img.image_url}" alt="item" onclick="window._openImageViewer('${img.image_url}')" style="width: 44px; height: 44px; object-fit: cover; border-radius: 6px; cursor: pointer;">`).join('')}
+                  </div>` : '';
+                })()}
+              </div>
+            </div>
+            ${canManage ? `
+              <div class="lf-card-actions" style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end;">
+                <button class="btn btn-danger btn-sm" onclick="window._deleteLostFound('${item.id}')"><i class="fas fa-trash-alt"></i> Delete</button>
+              </div>` : ''}
+          </div>
+        `;
+      }
+
+      const itemCardImgs = normalizeImages(item.images);
+      return `
+      <div class="card lf-card${isResolved ? ' lf-card--resolved' : ''}">
+        <div class="lf-card-header">
+          <div class="lf-card-title-group">
+            <h4 class="lf-card-title" style="${isResolved ? 'text-decoration:line-through;opacity:0.6;' : ''}">${escHtml(item.item_name)}</h4>
+          </div>
+          <div class="lf-card-badges">
+            <span class="lf-type-badge ${item.type}">${item.type}</span>
+            ${statusBadge}
+          </div>
+        </div>
+        ${item.description ? `<p class="lf-card-desc">${escHtml(item.description)}</p>` : ''}
+        <div class="lf-card-meta">
+          ${item.category ? `<span><i class="fas fa-tag"></i> ${escHtml(item.category)}</span>` : ''}
+          ${item.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(item.location_found)}</span>` : ''}
+          <span><i class="fas fa-calendar"></i> ${item.date_lost_found ? new Date(item.date_lost_found).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'}) : 'Unknown Date'}</span>
+          <span><i class="fas fa-clock"></i> ${timeAgo(item.created_at)}</span>
+          ${item.reporter_name ? `<span><i class="fas fa-user"></i> ${escHtml(item.reporter_name)}</span>` : ''}
+          ${item.contact_info ? `<span class="lf-card-contact"><i class="fas fa-address-card"></i> ${escHtml(item.contact_info)}</span>` : ''}
+        </div>
+        ${itemCardImgs.length > 0 ? `
+        <div class="lf-card-images">
+          ${itemCardImgs.map(img => `<img src="${img.image_url}" alt="item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
+        </div>` : ''}
+        ${showPendingHintAdmin ? `<div class="lf-match-hint lf-match-hint--pending"><i class="fas fa-magic"></i> AI suggested a pending match review.</div>` : ''}
+        ${showPendingHintUser ? `<div class="lf-match-hint lf-match-hint--info"><i class="fas fa-search"></i> Possible match found. Please check with the office.</div>` : ''}
+        ${(!showPendingHintAdmin && !showPendingHintUser) && showApprovedHint ? `<div class="lf-match-hint lf-match-hint--confirmed"><i class="fas fa-check-circle"></i> Match confirmed by admin.</div>` : ''}
+        ${state.filters.lfType === 'pending-guest' ? `
+          <div class="lf-card-actions">
+            <button class="btn btn-success btn-sm" onclick="window._approveGuestReport('${item.id}')"><i class="fas fa-check"></i> Approve</button>
+            <button class="btn btn-danger btn-sm" onclick="window._deleteLostFound('${item.id}')"><i class="fas fa-times"></i> Reject</button>
+          </div>
+        ` : (canManage ? `
+          <div class="lf-card-actions">
+            ${canResolve ? `<button class="btn btn-success btn-sm" onclick="window._resolveLostFound('${item.id}')"><i class="fas fa-check-circle"></i> Mark Resolved</button>` : ''}
+            ${!isResolved ? `<button class="btn btn-secondary btn-sm" onclick="window._editLostFound('${item.id}')"><i class="fas fa-edit"></i> Edit</button>` : ''}
+            <button class="btn btn-danger btn-sm" onclick="window._deleteLostFound('${item.id}')"><i class="fas fa-trash-alt"></i> Delete</button>
+          </div>` : '')}
+      </div>`;
+    }).filter(Boolean).join('');
+
     let itemsHtml = '';
-    if (state.lostFound.length === 0) {
+    if (!renderedCards) {
       itemsHtml = `
         <div class="empty-state">
           <i class="fas fa-box-open"></i>
@@ -3793,67 +4624,21 @@
           <p>${canPost ? 'Report a lost or found item using the + button.' : 'Check back later.'}</p>
         </div>`;
     } else {
-      itemsHtml = `
-        <div class="lf-items-list">
-          ${state.lostFound.map(item => {
-            const isResolved = item.status === 'resolved' || item.status === 'claimed';
-            const canManage = item.reporter_id === state.user.id || state.user.role === 'admin' || state.user.role === 'superadmin';
-            const canResolve = (state.user.role === 'admin' || state.user.role === 'superadmin') && !isResolved && item.type === 'found';
-            const showPendingHintAdmin = isAdmin && item.match_review_status === 'pending';
-            const showPendingHintUser = !isAdmin && item.reporter_id === state.user.id && item.match_review_status === 'pending';
-            const showApprovedHint = item.match_review_status === 'approved' || item.status === 'matched';
-            
-            let statusBadge = '';
-            if (item.status === 'resolved') {
-              statusBadge = '<span class="lf-resolved-badge"><i class="fas fa-check-circle"></i> Resolved</span>';
-            } else if (item.status === 'claimed') {
-              statusBadge = '<span class="lf-claimed-badge"><i class="fas fa-hand-holding-heart"></i> Claimed</span>';
-            } else if (item.status === 'deleted') {
-              statusBadge = '<span class="lf-deleted-badge" style="background-color:#dc2626; color:white; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold; display:inline-flex; align-items:center; gap:4px; text-transform:uppercase;"><i class="fas fa-trash-alt"></i> Deleted</span>';
-            }
-
-            return `
-            <div class="card lf-card${isResolved ? ' lf-card--resolved' : ''}">
-              <div class="lf-card-header">
-                <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start;">
-                  <span class="lf-type-badge ${item.type}">${item.type}</span>
-                  ${statusBadge}
-                </div>
-                <div style="flex:1">
-                  <h4 style="${isResolved ? 'text-decoration:line-through;opacity:0.6;' : ''}">${escHtml(item.item_name)}</h4>
-                  <p>${escHtml(item.description)}</p>
-                  <div class="lf-card-meta">
-                    ${item.category ? `<span><i class="fas fa-tag"></i> ${escHtml(item.category)}</span>` : ''}
-                    ${item.location_found ? `<span><i class="fas fa-map-marker-alt"></i> ${escHtml(item.location_found)}</span>` : ''}
-                    <span><i class="fas fa-calendar"></i> ${item.date_lost_found ? new Date(item.date_lost_found).toLocaleDateString('en-US', {month: 'short', day: 'numeric', year: 'numeric'}) : 'Unknown Date'}</span>
-                    <span><i class="fas fa-clock"></i> ${timeAgo(item.created_at)}</span>
-                    ${item.reporter_name ? `<span><i class="fas fa-user"></i> ${escHtml(item.reporter_name)}</span>` : ''}
-                  </div>
-                  ${item.contact_info ? `<div style="margin-top:6px;font-size:12px;color:var(--text-secondary);"><i class="fas fa-address-card"></i> ${escHtml(item.contact_info)}</div>` : ''}
-                </div>
-              </div>
-              ${item.images && item.images.length > 0 && item.images[0].id ? `
-              <div class="lf-card-images">
-                ${item.images.map(img => `<img src="${img.image_url}" alt="item" onclick="window._openImageViewer('${img.image_url}')">`).join('')}
-              </div>` : ''}
-              ${showPendingHintAdmin ? `<div class="lf-match-hint"><i class="fas fa-magic"></i> AI suggested a pending match review.</div>` : ''}
-              ${showPendingHintUser ? `<div class="lf-match-hint"><i class="fas fa-search"></i> Possible match found. Please check with the office.</div>` : ''}
-              ${(!showPendingHintAdmin && !showPendingHintUser) && showApprovedHint ? `<div class="lf-match-hint"><i class="fas fa-check-circle"></i> Match confirmed by admin.</div>` : ''}
-              ${state.filters.lfType === 'pending-guest' ? `
-                <div class="lf-card-actions" style="margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end;">
-                  <button class="btn btn-success btn-sm" onclick="window._approveGuestReport('${item.id}')"><i class="fas fa-check"></i> Approve</button>
-                  <button class="btn btn-danger btn-sm" onclick="window._deleteLostFound('${item.id}')"><i class="fas fa-times"></i> Reject</button>
-                </div>
-              ` : (canManage ? `
-                <div class="lf-card-actions">
-                  ${canResolve ? `<button class="btn btn-success btn-sm" onclick="window._resolveLostFound('${item.id}')"><i class="fas fa-check-circle"></i> Mark Resolved</button>` : ''}
-                  ${!isResolved ? `<button class="btn btn-secondary btn-sm" onclick="window._editLostFound('${item.id}')"><i class="fas fa-edit"></i> Edit</button>` : ''}
-                  <button class="btn btn-danger btn-sm" onclick="window._deleteLostFound('${item.id}')"><i class="fas fa-trash-alt"></i> Delete</button>
-                </div>` : '')}
-            </div>`;
-          }).join('')}
-        </div>`;
+      itemsHtml = `<div class="lf-items-list">${renderedCards}</div>`;
     }
+
+    const tabsHtml = isRestrictedRole ? `
+      <button class="lf-tab active" data-type="lost">Lost Items</button>
+    ` : `
+      <button class="lf-tab ${state.filters.lfType === 'all' ? 'active' : ''}" data-type="all">All</button>
+      <button class="lf-tab ${state.filters.lfType === 'lost' ? 'active' : ''}" data-type="lost">Lost</button>
+      <button class="lf-tab ${state.filters.lfType === 'found' ? 'active' : ''}" data-type="found">Found</button>
+      ${isAdmin ? `
+        <button class="lf-tab ${state.filters.lfType === 'resolved' ? 'active' : ''}" data-type="resolved">Resolved</button>
+        <button class="lf-tab ${state.filters.lfType === 'archived' ? 'active' : ''}" data-type="archived">Archived</button>
+      ` : ''}
+      <button class="lf-tab ${state.filters.lfType === 'pending-guest' ? 'active' : ''}" data-type="pending-guest">Pending Guest Reports</button>
+    `;
 
     if (hasLFLayout) {
       const dashboardContainer = document.getElementById('lfMatchDashboardContainer');
@@ -3868,12 +4653,12 @@
       }
 
       if (tabs) {
+        tabs.innerHTML = tabsHtml;
         tabs.querySelectorAll('.lf-tab').forEach(el => {
-          if (el.dataset.type === state.filters.lfType) {
-            el.classList.add('active');
-          } else {
-            el.classList.remove('active');
-          }
+          el.onclick = () => {
+            state.filters.lfType = el.dataset.type;
+            loadLostFound();
+          };
         });
       }
     } else {
@@ -3886,18 +4671,7 @@
           <div class="page-content">
             <div id="lfMatchDashboardContainer">${matchDashboardHtml}</div>
             <div class="lf-tabs">
-              ${isRestrictedRole ? `
-                <button class="lf-tab active" data-type="lost">Lost Items</button>
-              ` : `
-                <button class="lf-tab ${state.filters.lfType === 'all' ? 'active' : ''}" data-type="all">All</button>
-                <button class="lf-tab ${state.filters.lfType === 'lost' ? 'active' : ''}" data-type="lost">Lost</button>
-                <button class="lf-tab ${state.filters.lfType === 'found' ? 'active' : ''}" data-type="found">Found</button>
-                <button class="lf-tab ${state.filters.lfType === 'resolved' ? 'active' : ''}" data-type="resolved">Resolved</button>
-                ${isAdmin ? `
-                  <button class="lf-tab ${state.filters.lfType === 'archived' ? 'active' : ''}" data-type="archived">Archived</button>
-                ` : ''}
-                <button class="lf-tab ${state.filters.lfType === 'pending-guest' ? 'active' : ''}" data-type="pending-guest">Pending Guest Reports</button>
-              `}
+              ${tabsHtml}
             </div>
             <div id="lfItemsContainer">${itemsHtml}</div>
           </div>
@@ -3933,10 +4707,14 @@
   };
 
   window._deleteLostFound = async (id) => {
-    if (!await window.showSystemConfirm('Delete this item?')) return;
+    const isArchived = state.filters.lfType === 'archived';
+    const msg = isArchived
+      ? 'Permanently delete this item from archives? This action cannot be undone.'
+      : 'Delete this item?';
+    if (!await window.showSystemConfirm(msg)) return;
     try {
-      await api(`/api/lost-found/${id}`, { method: 'DELETE' });
-      showToast('Item deleted', 'success');
+      await api(`/api/lost-found/${id}${isArchived ? '?permanent=true' : ''}`, { method: 'DELETE' });
+      showToast(isArchived ? 'Item permanently deleted' : 'Item deleted', 'success');
       loadLostFound();
     } catch (err) { showToast(err.message || 'Delete failed', 'error'); }
   };
@@ -4020,10 +4798,81 @@
   };
 
 
+  window._reopenLostFoundMatch = (foundId, lostId) => {
+    openModal('custom-confirm', {
+      title: 'Re-open Match Review',
+      message: 'Restore this rejected match back to pending review?',
+      submessage: 'This allows admins to review and approve the match again if it was rejected by mistake.',
+      icon: 'fa-undo',
+      yesLabel: 'Yes, Re-open Match',
+      onConfirm: async () => {
+        try {
+          const res = await api(`/api/lost-found/matches/reopen/${foundId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ lostId }),
+          });
+          showToast(res.message || 'Match re-opened for review', 'success');
+          state.activeMatchTab = 'pending';
+          loadLostFound();
+        } catch (err) {
+          showToast(err.message || 'Failed to re-open match', 'error');
+        }
+      }
+    });
+  };
+
   window._changeActiveMatchTab = (tab) => {
     state.activeMatchTab = tab;
+    state.lfMatchIndex = 0;
     renderLostFoundPage();
   };
+
+  window._navigateLFMatch = (dir) => {
+    const pendingMatches = state.lostFoundReviews.filter(m => 
+      (m.found_item?.match_review_status === 'pending' || m.lost_item?.match_review_status === 'pending') &&
+      m.found_item?.status !== 'claimed' && m.lost_item?.status !== 'claimed'
+    );
+    const approvedMatches = state.lostFoundReviews.filter(m => 
+      m.found_item?.match_review_status === 'approved' && 
+      m.found_item?.status === 'matched'
+    );
+    const claimedMatches = state.lostFoundReviews.filter(m => 
+      m.found_item?.status === 'claimed' || m.lost_item?.status === 'claimed'
+    );
+    const rejectedMatches = state.lostFoundRejected || [];
+    const currentTabList = state.activeMatchTab === 'pending' ? pendingMatches 
+                          : state.activeMatchTab === 'approved' ? approvedMatches 
+                          : state.activeMatchTab === 'rejected' ? rejectedMatches
+                          : claimedMatches;
+
+    if (!currentTabList || currentTabList.length <= 1) return;
+    const cur = typeof state.lfMatchIndex === 'number' ? state.lfMatchIndex : 0;
+    const next = cur + dir;
+    if (next >= 0 && next < currentTabList.length) {
+      state.lfMatchIndex = next;
+      renderLostFoundPage();
+    }
+  };
+
+  if (!window._lfMatchKeyNavInitialized) {
+    window._lfMatchKeyNavInitialized = true;
+    window.addEventListener('keydown', (e) => {
+      if (state.currentPage !== 'lostfound') return;
+      const isAdmin = state.user && (state.user.role === 'admin' || state.user.role === 'superadmin');
+      if (!isAdmin) return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable)) return;
+      if (document.querySelector('.modal-backdrop.show, .modal.show, .modal-open, .custom-modal.show')) return;
+      
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        window._navigateLFMatch(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        window._navigateLFMatch(1);
+      }
+    });
+  }
 
   // ════════════════════════════════
   //  SECTION SCHEDULES DIRECTORY
@@ -4480,7 +5329,7 @@
   }
   function schedulePageTitle() {
     if (state.user.role === 'admin' || state.user.role === 'superadmin') return 'Class Schedules';
-    if (state.user.role === 'faculty') return 'Teaching Schedule';
+    if (state.user.role === 'faculty') return 'Class Schedules';
     return 'Class Schedule';
   }
 
@@ -4533,6 +5382,2252 @@
     }
     return url;
   }
+
+  // ════════════════════════════════
+  //  FACULTY LOADING REQUEST (replaces the old teaching-schedule view)
+  //  Term -> Type -> Program -> Subject (offering). Faculty claim admin-defined
+  //  slots; times/rooms are fixed by the offering, so no free-text time entry.
+  // ════════════════════════════════
+  const TERM_LABELS = { SUMMER: 'Summer', FIRST_SEMESTER: '1st Semester', SECOND_SEMESTER: '2nd Semester' };
+  const LOADING_STATUS = {
+    pending:  { label: 'Pending',  color: '#b45309', bg: '#fef3c7' },
+    approved: { label: 'Approved', color: '#15803d', bg: '#dcfce7' },
+    rejected: { label: 'Rejected', color: '#b91c1c', bg: '#fee2e2' },
+    returned: { label: 'Returned for revision', color: '#1d4ed8', bg: '#dbeafe' },
+  };
+
+  // ── Shared portfolio-section builder ─────────────────────────────────────────
+  // Used in both the gate form and the approved-faculty edit panel.
+  // `cred`    — current faculty_credentials object
+  // `pfx`     — CSS class prefix (e.g. 'gate' → classes gate-research-title, etc.)
+  const _PORT_CATS = [
+    { key: 'research',  label: 'Research'  },
+    { key: 'trainings', label: 'Trainings' },
+    { key: 'extension', label: 'Extension' },
+    { key: 'awards',    label: 'Awards'    },
+  ];
+  function buildPortfolioSection(cred, pfx) {
+    const port = (cred && cred.portfolio) ? cred.portfolio : {};
+    const rows = _PORT_CATS.map((cat, ci) =>
+      [0,1,2].map(i => {
+        const entry = (port[cat.key] || [])[i] || {};
+        const bg    = (ci * 3 + i) % 2 === 0 ? 'var(--bg-card,#fff)' : '#fafafa';
+        const sep   = (ci > 0 || i > 0) ? 'border-top:1px solid var(--border,#e2e8f0);' : '';
+        return `<div style="display:grid;grid-template-columns:110px 1fr 1fr;${sep}background:${bg};">
+          <div style="padding:5px 10px;border-right:1px solid var(--border,#e2e8f0);display:flex;align-items:center;">
+            ${i === 0 ? `<span style="font-size:12px;font-weight:700;color:#b91c1c;">${cat.label}</span>` : ''}
+          </div>
+          <div style="padding:5px 8px;border-right:1px solid var(--border,#e2e8f0);">
+            <input class="form-input ${pfx}-${cat.key}-title" style="font-size:12px;padding:4px 8px;" placeholder="Title / description..." value="${escHtml(entry.title||'')}">
+          </div>
+          <div style="padding:5px 8px;">
+            <input class="form-input ${pfx}-${cat.key}-url" style="font-size:12px;padding:4px 8px;" placeholder="https://..." value="${escHtml(entry.url||'')}">
+          </div>
+        </div>`;
+      }).join('')
+    ).join('');
+    return `
+      <div class="form-group" style="border-top:1px solid var(--border,#e2e8f0);padding-top:16px;margin-top:8px;">
+        <label class="form-label" style="font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <i class="fas fa-link" style="color:var(--maroon);font-size:13px;"></i>Portfolio Links
+          <span style="font-size:12px;font-weight:400;color:var(--text-light);">(For the Last 3 Years)</span>
+        </label>
+        <p style="font-size:12px;color:var(--text-light);margin:0 0 10px;">Fill in your research, trainings, extension work, and awards. Leave blank if not applicable.</p>
+        <div style="border:1px solid var(--border,#e2e8f0);border-radius:8px;overflow:hidden;">
+          <div style="display:grid;grid-template-columns:110px 1fr 1fr;background:var(--maroon,#880808);">
+            <div style="color:#fff;font-size:11px;font-weight:700;padding:8px 10px;border-right:1px solid #6b0606;">Category</div>
+            <div style="color:#fff;font-size:11px;font-weight:700;padding:8px 10px;border-right:1px solid #6b0606;">Title / Description</div>
+            <div style="color:#fff;font-size:11px;font-weight:700;padding:8px 10px;">Link / URL</div>
+          </div>
+          ${rows}
+        </div>
+      </div>`;
+  }
+  function collectPortfolio(pfx) {
+    const result = {};
+    _PORT_CATS.forEach(cat => {
+      const titles = [...document.querySelectorAll(`.${pfx}-${cat.key}-title`)].map(i => i.value.trim());
+      const urls   = [...document.querySelectorAll(`.${pfx}-${cat.key}-url`)].map(i => i.value.trim());
+      result[cat.key] = titles.map((t, i) => ({ title: t, url: urls[i] || '' }))
+                               .filter(e => e.title || e.url);
+    });
+    return result;
+  }
+
+  // Shown when faculty's profile is not yet approved.
+  // The specialization form is embedded directly here — no redirect to My Profile.
+  function renderProfileGatePage(prof) {
+    const pageArea = document.getElementById('pageArea');
+    const status = prof.status; // null | 'pending' | 'rejected'
+    const cred = prof.credentials || {};
+    const arr = (v, n) => { const a = Array.isArray(v) ? v.slice(0, n) : []; while (a.length < n) a.push(''); return a; };
+    // Use employment_type from the API response (most reliable — covers old sessions)
+    const isPartTime = (prof.employment_type || '').toLowerCase() === 'part_time';
+
+    const isPending  = status === 'pending';
+    const isRejected = status === 'rejected';
+    const isFirst    = !status;
+
+    // Top status banner
+    const banner = isPending
+      ? `<div style="background:#fef9c3;border:1px solid #fde047;border-radius:10px;padding:16px 20px;display:flex;gap:14px;align-items:flex-start;margin-bottom:20px;">
+           <i class="fas fa-hourglass-half" style="color:#b45309;font-size:22px;margin-top:2px;"></i>
+           <div>
+             <div style="font-weight:700;font-size:14px;color:#92400e;">Specialization Under Review</div>
+             <p style="margin:4px 0 0;font-size:13px;color:#78350f;">Your profile is waiting for admin review. You can still update your information below and re-submit — this will reset the review so admin sees your latest details.</p>
+           </div>
+         </div>`
+      : isRejected
+      ? `<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:10px;padding:16px 20px;display:flex;gap:14px;align-items:flex-start;margin-bottom:20px;">
+           <i class="fas fa-exclamation-circle" style="color:#b91c1c;font-size:22px;margin-top:2px;"></i>
+           <div>
+             <div style="font-weight:700;font-size:14px;color:#991b1b;">Profile Needs Revision</div>
+             <p style="margin:4px 0 0;font-size:13px;color:#7f1d1d;">${escHtml(prof.remarks || 'Please update your specialization and re-submit.')}</p>
+           </div>
+         </div>`
+      : `<div style="background:#dbeafe;border:1px solid #93c5fd;border-radius:10px;padding:16px 20px;display:flex;gap:14px;align-items:flex-start;margin-bottom:20px;">
+           <i class="fas fa-info-circle" style="color:#1d4ed8;font-size:22px;margin-top:2px;"></i>
+           <div>
+             <div style="font-weight:700;font-size:14px;color:#1e3a8a;">Specialization Required</div>
+             <p style="margin:4px 0 0;font-size:13px;color:#1e40af;">Fill in your specialization below and submit for admin review. The admin will assign programs you are qualified to teach before you can submit loading requests.</p>
+           </div>
+         </div>`;
+
+    // The editable form (shown for first-time and rejected; read-only when pending)
+    const specInputs = arr(cred.specializations, 3).map((v, i) =>
+      `<input class="form-input spec-input" style="margin-bottom:6px;" placeholder="Specialization ${i + 1}${i===0?' (required)':''}" value="${escHtml(v)}" >`).join('');
+    const eduInputs = arr(cred.education, 3).map((v, i) =>
+      `<input class="form-input edu-input" style="margin-bottom:6px;" placeholder="Degree ${i + 1} (e.g. BSIT, MIT)" value="${escHtml(v)}" >`).join('');
+
+    pageArea.innerHTML = `
+      <div class="page-header">
+        <h1 class="page-title">Course Preference</h1>
+        <p class="page-subtitle">Complete your specialization profile to get access to loading requests.</p>
+      </div>
+      <div class="page-content">
+        ${banner}
+        <div class="card" style="padding:20px;margin-bottom:24px;">
+          <div style="font-weight:700;font-size:15px;margin-bottom:16px;display:flex;align-items:center;gap:8px;">
+            <i class="fas fa-award" style="color:var(--maroon);"></i> Faculty Specialization Profile
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">Academic Title</label>
+              <input class="form-input" id="gateTitle" placeholder="e.g. Assistant Professor 1"
+                value="${escHtml(cred.academic_title || '')}" >
+            </div>
+            <div class="form-group">
+              <label class="form-label">Preferred Programs / Departments <span style="color:var(--maroon);">*</span></label>
+              <p style="font-size:12px;color:var(--text-light);margin:0 0 6px;">Select all programs you want to teach. Admin reviews and confirms the final assignment.</p>
+              <div style="position:relative;" id="gateProgramWrap">
+                <div id="gateProgramTrigger" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border:1px solid var(--border,#e2e8f0);border-radius:8px;cursor:pointer;background:var(--bg-card,#fff);min-height:40px;gap:8px;">
+                  <span id="gateProgramLabel" style="font-size:13px;color:var(--text-secondary,#777);">-- Select programs --</span>
+                  <i class="fas fa-chevron-down" style="font-size:11px;color:var(--text-light);flex-shrink:0;"></i>
+                </div>
+                <div id="gateProgramList" style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--bg-card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.12);z-index:200;padding:8px;">
+                  ${['BSA','BSBAFM','BSEDEN','BSENT','BSHM','BSIT','BSPSY','DIT'].map(p => {
+                    const checked = (cred.preferred_programs || []).includes(p);
+                    return `<label style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:13px;user-select:none;">
+                      <input type="checkbox" class="gate-prog-chk" value="${p}" ${checked ? 'checked' : ''}  onchange="window._updateGateProgramLabel()"> ${p}
+                    </label>`;
+                  }).join('')}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Specializations <span style="color:var(--maroon);">*</span></label>
+            <p style="font-size:12px;color:var(--text-light);margin:0 0 8px;">Enter at least one subject area or field you specialize in.</p>
+            ${specInputs}
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Educational Background</label>
+            <p style="font-size:12px;color:var(--text-light);margin:0 0 8px;">List your degrees, most recent first (e.g. MIT — Technology Management, BSIT).</p>
+            ${eduInputs}
+          </div>
+
+          ${buildPortfolioSection(cred, 'gate')}
+
+          ${isPartTime ? `
+            <div class="form-group" style="border-top:1px solid var(--border,#e2e8f0);padding-top:16px;margin-top:8px;" id="gateSchedSection">
+              <label class="form-label" style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                <i class="fas fa-clock" style="color:var(--maroon);font-size:13px;"></i>
+                Preferred Schedule
+                <span style="background:#fef3c7;color:#92400e;font-size:11px;padding:2px 8px;border-radius:20px;font-weight:700;">Part-Time</span>
+              </label>
+              <p style="font-size:12px;color:var(--text-light);margin:0 0 12px;">Add each day you are available and the time window for that day. You can add multiple days.</p>
+
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr 32px;gap:8px;margin-bottom:6px;padding:0 2px;">
+                <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">Day</div>
+                <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">From</div>
+                <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">To</div>
+                <div></div>
+              </div>
+              <div id="gateSchedRows"></div>
+              <button type="button" class="btn btn-secondary btn-sm" id="gateAddSchedRow" style="margin-top:8px;font-size:12px;">
+                <i class="fas fa-plus"></i> Add Day
+              </button>
+            </div>` : ''}
+
+          <div style="margin-top:16px;">
+            <button class="btn btn-primary" id="ldSubmitProfile">
+              <i class="fas fa-paper-plane"></i>
+              ${isPending ? 'Update & Resubmit' : isRejected ? 'Re-submit for Review' : 'Submit for Review'}
+            </button>
+          </div>
+        </div>
+
+        <h2 style="font-size:16px;font-weight:700;margin:0 0 12px;">My Requests</h2>
+        <div id="ldRequests"><div class="loader"><div class="spinner"></div></div></div>
+      </div>`;
+
+    // Programs dropdown toggle
+    const trigger = document.getElementById('gateProgramTrigger');
+    const list    = document.getElementById('gateProgramList');
+    if (trigger && list) {
+      trigger.onclick = () => { list.style.display = list.style.display === 'none' ? 'block' : 'none'; };
+      document.addEventListener('click', function _closeGateDrop(e) {
+        if (!document.getElementById('gateProgramWrap')?.contains(e.target)) {
+          list.style.display = 'none';
+          document.removeEventListener('click', _closeGateDrop);
+        }
+      });
+    }
+
+    // Programs dropdown label updater
+    window._updateGateProgramLabel = () => {
+      const checked = [...document.querySelectorAll('.gate-prog-chk:checked')].map(c => c.value);
+      const lbl = document.getElementById('gateProgramLabel');
+      if (lbl) lbl.textContent = checked.length ? checked.join(', ') : '-- Select programs --';
+    };
+    window._updateGateProgramLabel();
+
+    // ── Part-time preferred schedule rows ──────────────────────────────────────
+    if (isPartTime) {
+      const _SCHED_DAYS  = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+      const _SCHED_SLOTS = (() => {
+        const s = [];
+        for (let h = 7; h <= 21; h++) {
+          ['00','30'].forEach(m => {
+            if (h === 21 && m === '30') return;
+            const val = `${String(h).padStart(2,'0')}:${m}`;
+            s.push({ val, label: val });
+          });
+        }
+        return s;
+      })();
+      const _TIME_OPTS = `<option value="">--</option>` +
+        _SCHED_SLOTS.map(s => `<option value="${s.val}">${s.label}</option>`).join('');
+
+      // Migrate old format (preferred_days + preferred_time_from/to → new rows)
+      const _savedRows = Array.isArray(cred.preferred_schedule) && cred.preferred_schedule.length
+        ? cred.preferred_schedule
+        : Array.isArray(cred.preferred_days) && cred.preferred_days.length
+          ? cred.preferred_days.map(d => ({ day: d, from: cred.preferred_time_from || '', to: cred.preferred_time_to || '' }))
+          : [{ day: '', from: '', to: '' }];
+
+      window._gateSchedRows = _savedRows.map(r => ({ ...r }));
+
+      function _setOpts(sel, val) {
+        // Set selected option on a freshly built select
+        [...sel.options].forEach(o => { o.selected = o.value === val; });
+      }
+
+      window._renderGateSchedRows = () => {
+        const container = document.getElementById('gateSchedRows');
+        if (!container) return;
+        container.innerHTML = window._gateSchedRows.map((row, i) => `
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr 32px;gap:8px;margin-bottom:8px;align-items:center;" id="gsRow${i}">
+            <select class="form-input form-select" id="gsDay${i}" style="font-size:13px;">
+              <option value="">-- Day --</option>
+              ${_SCHED_DAYS.map(d => `<option value="${d}" ${row.day===d?'selected':''}>${d}</option>`).join('')}
+            </select>
+            <select class="form-input form-select" id="gsFrom${i}" style="font-size:13px;">
+              ${_TIME_OPTS}
+            </select>
+            <select class="form-input form-select" id="gsTo${i}" style="font-size:13px;">
+              ${_TIME_OPTS}
+            </select>
+            <button type="button" onclick="window._removeGateSchedRow(${i})"
+              style="width:32px;height:32px;border:1px solid #fca5a5;border-radius:6px;background:#fee2e2;color:#b91c1c;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;"
+              title="Remove row">&times;</button>
+          </div>`).join('');
+        // Re-apply saved from/to values (innerHTML wipes them)
+        window._gateSchedRows.forEach((row, i) => {
+          _setOpts(document.getElementById(`gsFrom${i}`), row.from || '');
+          _setOpts(document.getElementById(`gsTo${i}`),   row.to   || '');
+          document.getElementById(`gsDay${i}` ).onchange  = e => { window._gateSchedRows[i].day  = e.target.value; };
+          document.getElementById(`gsFrom${i}`).onchange  = e => { window._gateSchedRows[i].from = e.target.value; };
+          document.getElementById(`gsTo${i}`  ).onchange  = e => { window._gateSchedRows[i].to   = e.target.value; };
+        });
+      };
+
+      window._removeGateSchedRow = (i) => {
+        window._gateSchedRows.splice(i, 1);
+        if (!window._gateSchedRows.length) window._gateSchedRows.push({ day: '', from: '', to: '' });
+        window._renderGateSchedRows();
+      };
+
+      window._addGateSchedRow = () => {
+        window._gateSchedRows.push({ day: '', from: '', to: '' });
+        window._renderGateSchedRows();
+      };
+
+      window._renderGateSchedRows();
+      const addBtn = document.getElementById('gateAddSchedRow');
+      if (addBtn) addBtn.onclick = window._addGateSchedRow;
+    }
+
+    document.getElementById('ldSubmitProfile').onclick = async () => {
+        const specializations    = [...document.querySelectorAll('.spec-input')].map(i => i.value.trim()).filter(Boolean);
+        const education          = [...document.querySelectorAll('.edu-input')].map(i => i.value.trim()).filter(Boolean);
+        const academic_title     = (document.getElementById('gateTitle')?.value || '').trim();
+        const preferred_programs = [...document.querySelectorAll('.gate-prog-chk:checked')].map(c => c.value);
+
+        if (!specializations.length) {
+          showToast('Please enter at least one specialization.', 'error');
+          return;
+        }
+        if (!preferred_programs.length) {
+          showToast('Please select at least one preferred program/department.', 'error');
+          return;
+        }
+
+        // Collect part-time schedule rows; validate each filled row
+        let preferred_schedule;
+        if (isPartTime) {
+          const rows = (window._gateSchedRows || []).filter(r => r.day || r.from || r.to);
+          for (const r of rows) {
+            if (!r.day) { showToast('Please select a day for every schedule row.', 'error'); return; }
+            if (r.from && r.to && r.from >= r.to) {
+              showToast(`End time must be after start time for ${r.day}.`, 'error'); return;
+            }
+          }
+          preferred_schedule = rows;
+        }
+
+        const updatedCred = {
+          ...cred,
+          academic_title,
+          specializations,
+          education,
+          preferred_programs,
+          portfolio: collectPortfolio('gate'),
+        };
+        if (isPartTime) updatedCred.preferred_schedule = preferred_schedule;
+
+        try {
+          await api('/api/auth/me', {
+            method: 'PATCH',
+            body: JSON.stringify({
+              first_name: state.user.first_name,
+              last_name:  state.user.last_name,
+              faculty_credentials: updatedCred,
+            }),
+          });
+          await api('/api/loading/profile/submit', { method: 'POST' });
+          showToast('Specialization submitted! You will be notified once programs are assigned.', 'success');
+          renderLoadingPage();
+        } catch (err) { showToast(err.message, 'error'); }
+    };
+
+    loadMyLoadingRequests();
+  }
+
+  async function renderLoadingPage() {
+    const pageArea = document.getElementById('pageArea');
+    // Gate: check profile status before showing the request form
+    try {
+      const prof = await api('/api/loading/my-programs');
+      if (prof.status !== 'approved') {
+        renderProfileGatePage(prof);
+        return;
+      }
+      state._ldAllowedPrograms = prof.programs;
+    } catch (err) {
+      pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Course Preference</h1></div><div class="page-content"><div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>${escHtml(err.message)}</p></div></div>`;
+      return;
+    }
+    state._loadingOfferings = [];
+    pageArea.innerHTML = `
+      <div class="page-header">
+        <h1 class="page-title">Course Preference</h1>
+        <p class="page-subtitle">Choose a term and subject offering, then submit your loading request for admin review.</p>
+        ${state._ldAllowedPrograms?.length ? `<p style="font-size:12px;color:var(--text-light);margin:2px 0 0;">Your assigned programs: <strong style="color:var(--maroon);">${state._ldAllowedPrograms.map(escHtml).join(', ')}</strong></p>` : ''}
+      </div>
+      <div class="page-content">
+        <div class="card" style="padding:20px; margin-bottom:20px;">
+          <div class="form-row">
+            <div class="form-group"><label>Term</label>
+              <input type="hidden" id="ldTerm" value="${state.activeTerm || 'FIRST_SEMESTER'}">
+              <div class="form-input" style="background:var(--bg-soft,#f8fafc);color:var(--text-secondary,#555);cursor:default;display:flex;align-items:center;gap:6px;">
+                <i class="fas fa-lock" style="font-size:11px;opacity:.6;"></i>
+                ${state.activeYear || ''} · ${TERM_LABELS[state.activeTerm] || state.activeTerm || 'Not set'}
+              </div></div>
+            <div class="form-group"><label>Subject Type</label>
+              <select class="form-input form-select" id="ldType" disabled><option value="">--</option></select></div>
+            <div class="form-group"><label>Program</label>
+              <select class="form-input form-select" id="ldProgram" disabled><option value="">--</option></select></div>
+          </div>
+          <div class="form-group"><label>Subject Offering</label>
+            <select class="form-input form-select" id="ldOffering" disabled><option value="">--</option></select></div>
+          <div id="ldOfferingInfo" style="display:none; background:var(--bg-soft,#f8fafc); border:1px solid var(--border); border-radius:8px; padding:12px 16px; margin-bottom:14px; font-size:13px;"></div>
+          <div class="form-group"><label>Remarks (optional)</label>
+            <textarea class="form-input" id="ldRemarks" rows="2" placeholder="Any note for the admin reviewing your request"></textarea></div>
+          <button class="btn btn-primary" id="ldSubmit" disabled><i class="fas fa-paper-plane"></i> Submit Request</button>
+        </div>
+        <h2 style="font-size:16px; font-weight:700; margin:8px 0 12px;">My Requests</h2>
+        <div id="ldRequests"><div class="loader"><div class="spinner"></div></div></div>
+
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin:24px 0 12px; flex-wrap:wrap;">
+          <h2 style="font-size:16px; font-weight:700; margin:0;">My Schedule</h2>
+          <select class="form-input form-select" id="ldGridTerm" style="max-width:200px;">
+            ${Object.entries(TERM_LABELS).map(([v, l]) => `<option value="${v}" ${v === (state.activeTerm||'') ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </div>
+        <div id="ldGrid"><div class="loader"><div class="spinner"></div></div></div>
+
+        <!-- Edit Specialization — always available after approval -->
+        <details id="ldEditSpecDetails" style="margin-top:28px;">
+          <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px;padding:12px 16px;background:var(--bg-card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:10px;font-weight:700;font-size:14px;user-select:none;" id="ldEditSpecSummary">
+            <i class="fas fa-chevron-right" id="ldEditSpecChevron" style="font-size:11px;color:var(--text-light);transition:transform .2s;"></i>
+            <i class="fas fa-edit" style="color:var(--maroon);"></i> Edit Specialization Profile
+            <span style="font-size:12px;font-weight:400;color:var(--text-light);margin-left:4px;">— update and resubmit for admin re-review</span>
+          </summary>
+          <div style="padding:16px 0 0;" id="ldEditSpecBody">
+            <div class="card" style="padding:20px;">
+              <div id="ldEditSpecForm"><div class="loader"><div class="spinner"></div></div></div>
+            </div>
+          </div>
+        </details>
+      </div>`;
+
+    const $ = (id) => document.getElementById(id);
+    const termSel = $('ldTerm'), typeSel = $('ldType'), progSel = $('ldProgram'),
+          offSel = $('ldOffering'), info = $('ldOfferingInfo'), submitBtn = $('ldSubmit');
+
+    function resetSelect(sel, placeholder) {
+      sel.innerHTML = `<option value="">${placeholder}</option>`;
+      sel.disabled = true;
+    }
+    function fillSelect(sel, values, placeholder) {
+      sel.innerHTML = `<option value="">${placeholder}</option>` +
+        values.map(v => `<option value="${escHtml(v)}">${escHtml(v)}</option>`).join('');
+      sel.disabled = values.length === 0;
+    }
+    function currentOfferings() {
+      const t = typeSel.value, p = progSel.value;
+      return state._loadingOfferings.filter(o =>
+        (!t || (o.subject_type || '') === t) && (!p || (o.program || '') === p));
+    }
+    function refreshOfferingList() {
+      const list = currentOfferings();
+      offSel.innerHTML = `<option value="">-- Select subject --</option>` +
+        list.map(o => {
+          const pending = o.pending_count > 0 ? ` (${o.pending_count} other${o.pending_count > 1 ? 's' : ''} applied)` : '';
+          return `<option value="${o.id}">${escHtml(o.subject_name)} — ${o.day_of_week} ${formatTime(o.start_time)}-${formatTime(o.end_time)}${o.section ? ' · ' + escHtml(o.section) : ''}${pending}</option>`;
+        }).join('');
+      offSel.disabled = list.length === 0;
+      info.style.display = 'none';
+      submitBtn.disabled = true;
+    }
+
+    async function loadOfferings() {
+      resetSelect(typeSel, '--'); resetSelect(progSel, '--'); resetSelect(offSel, '--');
+      info.style.display = 'none'; submitBtn.disabled = true;
+      if (!termSel.value) return;
+      try {
+        state._loadingOfferings = await api(`/api/loading/offerings?term=${encodeURIComponent(termSel.value)}&academic_year=${encodeURIComponent(state.activeYear||'')}`);
+        const types = [...new Set(state._loadingOfferings.map(o => o.subject_type).filter(Boolean))].sort();
+        fillSelect(typeSel, types, 'All types');
+        const progs = [...new Set(state._loadingOfferings.map(o => o.program).filter(Boolean))].sort();
+        fillSelect(progSel, progs, 'All programs');
+        refreshOfferingList();
+        if (state._loadingOfferings.length === 0) showToast('No available offerings for this term yet.', 'info');
+      } catch (err) { showToast(err.message, 'error'); }
+    }
+    termSel.onchange = loadOfferings;
+    typeSel.onchange = refreshOfferingList;
+    progSel.onchange = refreshOfferingList;
+    offSel.onchange = () => {
+      const o = state._loadingOfferings.find(x => x.id === offSel.value);
+      if (!o) { info.style.display = 'none'; submitBtn.disabled = true; return; }
+      info.style.display = 'block';
+      info.innerHTML = `<strong>${escHtml(o.subject_name)}</strong><br>
+        <i class="fas fa-calendar-day"></i> ${o.day_of_week} &nbsp;
+        <i class="fas fa-clock"></i> ${formatTime(o.start_time)}-${formatTime(o.end_time)} &nbsp;
+        ${o.room ? `<i class="fas fa-door-open"></i> ${escHtml(o.room)} &nbsp;` : ''}
+        ${o.section ? `<i class="fas fa-users"></i> ${escHtml(o.section)}` : ''}
+        ${o.pending_count > 0 ? `<br><span style="color:#b45309;font-size:12px;"><i class="fas fa-users" style="margin-right:4px;"></i>${o.pending_count} other ${o.pending_count === 1 ? 'faculty has' : 'faculty have'} also requested this subject. The admin will decide who gets assigned.</span>` : ''}`;
+      submitBtn.disabled = false;
+    };
+    submitBtn.onclick = async () => {
+      if (!offSel.value) return;
+      submitBtn.disabled = true;
+      try {
+        const r = await api('/api/loading/requests', {
+          method: 'POST',
+          body: JSON.stringify({ offering_id: offSel.value, remarks: $('ldRemarks').value }),
+        });
+        if (r.warnings && r.warnings.length) showToast(r.warnings.join(' '), 'info');
+        showToast('Request submitted for review.', 'success');
+        $('ldRemarks').value = '';
+        loadOfferings();
+        loadMyLoadingRequests();
+      } catch (err) {
+        showToast(err.message, 'error');
+        submitBtn.disabled = false;
+      }
+    };
+
+    loadOfferings();
+    loadMyLoadingRequests();
+
+    const gridTerm = $('ldGridTerm');
+    gridTerm.value = termSel.value || state.activeTerm || 'FIRST_SEMESTER';
+    gridTerm.onchange = () => loadScheduleGrid(gridTerm.value);
+    loadScheduleGrid(gridTerm.value);
+
+    // Edit specialization details — lazy-load form when expanded
+    const editDetails  = $('ldEditSpecDetails');
+    const editChevron  = $('ldEditSpecChevron');
+    let   editLoaded   = false;
+    editDetails.addEventListener('toggle', async () => {
+      editChevron.style.transform = editDetails.open ? 'rotate(90deg)' : '';
+      if (!editDetails.open || editLoaded) return;
+      editLoaded = true;
+      const form = $('ldEditSpecForm');
+      try {
+        const prof = await api('/api/loading/my-programs');
+        const c = prof.credentials || {};
+        const arr = (v, n) => { const a = Array.isArray(v) ? v.slice(0, n) : []; while (a.length < n) a.push(''); return a; };
+        const specInputs = arr(c.specializations, 3).map((v, i) =>
+          `<input class="form-input edit-spec-input" style="margin-bottom:6px;" placeholder="Specialization ${i+1}${i===0?' (required)':''}" value="${escHtml(v)}">`).join('');
+        const eduInputs = arr(c.education, 3).map((v, i) =>
+          `<input class="form-input edit-edu-input" style="margin-bottom:6px;" placeholder="Degree ${i+1} (e.g. MIT, BSIT)" value="${escHtml(v)}">`).join('');
+        const progChks = ['BSA','BSBAFM','BSEDEN','BSENT','BSHM','BSIT','BSPSY','DIT'].map(p => {
+          const sel = (c.preferred_programs||[]).includes(p);
+          return `<label style="display:flex;align-items:center;gap:6px;font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid ${sel?'var(--maroon)':'var(--border)'};background:${sel?'#fff0f0':'transparent'};cursor:pointer;">
+            <input type="checkbox" class="edit-prog-chk" value="${p}" ${sel?'checked':''}> ${p}
+          </label>`;
+        }).join('');
+        form.innerHTML = `
+          <div class="form-row" style="margin-bottom:12px;">
+            <div class="form-group"><label class="form-label">Academic Title</label>
+              <input class="form-input" id="editCredTitle" value="${escHtml(c.academic_title||'')}" placeholder="e.g. Assistant Professor 1"></div>
+          </div>
+          <div class="form-group"><label class="form-label">Specializations <span style="color:var(--maroon);">*</span></label>${specInputs}</div>
+          <div class="form-group"><label class="form-label">Educational Background</label>${eduInputs}</div>
+          <div class="form-group">
+            <label class="form-label">Preferred Programs</label>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px;">${progChks}</div>
+          </div>
+          ${buildPortfolioSection(c, 'edit')}
+          ${(state.user.employment_type||'').toLowerCase()==='part_time' ? `
+          <div class="form-group" style="border-top:1px solid var(--border,#e2e8f0);padding-top:16px;margin-top:8px;">
+            <label class="form-label" style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+              <i class="fas fa-clock" style="color:var(--maroon);font-size:13px;"></i>Preferred Schedule
+              <span style="background:#fef3c7;color:#92400e;font-size:11px;padding:2px 8px;border-radius:20px;font-weight:700;">Part-Time</span>
+            </label>
+            <p style="font-size:12px;color:var(--text-light);margin:0 0 12px;">Add each day you are available and the time window for that day.</p>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 32px;gap:8px;margin-bottom:6px;padding:0 2px;">
+              <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">Day</div>
+              <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">From</div>
+              <div style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;">To</div>
+              <div></div>
+            </div>
+            <div id="editSchedRows"></div>
+            <button type="button" class="btn btn-secondary btn-sm" id="editAddSchedRow" style="margin-top:8px;font-size:12px;">
+              <i class="fas fa-plus"></i> Add Day
+            </button>
+          </div>` : ''}
+          <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <button class="btn btn-primary" id="editCredSave"><i class="fas fa-paper-plane"></i> Save & Resubmit for Review</button>
+            <span style="font-size:12px;color:var(--text-light);">Your profile status will reset to Pending until admin re-reviews.</span>
+          </div>`;
+
+        // Init edit schedule rows (part-time only)
+        if ((state.user.employment_type||'').toLowerCase() === 'part_time') {
+          const _EDIT_DAYS  = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+          const _EDIT_SLOTS = (() => {
+            const s = [];
+            for (let h = 7; h <= 21; h++) {
+              ['00','30'].forEach(m => {
+                if (h === 21 && m === '30') return;
+                const val = `${String(h).padStart(2,'0')}:${m}`;
+                s.push({ val, label: val });
+              });
+            }
+            return s;
+          })();
+          const _EDIT_TIME_OPTS = `<option value="">--</option>` +
+            _EDIT_SLOTS.map(s => `<option value="${s.val}">${s.label}</option>`).join('');
+          const _savedEditRows = Array.isArray(c.preferred_schedule) && c.preferred_schedule.length
+            ? c.preferred_schedule
+            : Array.isArray(c.preferred_days) && c.preferred_days.length
+              ? c.preferred_days.map(d => ({ day: d, from: c.preferred_time_from||'', to: c.preferred_time_to||'' }))
+              : [{ day: '', from: '', to: '' }];
+          window._editSchedRows = _savedEditRows.map(r => ({ ...r }));
+
+          function _setEditOpts(sel, val) { [...sel.options].forEach(o => { o.selected = o.value === val; }); }
+          window._renderEditSchedRows = () => {
+            const container = $('editSchedRows');
+            if (!container) return;
+            container.innerHTML = window._editSchedRows.map((row, i) => `
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr 32px;gap:8px;margin-bottom:8px;align-items:center;">
+                <select class="form-input form-select" id="esDay${i}" style="font-size:13px;">
+                  <option value="">-- Day --</option>
+                  ${_EDIT_DAYS.map(d => `<option value="${d}" ${row.day===d?'selected':''}>${d}</option>`).join('')}
+                </select>
+                <select class="form-input form-select" id="esFrom${i}" style="font-size:13px;">${_EDIT_TIME_OPTS}</select>
+                <select class="form-input form-select" id="esTo${i}"   style="font-size:13px;">${_EDIT_TIME_OPTS}</select>
+                <button type="button" onclick="window._removeEditSchedRow(${i})"
+                  style="width:32px;height:32px;border:1px solid #fca5a5;border-radius:6px;background:#fee2e2;color:#b91c1c;font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;">&times;</button>
+              </div>`).join('');
+            window._editSchedRows.forEach((row, i) => {
+              _setEditOpts($(`esFrom${i}`), row.from||'');
+              _setEditOpts($(`esTo${i}`),   row.to  ||'');
+              $(`esDay${i}` ).onchange = e => { window._editSchedRows[i].day  = e.target.value; };
+              $(`esFrom${i}`).onchange = e => { window._editSchedRows[i].from = e.target.value; };
+              $(`esTo${i}`  ).onchange = e => { window._editSchedRows[i].to   = e.target.value; };
+            });
+          };
+          window._removeEditSchedRow = (i) => {
+            window._editSchedRows.splice(i, 1);
+            if (!window._editSchedRows.length) window._editSchedRows.push({ day:'', from:'', to:'' });
+            window._renderEditSchedRows();
+          };
+          window._renderEditSchedRows();
+          const addEditBtn = $('editAddSchedRow');
+          if (addEditBtn) addEditBtn.onclick = () => { window._editSchedRows.push({day:'',from:'',to:''}); window._renderEditSchedRows(); };
+        }
+
+        $('editCredSave').onclick = async () => {
+          const specializations    = [...document.querySelectorAll('.edit-spec-input')].map(i=>i.value.trim()).filter(Boolean);
+          const education          = [...document.querySelectorAll('.edit-edu-input')].map(i=>i.value.trim()).filter(Boolean);
+          const preferred_programs = [...document.querySelectorAll('.edit-prog-chk:checked')].map(c=>c.value);
+          const academic_title     = ($('editCredTitle')?.value||'').trim();
+          if (!specializations.length) { showToast('Enter at least one specialization.','error'); return; }
+          if (!preferred_programs.length) { showToast('Select at least one preferred program.','error'); return; }
+          const isEditPartTime = (state.user.employment_type||'').toLowerCase() === 'part_time';
+          let preferred_schedule;
+          if (isEditPartTime) {
+            const rows = (window._editSchedRows||[]).filter(r => r.day||r.from||r.to);
+            for (const r of rows) {
+              if (!r.day) { showToast('Please select a day for every schedule row.','error'); return; }
+              if (r.from && r.to && r.from >= r.to) { showToast(`End time must be after start time for ${r.day}.`,'error'); return; }
+            }
+            preferred_schedule = rows;
+          }
+          try {
+            const updatedCred = { ...c, academic_title, specializations, education, preferred_programs, portfolio: collectPortfolio('edit') };
+            if (isEditPartTime) updatedCred.preferred_schedule = preferred_schedule;
+            await api('/api/auth/me',{ method:'PATCH', body:JSON.stringify({
+              first_name: state.user.first_name, last_name: state.user.last_name,
+              faculty_credentials: updatedCred,
+            })});
+            await api('/api/loading/profile/submit',{ method:'POST' });
+            showToast('Profile updated and resubmitted. You will be notified once programs are re-assigned.','success');
+            renderLoadingPage();
+          } catch(err) { showToast(err.message,'error'); }
+        };
+      } catch(err) {
+        form.innerHTML = `<p style="color:var(--text-light);">${escHtml(err.message)}</p>`;
+      }
+    });
+  }
+
+  async function loadScheduleGrid(term) {
+    const wrap = document.getElementById('ldGrid');
+    if (!wrap) return;
+    wrap.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
+    try {
+      const entries = await api(`/api/loading/schedule?term=${encodeURIComponent(term)}&mine=true&academic_year=${encodeURIComponent(state.activeYear||'')}`);
+      wrap.innerHTML = buildFacultyPersonalGrid(entries);
+    } catch (err) {
+      wrap.innerHTML = `<div class="empty-state"><p>${escHtml(err.message)}</p></div>`;
+    }
+  }
+
+  // ── Faculty personal timetable (own approved schedule only) ─────────────────
+  function buildFacultyPersonalGrid(entries) {
+    const DAYS  = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+    const SHORT = { Monday:'Mon',Tuesday:'Tue',Wednesday:'Wed',Thursday:'Thu',Friday:'Fri',Saturday:'Sat',Sunday:'Sun' };
+    const STEP  = 30;
+    const ROW_HEIGHT = 44;
+    const tmin  = t => {
+      if (!t) return 0;
+      const str = String(t).trim();
+      const ampm = str.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+      if (ampm) {
+        let h = parseInt(ampm[1], 10);
+        const m = parseInt(ampm[2], 10);
+        const ap = (ampm[3] || '').toUpperCase();
+        if (ap === 'PM' && h !== 12) h += 12;
+        if (ap === 'AM' && h === 12) h = 0;
+        return h * 60 + m;
+      }
+      const [h, m] = str.split(':');
+      return (+h || 0) * 60 + (+m || 0);
+    };
+    const fmt24 = m => { const h=Math.floor(m/60),mm=m%60; return `${String(h).padStart(2,'0')}:${String(mm).padStart(2,'0')}`; };
+
+    if (!entries.length) return `<div class="empty-state" style="padding:40px 0;"><i class="fas fa-calendar-times" style="font-size:32px;opacity:.3;"></i><h3 style="margin:12px 0 4px;">No approved schedule yet</h3><p style="color:var(--text-light);font-size:13px;">Your approved loading requests will appear here.</p></div>`;
+
+    const activeDays = entries.some(e => e.day_of_week === 'Sunday')
+      ? ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+      : ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const allStarts  = entries.map(e => tmin(e.start_time));
+    const allEnds    = entries.map(e => tmin(e.end_time));
+    const gridStart  = Math.floor(Math.min(...allStarts) / 60) * 60;
+    const gridEnd    = Math.ceil(Math.max(...allEnds) / 60) * 60;
+
+    const slots = [];
+    for (let t = gridStart; t < gridEnd; t += STEP) slots.push(t);
+
+    const covered = {};
+    let rows = '';
+
+    for (const slot of slots) {
+      const isHour     = slot % 60 === 0;
+      const timeTd = `<td style="
+        width:80px;min-width:80px;
+        background:${isHour ? '#f8f9fa' : '#fff'};
+        border-right:2px solid #dee2e6;
+        border-bottom:1px solid ${isHour ? '#ced4da' : '#f1f3f5'};
+        padding:0 10px;height:${ROW_HEIGHT}px;
+        vertical-align:top;
+        text-align:right;white-space:nowrap;">
+        <span style="display:block;position:relative;top:0;transform:translateY(-50%);font-size:11px;font-weight:${isHour ? '700' : '500'};color:${isHour ? '#495057' : '#6c757d'};">${fmt24(slot)}</span>
+      </td>`;
+
+      let dayCells = '';
+      for (const day of activeDays) {
+        if (covered[slot]?.[day]) { dayCells += ''; continue; }
+        const entry = entries.find(e => e.day_of_week === day && tmin(e.start_time) === slot);
+        if (entry) {
+          const span = Math.max(1, Math.round((tmin(entry.end_time) - tmin(entry.start_time)) / STEP));
+          for (let i = 1; i < span; i++) {
+            const cs = slot + i * STEP;
+            if (!covered[cs]) covered[cs] = {};
+            covered[cs][day] = true;
+          }
+          const bg  = _color(entry.subject_name);
+          const acc = _accent(entry.subject_name);
+          dayCells += `<td rowspan="${span}" class="course-timetable-slot course-timetable-slot--occupied" style="padding:0;border:1px solid #e9ecef;vertical-align:top;min-width:130px;">
+            <div class="course-timetable-event" style="background:${bg};border-left:4px solid ${acc};border-radius:6px;padding:7px 10px;height:100%;box-sizing:border-box;min-height:${span * ROW_HEIGHT}px;">
+              <div style="font-size:12px;font-weight:700;color:#1a1a2e;line-height:1.3;margin-bottom:4px;">${escHtml(entry.subject_name)}</div>
+              ${entry.section ? `<div style="display:inline-block;background:${acc};color:#fff;font-size:9px;font-weight:700;padding:2px 7px;border-radius:20px;margin-bottom:5px;letter-spacing:.3px;">${escHtml(entry.section)}</div>` : ''}
+              <div style="font-size:10.5px;color:#495057;margin-top:2px;">
+                <i class="fas fa-clock" style="color:${acc};font-size:9px;margin-right:4px;"></i>${fmt24(tmin(entry.start_time))} – ${fmt24(tmin(entry.end_time))}
+              </div>
+              ${entry.room ? `<div style="font-size:10.5px;color:#495057;margin-top:3px;"><i class="fas fa-map-marker-alt" style="color:${acc};font-size:9px;margin-right:4px;"></i>Room ${escHtml(entry.room)}</div>` : ''}
+            </div>
+          </td>`;
+        } else {
+          const inBlock = Object.keys(covered[slot]||{}).includes(day);
+          if (!inBlock) dayCells += `<td class="course-timetable-slot" style="border:1px solid #f1f3f5;height:${ROW_HEIGHT}px;background:#fdfdfe;"></td>`;
+        }
+      }
+      rows += `<tr>${timeTd}${dayCells}</tr>`;
+    }
+
+    if (!rows) return `<div class="empty-state" style="padding:40px 0;"><i class="fas fa-calendar-times" style="font-size:32px;opacity:.3;"></i><h3 style="margin:12px 0 4px;">No approved schedule yet</h3></div>`;
+
+    return `
+      <div class="course-timetable" style="overflow-x:auto;border-radius:10px;border:1px solid #dee2e6;box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+        <table class="course-timetable-table" style="border-collapse:collapse;width:100%;min-width:520px;font-family:inherit;background:var(--bg-card);">
+          <thead>
+            <tr>
+              <th class="course-timetable-time-head" style="background:#880808;color:#fff;padding:12px 10px;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;text-align:center;width:80px;border-right:2px solid rgba(255,255,255,.2);">TIME</th>
+              ${activeDays.map(d => `
+                <th class="course-timetable-day-head" style="background:#880808;color:#fff;padding:12px 8px;text-align:center;border-left:1px solid rgba(255,255,255,.15);min-width:130px;">
+                  <div style="font-size:13px;font-weight:700;letter-spacing:.3px;">${d}</div>
+                </th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+  }
+
+  // ── Shared grid constants ──────────────────────────────────────────────────
+  const _GRID_DAYS   = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const _GRID_SHORT  = { Monday:'Mon',Tuesday:'Tue',Wednesday:'Wed',Thursday:'Thu',Friday:'Fri',Saturday:'Sat' };
+  const _GRID_START  = 420, _GRID_END = 1230, _GRID_STEP = 30;
+  const _GRID_COLORS  = ['#fff3cd','#d1ecf1','#d4edda','#fce8d5','#f8d7da','#e2d9f3','#d0f0fd','#dff5e3'];
+  const _GRID_ACCENTS = ['#d4a017','#0c7b93','#1e7e34','#c96a1f','#b02a37','#6f42c1','#0077a8','#1a7d3c'];
+  const _tmin  = (t) => {
+    if (!t) return 0;
+    const str = String(t).trim();
+    const ampm = str.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+    if (ampm) {
+      let h = parseInt(ampm[1], 10);
+      const m = parseInt(ampm[2], 10);
+      const ap = (ampm[3] || '').toUpperCase();
+      if (ap === 'PM' && h !== 12) h += 12;
+      if (ap === 'AM' && h === 12) h = 0;
+      return h * 60 + m;
+    }
+    const [h, m] = str.split(':');
+    return (+h || 0) * 60 + (+m || 0);
+  };
+  const _fmt   = (m) => { const h=Math.floor(m/60),mm=m%60; return `${String(h).padStart(2,'0')}:${String(mm).padStart(2,'0')}`; };
+  const _color = (s) => { let h=0; for(const c of String(s)) h=(h*31+c.charCodeAt(0))>>>0; return _GRID_COLORS[h%_GRID_COLORS.length]; };
+  const _accent= (s) => { let h=0; for(const c of String(s)) h=(h*31+c.charCodeAt(0))>>>0; return _GRID_ACCENTS[h%_GRID_ACCENTS.length]; };
+  const _th    = (txt, w) => `<th style="background:var(--maroon,#880808);color:#fff;border:1px solid #6b0606;padding:6px 4px;font-size:11px;${w?`width:${w};`:''}">${txt}</th>`;
+
+  // Single program/dept grid
+  function buildScheduleGridHtml(entries) {
+    if (!entries.length) return `<div class="empty-state" style="padding:24px 0;"><i class="fas fa-calendar-times" style="font-size:28px;opacity:.3;"></i><p style="margin:8px 0 0;color:var(--text-light);font-size:13px;">No approved schedules yet.</p></div>`;
+
+    const activeDays = _GRID_DAYS;
+    const dayIndex = new Map(activeDays.map((day, index) => [day, index]));
+    const summaryId = `course-timetable-summary-${entries.reduce((hash, entry) => {
+      const key = `${entry.id || ''}${entry.day_of_week || ''}${entry.start_time || ''}`;
+      for (const char of key) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+      return hash;
+    }, 17)}`;
+    const usedStarts = entries.map(e => _tmin(e.start_time));
+    const usedEnds   = entries.map(e => _tmin(e.end_time));
+    const rangeStart = Math.floor(Math.min(...usedStarts) / 60) * 60;
+    const rangeEnd   = Math.ceil(Math.max(...usedEnds)   / 60) * 60 + _GRID_STEP;
+    const slotHeight = 44;
+    const slotCount = (rangeEnd - rangeStart) / _GRID_STEP;
+    const dayLayouts = new Map();
+
+    activeDays.forEach(day => {
+      const dayEntries = entries
+        .filter(entry => entry.day_of_week === day)
+        .slice()
+        .sort((a, b) => _tmin(a.start_time) - _tmin(b.start_time) || _tmin(a.end_time) - _tmin(b.end_time));
+      const layout = new Map();
+      let group = [];
+      let groupEnd = -Infinity;
+
+      const assignGroupLanes = () => {
+        if (!group.length) return;
+        const laneEnds = [];
+        group.forEach(entry => {
+          const start = _tmin(entry.start_time);
+          let lane = laneEnds.findIndex(end => end <= start);
+          if (lane === -1) lane = laneEnds.length;
+          laneEnds[lane] = _tmin(entry.end_time);
+          layout.set(entry, { lane });
+        });
+        group.forEach(entry => { layout.get(entry).laneCount = laneEnds.length; });
+      };
+
+      dayEntries.forEach(entry => {
+        const start = _tmin(entry.start_time);
+        if (group.length && start >= groupEnd) {
+          assignGroupLanes();
+          group = [];
+          groupEnd = -Infinity;
+        }
+        group.push(entry);
+        groupEnd = Math.max(groupEnd, _tmin(entry.end_time));
+      });
+      assignGroupLanes();
+      dayLayouts.set(day, layout);
+    });
+
+    const timeLabels = Array.from({ length: slotCount + 1 }, (_, index) => {
+      const isLast = index === slotCount;
+      const timeStr = _fmt(rangeStart + index * _GRID_STEP);
+      if (isLast) {
+        return `<div class="course-grid-time course-grid-time--last" style="height:0;padding:0 12px;transform:translateY(-50%);position:relative;z-index:2;line-height:1;font-size:10px;font-weight:700;color:var(--text-secondary,#555);text-align:right;">${timeStr}</div>`;
+      }
+      return `<div class="course-grid-time">${timeStr}</div>`;
+    }).join('');
+    const dayColumns = activeDays.map(day => {
+      const layout = dayLayouts.get(day);
+      const events = entries.filter(entry => entry.day_of_week === day).map(entry => {
+        const { lane, laneCount } = layout.get(entry);
+        const top = ((_tmin(entry.start_time) - rangeStart) / _GRID_STEP) * slotHeight;
+        const height = (((_tmin(entry.end_time) - _tmin(entry.start_time)) / _GRID_STEP) + 1) * slotHeight;
+        const bg = _color(entry.subject_name);
+        const accent = _accent(entry.subject_name);
+        return `<article class="course-grid-event" style="top:${top}px;height:${height}px;left:calc(${lane} * 100% / ${laneCount});width:calc(100% / ${laneCount});background:${bg};border-left-color:${accent};">
+          <h3>${escHtml(entry.subject_name)}</h3>
+          <p class="course-grid-faculty">${escHtml(entry.faculty_name || 'Faculty to be assigned')}</p>
+          ${entry.section ? `<span class="course-grid-section" style="background:${accent};">${escHtml(entry.section)}</span>` : ''}
+          <p class="course-grid-meta"><i class="fas fa-clock"></i> ${_fmt(_tmin(entry.start_time))} – ${_fmt(_tmin(entry.end_time))}</p>
+          ${entry.room ? `<p class="course-grid-meta"><i class="fas fa-map-marker-alt"></i> ${escHtml(entry.room)}</p>` : ''}
+        </article>`;
+      }).join('');
+      return `<section class="course-grid-day" aria-label="${day} schedule" style="height:${slotCount * slotHeight}px;">${events}</section>`;
+    }).join('');
+
+    const summaryRows = entries.slice().sort((a, b) =>
+      (dayIndex.get(a.day_of_week) ?? 99) - (dayIndex.get(b.day_of_week) ?? 99) || _tmin(a.start_time) - _tmin(b.start_time)
+    ).map(entry => `<li>
+      <span class="course-timetable-summary-day">${escHtml(_GRID_SHORT[entry.day_of_week] || entry.day_of_week)}</span>
+      <span><strong>${escHtml(entry.subject_name)}</strong>${entry.section ? ` · ${escHtml(entry.section)}` : ''}</span>
+      <span>${_fmt(_tmin(entry.start_time))}–${_fmt(_tmin(entry.end_time))}${entry.room ? ` · ${escHtml(entry.room)}` : ''}</span>
+    </li>`).join('');
+
+    return `<div class="course-timetable course-timetable--canvas">
+      <div class="course-grid" style="min-width:980px;">
+        <div class="course-grid-corner">Time</div>
+        ${activeDays.map(day => `<div class="course-grid-day-head">${day}</div>`).join('')}
+        <div class="course-grid-time-rail" style="height:${slotCount * slotHeight}px;">${timeLabels}</div>
+        ${dayColumns}
+      </div>
+    </div>
+    <details class="course-timetable-summary" id="${summaryId}">
+      <summary><span>All scheduled subjects</span><span>${entries.length} subject${entries.length === 1 ? '' : 's'}</span></summary>
+      <ul>${summaryRows}</ul>
+    </details>`;
+  }
+
+  // Overview summary card (admin only) — one row per program
+  function buildOverviewCard(entries) {
+    const programs = [...new Set(entries.map(e => e.program || 'General'))].sort();
+    const days = _GRID_DAYS;
+    const rows = programs.map(p => {
+      const pe = entries.filter(e => (e.program || 'General') === p);
+      const facultySet = new Set(pe.map(e => e.faculty_name));
+      const daySet = days.filter(d => pe.some(e => e.day_of_week === d));
+      return `<tr style="border-bottom:1px solid #e2e8f0;">
+        <td style="padding:8px 12px;font-weight:700;font-size:13px;">${escHtml(p)}</td>
+        <td style="padding:8px 12px;font-size:12px;text-align:center;">${pe.length}</td>
+        <td style="padding:8px 12px;font-size:12px;text-align:center;">${facultySet.size}</td>
+        <td style="padding:8px 12px;font-size:12px;">${daySet.map(d=>_GRID_SHORT[d]).join(', ') || '—'}</td>
+        <td style="padding:8px 12px;"><a href="#dept-${p.replace(/\s+/g,'-')}" style="font-size:12px;color:var(--maroon);text-decoration:none;"><i class="fas fa-arrow-down"></i> View</a></td>
+      </tr>`;
+    }).join('');
+    return `<div class="card" style="margin-bottom:20px;overflow:hidden;">
+      <div style="background:var(--maroon,#880808);color:#fff;padding:12px 16px;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;">
+        <i class="fas fa-table"></i> Schedule Overview — All Departments
+      </div>
+      <table style="border-collapse:collapse;width:100%;">
+        <thead><tr style="background:#f8fafc;font-size:11px;color:var(--text-light);text-transform:uppercase;">
+          <th style="padding:8px 12px;text-align:left;font-weight:700;">Program / Dept</th>
+          <th style="padding:8px 12px;text-align:center;font-weight:700;">Subjects</th>
+          <th style="padding:8px 12px;text-align:center;font-weight:700;">Faculty</th>
+          <th style="padding:8px 12px;text-align:left;font-weight:700;">Days</th>
+          <th style="padding:8px 12px;"></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }
+
+  // Grouped output: overview (admin) + one collapsible section per program
+  function buildAllDeptGrids(entries, isAdmin) {
+    if (!entries.length) {
+      return `<div class="empty-state"><i class="fas fa-calendar-times"></i><h3>No approved schedules yet</h3><p>Approve a loading request to see it here.</p></div>`;
+    }
+    const programs = [...new Set(entries.map(e => e.program || 'General'))].sort();
+    const overview = isAdmin ? buildOverviewCard(entries) : '';
+    const sections = programs.map(p => {
+      const pe = entries.filter(e => (e.program || 'General') === p);
+      const anchor = `dept-${p.replace(/\s+/g,'-')}`;
+      return `<details id="${anchor}" open style="margin-bottom:14px;">
+        <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg-card,#fff);border:1px solid var(--border,#e2e8f0);border-radius:8px;font-weight:700;font-size:14px;user-select:none;">
+          <i class="fas fa-chevron-right" style="font-size:11px;color:var(--text-light);transition:transform .2s;"></i>
+          <i class="fas fa-graduation-cap" style="color:var(--maroon,#880808);"></i>
+          ${escHtml(p)}
+          <span style="margin-left:auto;font-size:11px;font-weight:400;color:var(--text-light);">${pe.length} subject${pe.length!==1?'s':''} · ${new Set(pe.map(e=>e.faculty_name)).size} faculty</span>
+        </summary>
+        <div style="padding:10px 0 0 0;">${buildScheduleGridHtml(pe)}</div>
+      </details>`;
+    }).join('');
+    return overview + sections;
+  }
+
+  async function loadMyLoadingRequests() {
+    const wrap = document.getElementById('ldRequests');
+    if (!wrap) return;
+    try {
+      const rows = await api('/api/loading/requests/mine');
+      if (!rows.length) {
+        wrap.innerHTML = `<div class="empty-state"><i class="fas fa-clipboard-list"></i><h3>No requests yet</h3><p>Submit a request above to get started.</p></div>`;
+        return;
+      }
+      // Group requests by curriculum (program) + semester so the list stays organized.
+      const TERM_ORDER = { FIRST_SEMESTER: 0, SECOND_SEMESTER: 1, SUMMER: 2 };
+      const groups = new Map();
+      rows.forEach(r => {
+        const program = r.program || 'General';
+        const key = `${program}||${r.term}||${r.academic_year || ''}`;
+        if (!groups.has(key)) groups.set(key, { program, term: r.term, academic_year: r.academic_year, items: [] });
+        groups.get(key).items.push(r);
+      });
+      const sortedGroups = [...groups.values()].sort((a, b) =>
+        a.program.localeCompare(b.program) ||
+        (TERM_ORDER[a.term] ?? 9) - (TERM_ORDER[b.term] ?? 9) ||
+        String(b.academic_year || '').localeCompare(String(a.academic_year || ''))
+      );
+
+      const cardHtml = (r) => {
+        const s = LOADING_STATUS[r.status] || LOADING_STATUS.pending;
+        return `<div class="card" style="padding:14px 16px; margin-bottom:10px;">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+            <div style="min-width:0; overflow:hidden;">
+              <div style="font-weight:700; word-break:break-word; overflow-wrap:anywhere;">${escHtml(r.subject_name)}</div>
+              <div style="font-size:12px; color:var(--text-light); margin-top:2px;">
+                ${r.day_of_week} ${formatTime(r.start_time)}-${formatTime(r.end_time)}${r.room ? ' · ' + escHtml(r.room) : ''}${r.section ? ' · ' + escHtml(r.section) : ''}
+              </div>
+              ${r.admin_remarks ? `<div style="font-size:12px; margin-top:6px; color:var(--text-secondary,#555); word-break:break-word; overflow-wrap:anywhere;"><i class="fas fa-comment-dots"></i> ${escHtml(r.admin_remarks)}</div>` : ''}
+            </div>
+            <span style="background:${s.bg}; color:${s.color}; font-size:11px; font-weight:700; padding:3px 9px; border-radius:99px; white-space:nowrap;">${s.label}</span>
+          </div>
+          ${r.status === 'pending' ? `<div style="margin-top:10px;"><button class="btn btn-sm btn-secondary" onclick="window._withdrawLoading('${r.id}')"><i class="fas fa-times"></i> Withdraw</button></div>` : ''}
+          ${r.status === 'rejected' ? `<div style="margin-top:10px;">
+            ${r.is_available
+              ? `<button class="btn btn-sm btn-primary" onclick="window._resubmitLoading('${r.offering_id}')"><i class="fas fa-redo"></i> Resubmit</button>`
+              : `<span style="font-size:12px; color:var(--text-light);"><i class="fas fa-lock"></i> Slot already taken — resubmission unavailable</span>`}
+          </div>` : ''}
+        </div>`;
+      };
+
+      wrap.innerHTML = sortedGroups.map(g => {
+        const semester = TERM_LABELS[g.term] || g.term;
+        return `<div style="margin-bottom:18px;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+            <span style="background:var(--maroon,#880808); color:#fff; font-size:11px; font-weight:700; padding:3px 10px; border-radius:99px;"><i class="fas fa-graduation-cap"></i> ${escHtml(g.program)}</span>
+            <span style="font-size:13px; font-weight:700; color:var(--text-secondary,#333);">${escHtml(semester)}</span>
+            ${g.academic_year ? `<span style="font-size:12px; color:var(--text-light);">A.Y. ${escHtml(g.academic_year)}</span>` : ''}
+          </div>
+          ${g.items.map(cardHtml).join('')}
+        </div>`;
+      }).join('');
+    } catch (err) {
+      wrap.innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><p>${escHtml(err.message)}</p></div>`;
+    }
+  }
+
+  window._withdrawLoading = async (id) => {
+    if (!await showSystemConfirm('Withdraw this pending request?')) return;
+    try {
+      await api(`/api/loading/requests/${id}`, { method: 'DELETE' });
+      showToast('Request withdrawn.', 'success');
+      loadMyLoadingRequests();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  window._resubmitLoading = async (offeringId) => {
+    if (!await showSystemConfirm('Resubmit a request for this slot?')) return;
+    try {
+      await api('/api/loading/requests', { method: 'POST', body: JSON.stringify({ offering_id: offeringId }) });
+      showToast('Request resubmitted successfully.', 'success');
+      loadMyLoadingRequests();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  // ════════════════════════════════
+  //  ADMIN — LOADING MANAGEMENT (offerings + approvals)
+  // ════════════════════════════════
+  const LOADING_PROGRAMS = ['BSA', 'BSBAFM', 'BSEDEN', 'BSENT', 'BSHM', 'BSIT', 'BSPSY', 'DIT'];
+
+  function buildYearOptions(selected) {
+    const cur = new Date().getFullYear();
+    const years = [];
+    for (let y = cur - 3; y <= cur + 10; y++) years.push(`${y}-${y+1}`);
+    return years.map(y => `<option value="${y}"${y === selected ? ' selected' : ''}>${y}</option>`).join('');
+  }
+
+  function buildTimeSelect(id, selected, style) {
+    const opts = ['<option value="">-- time --</option>'];
+    for (let h = 6; h <= 22; h++) {
+      for (const m of [0, 30]) {
+        if (h === 22 && m === 30) continue;
+        const val = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+        opts.push(`<option value="${val}"${selected === val ? ' selected' : ''}>${val}</option>`);
+      }
+    }
+    return `<select class="form-input form-select" id="${id}"${style ? ` style="${style}"` : ''}>${opts.join('')}</select>`;
+  }
+  const LOADING_TYPES = ['MAJOR', 'GEED', 'ELEC', 'NSTP', 'PATHFIT'];
+  const LOADING_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
+  function renderAdminLoading() {
+    const pageArea = document.getElementById('pageArea');
+    state._ldAdminTab  = state._ldAdminTab  || 'profiles';
+    state._ldAdminTerm = state._ldAdminTerm || state.activeTerm || 'FIRST_SEMESTER';
+    state._ldAdminYear = state._ldAdminYear || state.activeYear || '2025-2026';
+    pageArea.innerHTML = `
+      <div class="page-header">
+        <h1 class="page-title">Course Preference</h1>
+        <p class="page-subtitle">Define subject offerings, then review faculty course preferences.</p>
+      </div>
+      <div class="page-content">
+
+        <!-- Semester control bar -->
+        <div style="background:var(--bg-card,#fff);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;flex-wrap:nowrap;overflow-x:auto;">
+          <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-light);white-space:nowrap;">Viewing</span>
+          <select class="form-input form-select" id="ldaYear" style="width:130px;min-width:130px;font-size:13px;">
+            ${buildYearOptions(state._ldAdminYear)}
+          </select>
+          <select class="form-input form-select" id="ldaTerm" style="width:160px;min-width:160px;font-size:13px;">
+            ${Object.entries(TERM_LABELS).map(([v, l]) => `<option value="${v}"${v === state._ldAdminTerm ? ' selected' : ''}>${l}</option>`).join('')}
+          </select>
+          <div style="flex:1;"></div>
+          <div class="active-term-banner">
+            <i class="fas fa-circle" style="font-size:7px;color:#15803d;"></i>
+            <span style="font-size:12px;color:#15803d;">Active semester:</span>
+            <strong id="ldaActiveTermLabel" style="font-size:13px;color:#14532d;">${state.activeYear} · ${TERM_LABELS[state.activeTerm] || state.activeTerm}</strong>
+          </div>
+          <button class="btn btn-sm btn-primary" id="ldaSetActiveTerm" style="font-size:12px;white-space:nowrap;flex-shrink:0;">
+            <i class="fas fa-check-circle"></i> Set as Active
+          </button>
+        </div>
+
+        <!-- Tab bar -->
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:16px;padding-bottom:2px;">
+          <button class="btn btn-sm ${state._ldAdminTab === 'profiles' ? 'btn-primary' : 'btn-secondary'}" id="ldaTabProf">Faculty Profiles</button>
+          <button class="btn btn-sm ${state._ldAdminTab === 'offerings' ? 'btn-primary' : 'btn-secondary'}" id="ldaTabOff">Offerings</button>
+          <button class="btn btn-sm ${state._ldAdminTab === 'requests' ? 'btn-primary' : 'btn-secondary'}" id="ldaTabReq">Requests</button>
+          <button class="btn btn-sm ${state._ldAdminTab === 'timetable' ? 'btn-primary' : 'btn-secondary'}" id="ldaTabGrid">Timetable</button>
+          <div style="flex:1;"></div>
+          <a class="btn btn-sm btn-secondary" id="ldaExport" href="#"><i class="fas fa-file-csv"></i> Export approved</a>
+        </div>
+
+        <div id="ldaBody"><div class="loader"><div class="spinner"></div></div></div>
+      </div>`;
+
+    const yearSel = document.getElementById('ldaYear');
+    const termSel = document.getElementById('ldaTerm');
+    yearSel.onchange = () => { state._ldAdminYear = yearSel.value; renderAdminLoadingBody(); };
+    termSel.onchange = () => { state._ldAdminTerm = termSel.value; renderAdminLoadingBody(); };
+    document.getElementById('ldaSetActiveTerm').onclick = async () => {
+      const newYear = state._ldAdminYear;
+      const newTerm = state._ldAdminTerm;
+      try {
+        await api('/api/admin/system-settings', { method: 'POST', body: JSON.stringify({ active_term: newTerm, active_year: newYear }) });
+        state.activeTerm = newTerm;
+        state.activeYear = newYear;
+        document.getElementById('ldaActiveTermLabel').textContent = `${newYear} · ${TERM_LABELS[newTerm] || newTerm}`;
+        showToast(`Active period set to ${newYear} · ${TERM_LABELS[newTerm] || newTerm}.`, 'success');
+      } catch (err) { showToast(err.message, 'error'); }
+    };
+    document.getElementById('ldaTabProf').onclick = () => { state._ldAdminTab = 'profiles'; renderAdminLoading(); };
+    document.getElementById('ldaTabOff').onclick = () => { state._ldAdminTab = 'offerings'; renderAdminLoading(); };
+    document.getElementById('ldaTabReq').onclick = () => { state._ldAdminTab = 'requests'; renderAdminLoading(); };
+    document.getElementById('ldaTabGrid').onclick = () => { state._ldAdminTab = 'timetable'; renderAdminLoading(); };
+    document.getElementById('ldaExport').onclick = async (e) => {
+      e.preventDefault();
+      try {
+        const res = await fetch(`/api/loading/admin/export?term=${state._ldAdminTerm}&academic_year=${encodeURIComponent(state._ldAdminYear||'')}`, {
+          headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+        });
+        if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || 'Export failed'); }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = `loading-${state._ldAdminTerm}.csv`; a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) { showToast(err.message, 'error'); }
+    };
+    renderAdminLoadingBody();
+  }
+
+  async function renderAdminLoadingBody() {
+    if (state._ldAdminTab === 'profiles')  return renderAdminProfiles();
+    if (state._ldAdminTab === 'offerings') return renderAdminOfferings();
+    if (state._ldAdminTab === 'timetable') return renderAdminTimetable();
+    return renderAdminRequests();
+  }
+
+  window._toggleFacultyAccordion = (id) => {
+    const body = document.getElementById(`prof-body-${id}`);
+    const chevron = document.getElementById(`prof-chevron-${id}`);
+    if (!body) return;
+    const isHidden = body.style.display === 'none';
+    body.style.display = isHidden ? 'block' : 'none';
+    if (chevron) {
+      chevron.style.transform = isHidden ? 'rotate(180deg)' : 'rotate(0deg)';
+    }
+  };
+
+  async function renderAdminProfiles() {
+    const body = document.getElementById('ldaBody');
+    body.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
+    try {
+      const faculty = await api('/api/loading/admin/profiles');
+      if (!faculty.length) {
+        body.innerHTML = `<div class="empty-state"><i class="fas fa-users"></i><h3>No faculty accounts yet</h3><p>Faculty will appear here once they register.</p></div>`;
+        return;
+      }
+      const STATUS_STYLE = {
+        pending:  { bg:'#fef9c3', color:'#b45309', label:'Pending Review' },
+        approved: { bg:'#dcfce7', color:'#15803d', label:'Approved' },
+        rejected: { bg:'#fee2e2', color:'#b91c1c', label:'Needs Revision' },
+        null:     { bg:'#f1f5f9', color:'#64748b', label:'Not Submitted' },
+      };
+      body.innerHTML = faculty.map(f => {
+        const s = STATUS_STYLE[f.status] || STATUS_STYLE['null'];
+        const cred = f.credentials || {};
+        const specs = cred.specializations?.filter(Boolean) || [];
+        const edu = cred.education?.filter(Boolean) || [];
+        const assigned = Array.isArray(f.assigned_programs) ? f.assigned_programs : [];
+        const isPending = f.status === 'pending';
+        const isApproved = f.status === 'approved';
+        const isPartTimeFaculty = (f.employment_type || '') === 'part_time';
+        const fmt24 = t => { if (!t) return ''; const [h,m] = t.split(':'); return `${String(parseInt(h, 10)).padStart(2,'0')}:${m}`; };
+        // ── Reusable panel + section-label styling for an organized layout ──────
+        const labelCss  = 'font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--maroon,#880808);margin-bottom:10px;';
+        const panelCss  = 'background:var(--bg-soft,#f8fafc);border:1px solid var(--border,#e2e8f0);border-radius:12px;padding:16px 18px;';
+        const panel = (title, icon, inner) => `<div style="${panelCss}">
+          <div style="${labelCss}">${icon ? `<i class="fas ${icon}" style="margin-right:6px;"></i>` : ''}${title}</div>
+          ${inner}
+        </div>`;
+        const bullet = txt => `<div style="font-size:14px;padding:3px 0;display:flex;align-items:flex-start;gap:8px;"><i class="fas fa-circle" style="font-size:5px;color:var(--maroon,#880808);margin-top:7px;flex-shrink:0;"></i><span>${escHtml(txt)}</span></div>`;
+
+        // Left panel: specializations + education + academic title
+        const profilePanel = panel('Profile', 'fa-id-badge', `
+          <div style="font-size:11px;font-weight:700;color:var(--text-light);margin-bottom:4px;">Specializations</div>
+          ${specs.length ? specs.map(bullet).join('') : '<div style="font-size:13px;color:var(--text-light);font-style:italic;">None submitted yet.</div>'}
+          ${edu.length ? `<div style="font-size:11px;font-weight:700;color:var(--text-light);margin:12px 0 4px;">Educational Background</div>${edu.map(bullet).join('')}` : ''}
+          ${cred.academic_title ? `<div style="margin-top:12px;font-size:13px;color:var(--text-secondary,#555);">Academic Title: <strong style="color:var(--text-primary,#111);">${escHtml(cred.academic_title)}</strong></div>` : ''}
+        `);
+
+        // Right panel: faculty-requested programs
+        const requestedPanel = cred.preferred_programs?.length ? panel('Requested Programs', 'fa-star', `
+          <div style="font-size:11px;color:var(--text-light);margin:-4px 0 10px;">Faculty preference</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            ${cred.preferred_programs.map(p=>`<span style="background:#fff0f0;color:var(--maroon);font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px;border:1px solid #fca5a5;">${escHtml(p)}</span>`).join('')}
+          </div>
+        `) : '';
+
+        // Part-time preferred schedule panel
+        const schedPanel = (() => {
+          if (!isPartTimeFaculty) return '';
+          const sched = Array.isArray(cred.preferred_schedule) && cred.preferred_schedule.length
+            ? cred.preferred_schedule
+            : Array.isArray(cred.preferred_days) && cred.preferred_days.length
+              ? cred.preferred_days.map(d => ({ day: d, from: cred.preferred_time_from||'', to: cred.preferred_time_to||'' }))
+              : [];
+          if (!sched.length) return '';
+          return `<div class="lda-pt-sched-panel" style="border-radius:12px;padding:16px 18px;border:1px solid var(--border);">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:#92400e;margin-bottom:10px;"><i class="fas fa-clock" style="margin-right:6px;"></i>Preferred Schedule (Part-Time)</div>
+            <div style="display:grid;grid-template-columns:auto auto auto auto;gap:6px 12px;align-items:center;">
+              ${sched.map(r => `
+                <span style="font-size:13px;font-weight:700;color:#92400e;">${escHtml(r.day||'')}</span>
+                <span style="font-size:13px;">${r.from ? fmt24(r.from) : '–'}</span>
+                <span style="font-size:13px;text-align:center;">→</span>
+                <span style="font-size:13px;">${r.to ? fmt24(r.to) : ''}</span>
+              `).join('')}
+            </div>
+          </div>`;
+        })();
+
+        // Portfolio links (full width, with URL wrapping so long links never overflow)
+        const portfolioPanel = (() => {
+          const port = cred.portfolio || {};
+          const hasAny = _PORT_CATS.some(cat => (port[cat.key]||[]).some(e => e.title || e.url));
+          if (!hasAny) return '';
+          return panel('Portfolio Links (Last 3 Years)', 'fa-link', `
+            ${_PORT_CATS.map(cat => {
+              const items = (port[cat.key]||[]).filter(e => e.title || e.url);
+              if (!items.length) return '';
+              const fieldLabel = 'font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--text-light);min-width:46px;flex-shrink:0;';
+              return `<div style="margin-bottom:12px;">
+                <div style="font-size:12px;font-weight:700;color:#b91c1c;margin-bottom:6px;">${cat.label}</div>
+                ${items.map(e => `<div style="border:1px solid var(--border,#e2e8f0);border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--bg-card,#fff);">
+                  <div style="display:flex;gap:10px;font-size:13px;line-height:1.5;${e.url?'margin-bottom:6px;':''}">
+                    <span style="${fieldLabel}">Title</span>
+                    <span style="font-weight:600;">${e.title ? escHtml(e.title) : '<span style="color:var(--text-light);font-weight:400;font-style:italic;">Untitled</span>'}</span>
+                  </div>
+                  ${e.url ? `<div style="display:flex;gap:10px;font-size:13px;line-height:1.5;">
+                    <span style="${fieldLabel}">Link</span>
+                    <a href="${escHtml(e.url)}" target="_blank" rel="noopener" style="color:var(--maroon);word-break:break-all;overflow-wrap:anywhere;">${escHtml(e.url)}</a>
+                  </div>` : ''}
+                </div>`).join('')}
+              </div>`;
+            }).join('')}
+          `);
+        })();
+
+        return `<div class="card faculty-accordion-card" style="margin-bottom:18px;border:1px solid var(--border);border-radius:12px;overflow:hidden;padding:0;" id="prof-${f.id}">
+          <div class="faculty-accordion-header" onclick="window._toggleFacultyAccordion('${f.id}')" style="display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;padding:18px 22px;cursor:pointer;background:var(--bg-card);transition:background .2s;">
+            <div style="display:flex;align-items:center;gap:12px;">
+              <div style="width:38px;height:38px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:grid;place-items:center;font-weight:700;font-size:14px;flex-shrink:0;">
+                ${getInitials(`${f.first_name} ${f.last_name}`)}
+              </div>
+              <div>
+                <div style="font-weight:800;font-size:17px;letter-spacing:-.2px;color:var(--text-primary);">${escHtml(f.last_name)}, ${escHtml(f.first_name)}
+                  ${isPartTimeFaculty ? `<span style="background:#fef3c7;color:#92400e;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:8px;vertical-align:middle;">Part-Time</span>` : `<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:8px;vertical-align:middle;">Full-Time</span>`}
+                </div>
+                ${(f.position||f.department) ? `<div style="font-size:12px;color:var(--text-light);margin-top:2px;">${escHtml(f.position||'')}${f.department?' · '+escHtml(f.department):''}</div>` : ''}
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span style="background:${s.bg};color:${s.color};font-size:12px;font-weight:700;padding:4px 12px;border-radius:99px;white-space:nowrap;">${s.label}</span>
+              <span id="prof-chevron-${f.id}" style="font-size:13px;color:var(--text-light);transition:transform .2s;"><i class="fas fa-chevron-down"></i></span>
+            </div>
+          </div>
+
+          <div id="prof-body-${f.id}" class="faculty-accordion-body" style="display:none;padding:20px 24px;border-top:1px solid var(--border);background:var(--bg-card);">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">
+              ${profilePanel}
+              ${requestedPanel}
+              ${schedPanel}
+            </div>
+
+            ${portfolioPanel ? `<div style="margin-top:14px;">${portfolioPanel}</div>` : ''}
+
+            <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:18px;">
+              <div style="font-size:13px;font-weight:800;margin-bottom:12px;"><i class="fas fa-sliders-h" style="margin-right:6px;color:var(--maroon,#880808);"></i>Assign Programs</div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:18px;">
+                ${['BSA','BSBAFM','BSEDEN','BSENT','BSHM','BSIT','BSPSY','DIT'].map(p => {
+                  const isAssigned   = assigned.includes(p);
+                  const isPreferred  = !isAssigned && (cred.preferred_programs || []).includes(p);
+                  const border = isAssigned ? 'var(--maroon)' : isPreferred ? '#93c5fd' : 'var(--border)';
+                  const bg     = isAssigned ? '#fff0f0'       : isPreferred ? '#eff6ff' : 'var(--bg-card,#fff)';
+                  return `<label style="display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid ${border};background:${bg};transition:border-color .15s;" title="${isPreferred?'Faculty requested this program':''}">
+                    <input type="checkbox" class="prog-chk-${f.id}" value="${p}" ${isAssigned||isPreferred?'checked':''} style="width:16px;height:16px;cursor:pointer;accent-color:var(--maroon,#880808);"> ${p}${isPreferred?` <span style="font-size:10px;font-weight:700;color:#1d4ed8;">requested</span>`:''}
+                  </label>`;
+                }).join('')}
+              </div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                ${(isPending || !isApproved) ? `<button class="btn btn-primary" onclick="window._approveProfile('${f.id}')"><i class="fas fa-check"></i> Approve & Assign</button>` : ''}
+                ${isApproved ? `<button class="btn btn-secondary" onclick="window._updatePrograms('${f.id}')"><i class="fas fa-save"></i> Update Programs</button>` : ''}
+                ${isPending ? `<button class="btn btn-secondary" onclick="window._rejectProfile('${f.id}')"><i class="fas fa-undo"></i> Return for Revision</button>` : ''}
+              </div>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (err) {
+      body.innerHTML = `<div class="empty-state"><p>${escHtml(err.message)}</p></div>`;
+    }
+  }
+
+  function _getCheckedPrograms(facultyId) {
+    return [...document.querySelectorAll(`.prog-chk-${facultyId}:checked`)].map(c => c.value);
+  }
+
+  window._approveProfile = async (id) => {
+    const programs = _getCheckedPrograms(id);
+    if (!programs.length) { showToast('Select at least one program to assign.', 'error'); return; }
+    try {
+      await api(`/api/loading/admin/profiles/${id}/approve`, { method:'POST', body:JSON.stringify({ programs }) });
+      showToast('Profile approved and programs assigned.', 'success');
+      renderAdminProfiles();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  window._updatePrograms = async (id) => {
+    const programs = _getCheckedPrograms(id);
+    try {
+      await api(`/api/loading/admin/profiles/${id}/programs`, { method:'PUT', body:JSON.stringify({ programs }) });
+      showToast('Programs updated.', 'success');
+      renderAdminProfiles();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  window._rejectProfile = async (id) => {
+    const remarks = await showSystemPrompt('What does the faculty need to fix or add?');
+    if (remarks === null) return;
+    if (!remarks.trim()) { showToast('Please provide remarks.', 'error'); return; }
+    try {
+      await api(`/api/loading/admin/profiles/${id}/reject`, { method:'POST', body:JSON.stringify({ remarks }) });
+      showToast('Returned for revision.', 'success');
+      renderAdminProfiles();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  window._unapproveProfile = (id) => {
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.style.zIndex = '99999';
+      overlay.innerHTML = `
+        <div class="modal modal-sm" style="max-width:440px;transform:scale(0.95);transition:transform 0.2s ease-out;">
+          <div class="modal-header" style="border-bottom:1px solid var(--border);padding:14px 18px;">
+            <h3 class="modal-title" style="font-size:16px;font-weight:700;color:var(--text-primary);display:flex;align-items:center;gap:8px;margin:0;">
+              <i class="fas fa-ban" style="color:#b91c1c;"></i> Unapprove Faculty
+            </h3>
+          </div>
+          <div class="modal-body" style="padding:18px;display:flex;flex-direction:column;gap:14px;">
+            <div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:10px 14px;font-size:13px;color:#b91c1c;line-height:1.5;">
+              <i class="fas fa-exclamation-triangle" style="margin-right:6px;"></i>
+              This will remove the faculty's assigned programs. They will need to re-submit their specialization for admin review before they can request subjects again.
+            </div>
+            <div>
+              <label style="font-size:12px;font-weight:700;color:var(--text-secondary);display:block;margin-bottom:6px;">
+                Reason for unapproving <span style="color:var(--text-light);font-weight:400;">(shown to the faculty)</span>
+              </label>
+              <textarea id="unapproveRemarks" class="form-input" rows="3"
+                placeholder="e.g. Credentials need to be updated, specialization does not match assigned programs…"
+                style="width:100%;resize:vertical;font-size:13px;box-sizing:border-box;"></textarea>
+            </div>
+          </div>
+          <div class="modal-footer" style="border-top:1px solid var(--border);padding:12px 18px;display:flex;justify-content:flex-end;gap:10px;">
+            <button class="btn btn-secondary btn-sm" id="unapproveCancel">Cancel</button>
+            <button class="btn btn-sm" id="unapproveConfirm"
+              style="background:#b91c1c;color:#fff;border:none;">
+              <i class="fas fa-ban"></i> Unapprove
+            </button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      setTimeout(() => { const d = overlay.querySelector('.modal'); if (d) d.style.transform = 'scale(1)'; }, 10);
+
+      const close = () => {
+        const d = overlay.querySelector('.modal');
+        if (d) d.style.transform = 'scale(0.95)';
+        overlay.style.opacity = '0';
+        overlay.style.transition = 'opacity 0.15s ease-out';
+        setTimeout(() => { overlay.remove(); resolve(); }, 150);
+      };
+
+      overlay.querySelector('#unapproveCancel').onclick = close;
+      overlay.onclick = (e) => { if (e.target === overlay) close(); };
+      overlay.querySelector('#unapproveConfirm').onclick = async () => {
+        const remarks = overlay.querySelector('#unapproveRemarks').value.trim();
+        close();
+        try {
+          await api(`/api/loading/admin/profiles/${id}/unapprove`, { method:'POST', body:JSON.stringify({ remarks }) });
+          showToast('Faculty profile unapproved and programs cleared.', 'success');
+          renderAdminProfiles();
+        } catch (err) { showToast(err.message, 'error'); }
+      };
+    });
+  };
+
+  async function renderAdminTimetable() {
+    const body = document.getElementById('ldaBody');
+    body.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
+    try {
+      const entries = await api(`/api/loading/schedule?term=${state._ldAdminTerm}&academic_year=${encodeURIComponent(state._ldAdminYear||'')}`);
+      body.innerHTML = `<p style="font-size:13px;color:var(--text-light);margin:0 0 16px;">
+        Approved loads for <strong>${TERM_LABELS[state._ldAdminTerm] || state._ldAdminTerm}</strong> — separated by program/department.
+      </p>${buildAllDeptGrids(entries, true)}`;
+      _bindDetailsChevrons(body);
+    } catch (err) {
+      body.innerHTML = `<div class="empty-state"><p>${escHtml(err.message)}</p></div>`;
+    }
+  }
+
+  // Rotate chevron icon when a <details> opens/closes
+  function _bindDetailsChevrons(root) {
+    (root || document).querySelectorAll('details').forEach(det => {
+      const chevron = det.querySelector('summary .fa-chevron-right');
+      if (!chevron) return;
+      const update = () => chevron.style.transform = det.open ? 'rotate(90deg)' : '';
+      update();
+      det.addEventListener('toggle', update);
+    });
+  }
+
+  async function renderAdminOfferings() {
+    const body = document.getElementById('ldaBody');
+    body.innerHTML = `
+      <div class="card" style="padding:18px; margin-bottom:18px;">
+        <h3 style="margin:0 0 10px; font-size:15px;">Add Offering</h3>
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#1e40af;display:flex;gap:10px;align-items:flex-start;">
+          <i class="fas fa-info-circle" style="margin-top:1px;flex-shrink:0;"></i>
+          <span><strong>Conflict rules:</strong>
+            Same room + same day + overlapping time = blocked.
+            Same section + same day + overlapping time = blocked.
+            <strong>Parallel sections of the same subject are allowed — each needs a unique room.</strong>
+          </span>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Type</label>
+            <select class="form-input form-select" id="ofType">${LOADING_TYPES.map(t => `<option value="${t}">${t}</option>`).join('')}</select></div>
+          <div class="form-group"><label>Program</label>
+            <select class="form-input form-select" id="ofProgram"><option value="">-- select program --</option>${LOADING_PROGRAMS.map(p => `<option value="${p}">${p}</option>`).join('')}</select></div>
+          <div class="form-group"><label>Subject</label>
+            <select class="form-input form-select" id="ofCourse"><option value="">-- pick type/program --</option></select></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Section</label><input class="form-input" id="ofSection" placeholder="e.g. BSIT 1-1"></div>
+          <div class="form-group"><label>Day</label>
+            <select class="form-input form-select" id="ofDay">${LOADING_DAYS.map(d => `<option value="${d}">${d}</option>`).join('')}</select></div>
+          <div class="form-group"><label>Start</label>${buildTimeSelect('ofStart','')}</div>
+          <div class="form-group"><label>End</label>${buildTimeSelect('ofEnd','')}</div>
+          <div class="form-group"><label>Room</label><input class="form-input" id="ofRoom" placeholder="e.g. 201"></div>
+        </div>
+
+        <!-- Live conflict status banner -->
+        <div id="ofConflictStatus" style="display:none;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;display:flex;gap:10px;align-items:flex-start;"></div>
+
+        <button class="btn btn-primary" id="ofAdd" disabled style="opacity:.5;cursor:not-allowed;">
+          <i class="fas fa-plus"></i> Add Offering
+        </button>
+        <span id="ofAddHint" style="font-size:11px;color:var(--text-light);margin-left:10px;">Fill in day, start &amp; end time to enable.</span>
+      </div>
+      <div id="ldaOffList"><div class="loader"><div class="spinner"></div></div></div>`;
+
+    // ── Course cascade ────────────────────────────────────────────────────────
+    const typeSel = document.getElementById('ofType'), progSel = document.getElementById('ofProgram'),
+          courseSel = document.getElementById('ofCourse');
+    async function reloadCourses() {
+      if (!progSel.value) {
+        courseSel.innerHTML = `<option value="">-- select program first --</option>`;
+        courseSel.disabled = true;
+        return;
+      }
+      courseSel.disabled = false;
+      const q = new URLSearchParams({ type: typeSel.value, program: progSel.value });
+      try {
+        const courses = await api(`/api/loading/admin/courses?${q.toString()}`);
+        courseSel.innerHTML = `<option value="">-- Select subject --</option>` +
+          courses.map(c => `<option value="${c.id}" data-name="${escHtml(c.subject_name)}" data-code="${escHtml(c.subject_code || '')}" data-program="${escHtml(c.program || '')}">${escHtml(c.subject_name)}</option>`).join('');
+      } catch (err) { showToast(err.message, 'error'); }
+    }
+    typeSel.onchange = reloadCourses;
+    progSel.onchange = reloadCourses;
+    reloadCourses();
+
+    // ── Live conflict check ───────────────────────────────────────────────────
+    const statusDiv = document.getElementById('ofConflictStatus');
+    const addBtn    = document.getElementById('ofAdd');
+    const addHint   = document.getElementById('ofAddHint');
+    let _checkTimer = null;
+    let _conflictClear = false;
+
+    function setConflictStatus(state, msg) {
+      // state: 'checking' | 'clear' | 'conflict' | 'idle'
+      statusDiv.style.display = 'flex';
+      if (state === 'idle') { statusDiv.style.display = 'none'; return; }
+      const styles = {
+        checking: { bg:'#f8fafc', border:'#e2e8f0', color:'#64748b', icon:'fa-spinner fa-spin' },
+        clear:    { bg:'#f0fdf4', border:'#86efac', color:'#15803d', icon:'fa-check-circle'    },
+        conflict: { bg:'#fee2e2', border:'#fca5a5', color:'#b91c1c', icon:'fa-times-circle'    },
+      };
+      const s = styles[state] || styles.checking;
+      statusDiv.style.cssText = `display:flex;gap:10px;align-items:flex-start;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;background:${s.bg};border:1px solid ${s.border};color:${s.color};`;
+      statusDiv.innerHTML = `<i class="fas ${s.icon}" style="margin-top:2px;flex-shrink:0;font-size:15px;"></i><span>${escHtml(msg)}</span>`;
+      _conflictClear = (state === 'clear');
+      const ready = _conflictClear && !!courseSel.value;
+      addBtn.disabled = !ready;
+      addBtn.style.opacity = ready ? '1' : '.5';
+      addBtn.style.cursor  = ready ? 'pointer' : 'not-allowed';
+      addHint.style.display = ready ? 'none' : 'inline';
+    }
+
+    async function runConflictCheck() {
+      const day   = document.getElementById('ofDay').value;
+      const start = document.getElementById('ofStart').value;
+      const end   = document.getElementById('ofEnd').value;
+      const room  = document.getElementById('ofRoom').value.trim();
+      const sec   = document.getElementById('ofSection').value.trim();
+
+      if (!start || !end) { setConflictStatus('idle', ''); return; }
+      if (start >= end)   { setConflictStatus('conflict', 'Start time must be before end time.'); return; }
+
+      setConflictStatus('checking', 'Checking for conflicts…');
+      try {
+        const result = await api('/api/loading/admin/offerings/check-conflict', {
+          method: 'POST',
+          body: JSON.stringify({
+            term: state._ldAdminTerm,
+            academic_year: state._ldAdminYear || null,
+            day_of_week: day,
+            start_time: start,
+            end_time: end,
+            room: room || null,
+            section: sec || null,
+            course_id: courseSel.value || null,
+          }),
+        });
+        if (result.clear === true)  setConflictStatus('clear',    result.message);
+        else if (result.clear === false) setConflictStatus('conflict', result.message);
+        else setConflictStatus('idle', '');
+      } catch (err) {
+        setConflictStatus('conflict', err.message);
+      }
+    }
+
+    function scheduleCheck() {
+      clearTimeout(_checkTimer);
+      _checkTimer = setTimeout(runConflictCheck, 600);
+    }
+
+    // Watch all schedule-related fields + course selection
+    ['ofDay','ofStart','ofEnd','ofRoom','ofSection'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', scheduleCheck);
+      if (el && el.type !== 'select-one') el.addEventListener('input', scheduleCheck);
+    });
+    // Re-run full conflict check (including duplicate subject+section) when course changes
+    courseSel.addEventListener('change', () => {
+      scheduleCheck();
+    });
+
+    // ── Submit ────────────────────────────────────────────────────────────────
+    addBtn.onclick = async () => {
+      const opt = courseSel.selectedOptions[0];
+      if (!courseSel.value) { showToast('Select a subject', 'error'); return; }
+      const payload = {
+        term: state._ldAdminTerm,
+        academic_year: state._ldAdminYear || null,
+        course_id: courseSel.value,
+        subject_name: opt.dataset.name,
+        subject_code: opt.dataset.code || null,
+        program: progSel.value || opt.dataset.program || null,
+        section: document.getElementById('ofSection').value.trim() || null,
+        day_of_week: document.getElementById('ofDay').value,
+        start_time: document.getElementById('ofStart').value,
+        end_time: document.getElementById('ofEnd').value,
+        room: document.getElementById('ofRoom').value.trim() || null,
+      };
+      addBtn.disabled = true;
+      try {
+        await api('/api/loading/admin/offerings', { method: 'POST', body: JSON.stringify(payload) });
+        showToast('Offering added.', 'success');
+        // Reset all form fields
+        document.getElementById('ofSection').value = '';
+        document.getElementById('ofRoom').value    = '';
+        // Reset dropdowns and trigger change so custom UI syncs
+        ['ofType','ofProgram','ofDay','ofStart','ofEnd'].forEach(id => {
+          const el = document.getElementById(id);
+          if (!el) return;
+          el.selectedIndex = 0;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        setConflictStatus('idle', '');
+        loadAdminOfferingList();
+      } catch (err) {
+        // Server-side double-check failed (race condition) — show the reason
+        setConflictStatus('conflict', err.message);
+      }
+    };
+
+    loadAdminOfferingList();
+  }
+
+  async function loadAdminOfferingList() {
+    const wrap = document.getElementById('ldaOffList');
+    if (!wrap) return;
+    try {
+      const rows = await api(`/api/loading/admin/offerings?term=${state._ldAdminTerm}&academic_year=${encodeURIComponent(state._ldAdminYear||'')}`);
+      state._adminOfferingsMap = new Map(rows.map(o => [String(o.id), o]));
+      if (!rows.length) { wrap.innerHTML = `<div class="empty-state"><i class="fas fa-list"></i><h3>No offerings yet</h3><p>Add offerings above so faculty can request them.</p></div>`; return; }
+
+      // Group by program
+      const byProgram = {};
+      rows.forEach(o => {
+        const prog = o.program || 'General';
+        if (!byProgram[prog]) byProgram[prog] = [];
+        byProgram[prog].push(o);
+      });
+
+      wrap.innerHTML = Object.keys(byProgram).sort().map(prog => {
+        const offerings = byProgram[prog];
+        const assignedCount = offerings.filter(o => !!o.approved_faculty).length;
+        const pendingCount  = offerings.filter(o => !o.approved_faculty && o.pending_count > 0).length;
+
+        const offRows = offerings.map(o => {
+          const taken = !!o.approved_faculty;
+          return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border);">
+            <div style="min-width:0;">
+              <div style="font-weight:700;font-size:14px;">${escHtml(o.subject_name)}</div>
+              <div style="font-size:12px;color:var(--text-light);margin-top:1px;">
+                ${o.day_of_week} ${formatTime(o.start_time)}–${formatTime(o.end_time)}${o.room ? ' · Room ' + escHtml(o.room) : ''}${o.section ? ' · ' + escHtml(o.section) : ''}
+              </div>
+              <div style="font-size:12px;margin-top:4px;">
+                ${taken
+                  ? `<span style="color:#15803d;"><i class="fas fa-check-circle"></i> Assigned: ${escHtml(o.approved_faculty)}</span>`
+                  : o.pending_count > 0
+                    ? `<span style="color:#b45309;"><i class="fas fa-hourglass-half"></i> ${o.pending_count} pending request${o.pending_count > 1 ? 's' : ''}</span>`
+                    : `<span style="color:var(--text-light);"><i class="fas fa-circle" style="font-size:7px;vertical-align:middle;"></i> No requests yet</span>`}
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+              <button class="btn btn-sm btn-secondary" onclick="window._editOffering('${o.id}')" title="Edit offering" style="padding:5px 9px;border-radius:6px;"><i class="fas fa-edit"></i></button>
+              <button class="btn btn-sm btn-secondary" onclick="window._delOffering('${o.id}')" title="Delete offering" style="padding:5px 9px;border-radius:6px;"><i class="fas fa-trash"></i></button>
+            </div>
+          </div>`;
+        }).join('');
+
+        return `<div style="margin-bottom:20px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <div style="background:var(--maroon,#880808);color:#fff;font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;padding:4px 12px;border-radius:6px;">${escHtml(prog)}</div>
+            <span style="font-size:12px;color:var(--text-light);">${offerings.length} offering${offerings.length !== 1 ? 's' : ''}${assignedCount ? ` · ${assignedCount} assigned` : ''}${pendingCount ? ` · ${pendingCount} with requests` : ''}</span>
+          </div>
+          <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--bg-card,#fff);">
+            ${offRows}
+          </div>
+        </div>`;
+      }).join('');
+
+    } catch (err) { wrap.innerHTML = `<div class="empty-state"><p>${escHtml(err.message)}</p></div>`; }
+  }
+
+  window._editOffering = async (id) => {
+    const o = state._adminOfferingsMap?.get(String(id));
+    if (!o) return;
+
+    const existingModal = document.getElementById('editOfferingModalOverlay');
+    if (existingModal) existingModal.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'editOfferingModalOverlay';
+    overlay.className = 'modal-overlay';
+    overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;position:fixed;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(3px);z-index:9999;padding:16px;';
+
+    overlay.innerHTML = `
+      <div class="modal card" style="max-width:620px;width:100%;max-height:90vh;overflow-y:auto;padding:24px;border-radius:12px;background:var(--bg-card,#fff);box-shadow:var(--shadow-lg);">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid var(--border);padding-bottom:12px;">
+          <h3 style="margin:0;font-size:16px;font-weight:800;color:var(--text-primary);display:flex;align-items:center;gap:8px;">
+            <i class="fas fa-edit" style="color:var(--primary,#880808);"></i> Edit Offering
+          </h3>
+          <button class="btn-icon" id="editOfCloseBtn" style="cursor:pointer;border:none;background:transparent;font-size:16px;color:var(--text-secondary);width:32px;height:32px;border-radius:6px;display:flex;align-items:center;justify-content:center;" title="Close"><i class="fas fa-times"></i></button>
+        </div>
+
+        <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#1e40af;display:flex;gap:10px;align-items:flex-start;">
+          <i class="fas fa-info-circle" style="margin-top:2px;flex-shrink:0;"></i>
+          <span>Modify offering details. Conflict checks will run in real time.</span>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group"><label>Type</label>
+            <select class="form-input form-select" id="ofEditType">
+              ${LOADING_TYPES.map(t => `<option value="${t}"${(o.subject_type || 'MAJOR') === t ? ' selected' : ''}>${t}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group"><label>Program</label>
+            <select class="form-input form-select" id="ofEditProgram">
+              <option value="">-- select program --</option>
+              ${LOADING_PROGRAMS.map(p => `<option value="${p}"${(o.program || '') === p ? ' selected' : ''}>${p}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group"><label>Subject</label>
+            <select class="form-input form-select" id="ofEditCourse">
+              <option value="${o.course_id || ''}" data-name="${escHtml(o.subject_name)}" data-code="${escHtml(o.subject_code || '')}" data-program="${escHtml(o.program || '')}" selected>${escHtml(o.subject_name)}</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group"><label>Section</label>
+            <input class="form-input" id="ofEditSection" placeholder="e.g. BSIT 1-1" value="${escHtml(o.section || '')}">
+          </div>
+          <div class="form-group"><label>Day</label>
+            <select class="form-input form-select" id="ofEditDay">
+              ${LOADING_DAYS.map(d => `<option value="${d}"${o.day_of_week === d ? ' selected' : ''}>${d}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group"><label>Start</label>
+            ${buildTimeSelect('ofEditStart', (o.start_time || '').slice(0, 5))}
+          </div>
+          <div class="form-group"><label>End</label>
+            ${buildTimeSelect('ofEditEnd', (o.end_time || '').slice(0, 5))}
+          </div>
+          <div class="form-group"><label>Room</label>
+            <input class="form-input" id="ofEditRoom" placeholder="e.g. 201" value="${escHtml(o.room || '')}">
+          </div>
+        </div>
+
+        <!-- Live conflict status banner for edit -->
+        <div id="ofEditConflictStatus" style="display:none;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;display:flex;gap:10px;align-items:flex-start;"></div>
+
+        <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px;border-top:1px solid var(--border);padding-top:14px;">
+          <button class="btn btn-secondary" id="ofEditCancel">Cancel</button>
+          <button class="btn btn-primary" id="ofEditSave"><i class="fas fa-save"></i> Save Changes</button>
+        </div>
+      </div>`;
+
+    document.body.appendChild(overlay);
+
+    const close = () => overlay.remove();
+    overlay.querySelector('#editOfCloseBtn').onclick = close;
+    overlay.querySelector('#ofEditCancel').onclick = close;
+    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+
+    // Course cascading
+    const typeSel = overlay.querySelector('#ofEditType');
+    const progSel = overlay.querySelector('#ofEditProgram');
+    const courseSel = overlay.querySelector('#ofEditCourse');
+    const statusDiv = overlay.querySelector('#ofEditConflictStatus');
+    const saveBtn = overlay.querySelector('#ofEditSave');
+
+    async function reloadCourses(preserveSelected) {
+      if (!progSel.value) {
+        courseSel.innerHTML = `<option value="">-- select program first --</option>`;
+        courseSel.disabled = true;
+        return;
+      }
+      courseSel.disabled = false;
+      const q = new URLSearchParams({ type: typeSel.value, program: progSel.value });
+      try {
+        const courses = await api(`/api/loading/admin/courses?${q.toString()}`);
+        courseSel.innerHTML = `<option value="">-- Select subject --</option>` +
+          courses.map(c => {
+            const sel = (preserveSelected && (c.id === o.course_id || c.subject_name === o.subject_name)) ? ' selected' : '';
+            return `<option value="${c.id}" data-name="${escHtml(c.subject_name)}" data-code="${escHtml(c.subject_code || '')}" data-program="${escHtml(c.program || '')}"${sel}>${escHtml(c.subject_name)}</option>`;
+          }).join('');
+      } catch (err) { showToast(err.message, 'error'); }
+    }
+
+    typeSel.onchange = () => { reloadCourses(false); scheduleCheck(); };
+    progSel.onchange = () => { reloadCourses(false); scheduleCheck(); };
+    reloadCourses(true);
+
+    // Live conflict check
+    let _editTimer = null;
+    function setEditConflictStatus(state, msg) {
+      statusDiv.style.display = 'flex';
+      if (state === 'idle') { statusDiv.style.display = 'none'; return; }
+      const styles = {
+        checking: { bg:'#f8fafc', border:'#e2e8f0', color:'#64748b', icon:'fa-spinner fa-spin' },
+        clear:    { bg:'#f0fdf4', border:'#86efac', color:'#15803d', icon:'fa-check-circle'    },
+        conflict: { bg:'#fee2e2', border:'#fca5a5', color:'#b91c1c', icon:'fa-times-circle'    },
+      };
+      const s = styles[state] || styles.checking;
+      statusDiv.style.cssText = `display:flex;gap:10px;align-items:flex-start;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;background:${s.bg};border:1px solid ${s.border};color:${s.color};`;
+      statusDiv.innerHTML = `<i class="fas ${s.icon}" style="margin-top:2px;flex-shrink:0;font-size:15px;"></i><span>${escHtml(msg)}</span>`;
+      const isClear = (state === 'clear');
+      saveBtn.disabled = !isClear;
+      saveBtn.style.opacity = isClear ? '1' : '.5';
+      saveBtn.style.cursor  = isClear ? 'pointer' : 'not-allowed';
+    }
+
+    async function runEditConflictCheck() {
+      const day   = overlay.querySelector('#ofEditDay').value;
+      const start = overlay.querySelector('#ofEditStart').value;
+      const end   = overlay.querySelector('#ofEditEnd').value;
+      const room  = overlay.querySelector('#ofEditRoom').value.trim();
+      const sec   = overlay.querySelector('#ofEditSection').value.trim();
+
+      if (!start || !end) { setEditConflictStatus('idle', ''); return; }
+      if (start >= end)   { setEditConflictStatus('conflict', 'Start time must be before end time.'); return; }
+
+      setEditConflictStatus('checking', 'Checking for conflicts…');
+      try {
+        const result = await api('/api/loading/admin/offerings/check-conflict', {
+          method: 'POST',
+          body: JSON.stringify({
+            term: o.term || state._ldAdminTerm,
+            academic_year: o.academic_year || state._ldAdminYear || null,
+            day_of_week: day,
+            start_time: start,
+            end_time: end,
+            room: room || null,
+            section: sec || null,
+            course_id: courseSel.value || o.course_id || null,
+            exclude_id: o.id,
+          }),
+        });
+        if (result.clear === true)  setEditConflictStatus('clear', result.message);
+        else if (result.clear === false) setEditConflictStatus('conflict', result.message);
+        else setEditConflictStatus('idle', '');
+      } catch (err) {
+        setEditConflictStatus('conflict', err.message);
+      }
+    }
+
+    function scheduleCheck() {
+      clearTimeout(_editTimer);
+      _editTimer = setTimeout(runEditConflictCheck, 500);
+    }
+
+    ['ofEditDay','ofEditStart','ofEditEnd','ofEditRoom','ofEditSection'].forEach(id => {
+      const el = overlay.querySelector('#' + id);
+      if (el) el.addEventListener('change', scheduleCheck);
+      if (el && el.type !== 'select-one') el.addEventListener('input', scheduleCheck);
+    });
+    courseSel.addEventListener('change', scheduleCheck);
+
+    // Initial conflict check
+    runEditConflictCheck();
+
+    // Submit edit
+    saveBtn.onclick = async () => {
+      const opt = courseSel.selectedOptions[0];
+      const selectedCourseId = courseSel.value || o.course_id || null;
+      const subName = opt?.dataset?.name || opt?.text || o.subject_name;
+      const subCode = opt?.dataset?.code || o.subject_code || null;
+      const prog = progSel.value || opt?.dataset?.program || o.program || null;
+      const sec = overlay.querySelector('#ofEditSection').value.trim() || null;
+      const day = overlay.querySelector('#ofEditDay').value;
+      const start = overlay.querySelector('#ofEditStart').value;
+      const end = overlay.querySelector('#ofEditEnd').value;
+      const room = overlay.querySelector('#ofEditRoom').value.trim() || null;
+
+      if (!start || !end) { showToast('Start and end time are required', 'error'); return; }
+      if (start >= end) { showToast('Start time must be before end time', 'error'); return; }
+
+      const payload = {
+        term: o.term || state._ldAdminTerm,
+        academic_year: o.academic_year || state._ldAdminYear || null,
+        course_id: selectedCourseId,
+        subject_name: subName,
+        subject_code: subCode,
+        program: prog,
+        section: sec,
+        day_of_week: day,
+        start_time: start,
+        end_time: end,
+        room: room,
+      };
+
+      saveBtn.disabled = true;
+      try {
+        await api(`/api/loading/admin/offerings/${o.id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        showToast('Offering updated successfully.', 'success');
+        close();
+        loadAdminOfferingList();
+      } catch (err) {
+        saveBtn.disabled = false;
+        setEditConflictStatus('conflict', err.message);
+        showToast(err.message, 'error');
+      }
+    };
+  };
+
+  window._delOffering = async (id) => {
+    if (!await showSystemConfirm('Delete this offering? Related requests will also be removed.')) return;
+    try {
+      await api(`/api/loading/admin/offerings/${id}`, { method: 'DELETE' });
+      showToast('Offering deleted.', 'success');
+      loadAdminOfferingList();
+    } catch (err) { showToast(err.message, 'error'); }
+  };
+
+  async function renderAdminRequests() {
+    const body = document.getElementById('ldaBody');
+    body.innerHTML = `<div class="loader"><div class="spinner"></div></div>`;
+    try {
+      const rows = await api(`/api/loading/admin/requests?term=${state._ldAdminTerm}&academic_year=${encodeURIComponent(state._ldAdminYear||'')}`);
+      if (!rows.length) { body.innerHTML = `<div class="empty-state"><i class="fas fa-inbox"></i><h3>No requests</h3><p>No loading requests for this term yet.</p></div>`; return; }
+
+      // Group: program → offering_id → [requests]
+      const byProgram = {};
+      rows.forEach(r => {
+        const prog = r.program || 'General';
+        if (!byProgram[prog]) byProgram[prog] = {};
+        if (!byProgram[prog][r.offering_id]) byProgram[prog][r.offering_id] = [];
+        byProgram[prog][r.offering_id].push(r);
+      });
+
+      const DAYS_LIST = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
+      body.innerHTML = Object.keys(byProgram).sort().map(prog => {
+        const offeringsMap = byProgram[prog];
+        const totalReqs = Object.values(offeringsMap).reduce((n, arr) => n + arr.length, 0);
+
+        const offeringsHtml = Object.values(offeringsMap).map(reqs => {
+          const o = reqs[0];
+          const hasApproved = reqs.some(r => r.status === 'approved');
+          const pendingCount = reqs.filter(r => r.status === 'pending').length;
+
+          const facultyRows = reqs.map(r => {
+            const s = LOADING_STATUS[r.status] || LOADING_STATUS.pending;
+            const isApproved = r.status === 'approved';
+            return `<div style="border-top:1px solid var(--border); padding:12px 0;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
+                <div style="min-width:0; overflow:hidden;">
+                  <div style="font-weight:600; font-size:14px; word-break:break-word; overflow-wrap:anywhere;">${escHtml(r.faculty_name)}
+                    <span style="background:${s.bg};color:${s.color};font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;margin-left:6px;">${s.label}</span>
+                  </div>
+                  <div style="font-size:12px; color:var(--text-light); margin-top:1px;">${escHtml(r.faculty_position || '')}${r.faculty_department ? ' · ' + escHtml(r.faculty_department) : ''}</div>
+                  ${r.remarks ? `<div style="font-size:12px; margin-top:4px; color:var(--text-secondary); word-break:break-word; overflow-wrap:anywhere; white-space:pre-wrap;"><i class="fas fa-comment" style="margin-right:4px;"></i>${escHtml(r.remarks)}</div>` : ''}
+                  ${renderCredentialsSummary(r.faculty_credentials)}
+                </div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap; flex-shrink:0;">
+                  ${(r.status === 'pending' || r.status === 'returned') ? `
+                    <button class="btn btn-sm btn-primary" onclick="window._reviewLoading('${r.id}','approve')" title="Assign this subject to ${escHtml(r.faculty_name)}. Other pending requests will be auto-denied.">
+                      <i class="fas fa-user-check"></i> Assign to ${escHtml(r.faculty_name.split(' ')[0])}
+                    </button>
+                    <button class="btn btn-sm btn-secondary" onclick="window._reviewLoading('${r.id}','return')">Return</button>
+                    <button class="btn btn-sm btn-secondary" onclick="window._reviewLoading('${r.id}','reject')">Reject</button>` : ''}
+                  ${isApproved ? `
+                    <button class="btn btn-sm" style="background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;font-size:12px;"
+                      onclick="window._toggleReschedule('${r.id}')">
+                      <i class="fas fa-pen"></i> Edit Schedule
+                    </button>` : ''}
+                </div>
+              </div>
+              ${isApproved ? `
+              <div id="rsp-${r.id}" data-offering-id="${o.offering_id}" class="sched-edit-panel" style="display:none; margin-top:12px; border-radius:10px; padding:14px 16px; border:1px solid var(--border);">
+                <div style="font-size:13px; font-weight:700; color:#c2410c; margin-bottom:10px;">
+                  <i class="fas fa-calendar-edit" style="margin-right:6px;"></i>Edit Schedule for ${escHtml(r.faculty_name)}
+                </div>
+                <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:10px; margin-bottom:10px;">
+                  <div>
+                    <label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-secondary);display:block;margin-bottom:4px;">Day</label>
+                    <select class="form-input form-select" id="rsp-day-${r.id}" style="font-size:13px;">
+                      ${DAYS_LIST.map(d => `<option value="${d}" ${d === o.day_of_week ? 'selected' : ''}>${d}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div>
+                    <label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-secondary);display:block;margin-bottom:4px;">Start</label>
+                    ${buildTimeSelect(`rsp-start-${r.id}`, o.start_time.slice(0,5), 'font-size:13px;')}
+                  </div>
+                  <div>
+                    <label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-secondary);display:block;margin-bottom:4px;">End</label>
+                    ${buildTimeSelect(`rsp-end-${r.id}`, o.end_time.slice(0,5), 'font-size:13px;')}
+                  </div>
+                  <div>
+                    <label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-secondary);display:block;margin-bottom:4px;">Room</label>
+                    <input type="text" class="form-input" id="rsp-room-${r.id}" value="${escHtml(o.room || '')}" placeholder="e.g. 201" style="font-size:13px;">
+                  </div>
+                </div>
+                <div id="rsp-status-${r.id}" style="display:none; border-radius:7px; padding:8px 12px; font-size:12px; margin-bottom:10px;"></div>
+                <div style="display:flex; gap:8px; align-items:center;">
+                  <button class="btn btn-primary btn-sm" id="rsp-save-${r.id}" onclick="window._saveReschedule('${r.id}')">
+                    <i class="fas fa-save"></i> Save Changes
+                  </button>
+                  <button class="btn btn-secondary btn-sm" onclick="window._toggleReschedule('${r.id}')">Cancel</button>
+                  <span style="font-size:11px;color:var(--text-light);margin-left:4px;"><i class="fas fa-info-circle"></i> Faculty will be notified of the change.</span>
+                </div>
+              </div>` : ''}
+            </div>`;
+          }).join('');
+
+          const statusBadge = hasApproved
+            ? `<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;">Assigned</span>`
+            : pendingCount > 0
+              ? `<span style="background:#fef9c3;color:#b45309;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;">${pendingCount} pending</span>`
+              : '';
+
+          return `<div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px;background:var(--bg-card,#fff);">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:2px;">
+              <div style="font-weight:700;font-size:14px;">${escHtml(o.subject_name)}</div>
+              ${statusBadge}
+            </div>
+            <div style="font-size:12px; color:var(--text-light); margin-bottom:8px;">
+              ${o.day_of_week} ${formatTime(o.start_time)}–${formatTime(o.end_time)}${o.room ? ' · Room ' + escHtml(o.room) : ''}${o.section ? ' · ' + escHtml(o.section) : ''}
+            </div>
+            ${facultyRows}
+          </div>`;
+        }).join('');
+
+        return `<div style="margin-bottom:24px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+            <div style="background:var(--maroon,#880808);color:#fff;font-size:11px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;padding:4px 12px;border-radius:6px;">${escHtml(prog)}</div>
+            <span style="font-size:12px;color:var(--text-light);">${totalReqs} request${totalReqs !== 1 ? 's' : ''}</span>
+          </div>
+          ${offeringsHtml}
+        </div>`;
+      }).join('');
+
+    } catch (err) { body.innerHTML = `<div class="empty-state"><p>${escHtml(err.message)}</p></div>`; }
+  }
+
+  function renderCredentialsSummary(c) {
+    if (!c || typeof c !== 'object') return '';
+    const line = (label, val) => {
+      const items = Array.isArray(val) ? val.filter(Boolean) : (val ? [val] : []);
+      return items.length ? `<div style="font-size:11px;"><strong>${label}:</strong> ${items.map(escHtml).join('; ')}</div>` : '';
+    };
+    const parts = [
+      line('Title', c.academic_title),
+      line('Specialization', c.specializations),
+      line('Education', c.education),
+      line('Research', c.research),
+      line('Trainings', c.trainings),
+      line('Extension', c.extension),
+      line('Awards', c.awards),
+    ].filter(Boolean);
+    if (!parts.length) return '';
+    return `<details style="margin-top:6px;"><summary style="font-size:11px; color:var(--maroon); cursor:pointer;">View credentials</summary>
+      <div style="margin-top:4px; padding:8px; background:var(--bg-soft,#f8fafc); border-radius:6px; display:flex; flex-direction:column; gap:3px;">${parts.join('')}</div></details>`;
+  }
+
+  // ── Conflict modal ─────────────────────────────────────────────────────────
+  function showConflictModal(data) {
+    document.getElementById('schedConflictModal')?.remove();
+    const fmt = t => {
+      if (!t) return '–';
+      const [h, m] = t.split(':');
+      const n = parseInt(h, 10);
+      return `${String(n).padStart(2, '0')}:${m}`;
+    };
+    const c   = data.conflict        || {};
+    const rec = data.recommendations || {};
+
+    const typeMeta = {
+      faculty: { icon: 'fa-user-clock',      color: '#1d4ed8', bg: '#dbeafe', border: '#93c5fd', label: 'Faculty Double-Booking' },
+      room:    { icon: 'fa-door-open',        color: '#b91c1c', bg: '#fee2e2', border: '#fca5a5', label: 'Room Already Occupied'   },
+      section: { icon: 'fa-users',            color: '#b45309', bg: '#fef3c7', border: '#fde68a', label: 'Section Conflict'        },
+    };
+    const tm = typeMeta[c.type] || typeMeta.room;
+
+    const pill = (txt, bg, color, border) =>
+      `<span style="background:${bg};color:${color};border:1px solid ${border};padding:3px 12px;border-radius:99px;font-size:12px;font-weight:700;white-space:nowrap;">${escHtml(txt)}</span>`;
+
+    const roomPills = rec.available_rooms?.length
+      ? rec.available_rooms.map(r => pill(r, '#dcfce7', '#15803d', '#86efac')).join('')
+      : `<span style="font-size:12px;color:var(--text-light);font-style:italic;">No free rooms found at this time.</span>`;
+
+    const timePills = rec.available_times?.length
+      ? rec.available_times.map(t => pill(`${fmt(t.from)} – ${fmt(t.to)}`, '#dbeafe', '#1d4ed8', '#93c5fd')).join('')
+      : `<span style="font-size:12px;color:var(--text-light);font-style:italic;">No free windows found for this room on this day.</span>`;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'schedConflictModal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
+    overlay.innerHTML = `
+      <div style="background:var(--bg-card,#fff);border-radius:16px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.35);overflow:hidden;animation:fadeInUp .2s ease;">
+        <!-- Header -->
+        <div style="background:linear-gradient(135deg,#7f1d1d,#b91c1c);padding:20px 24px;display:flex;align-items:center;gap:14px;">
+          <div style="background:rgba(255,255,255,.15);border-radius:50%;width:44px;height:44px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+            <i class="fas fa-exclamation-triangle" style="color:#fbbf24;font-size:20px;"></i>
+          </div>
+          <div>
+            <div style="color:#fff;font-weight:800;font-size:17px;">Schedule Conflict Detected</div>
+            <div style="color:#fca5a5;font-size:12px;margin-top:2px;">This request cannot be approved without resolving the conflict below.</div>
+          </div>
+        </div>
+
+        <!-- Conflict card -->
+        <div style="padding:20px 24px 0;">
+          <div style="background:${tm.bg};border:1px solid ${tm.border};border-radius:10px;padding:14px 16px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+              <i class="fas ${tm.icon}" style="color:${tm.color};font-size:15px;"></i>
+              <span style="font-size:12px;font-weight:800;text-transform:uppercase;color:${tm.color};">${tm.label}</span>
+            </div>
+            ${c.blocking_subject
+              ? `<div style="font-size:15px;font-weight:700;color:#1e293b;margin-bottom:4px;">${escHtml(c.blocking_subject)}</div>` : ''}
+            ${c.blocking_faculty
+              ? `<div style="font-size:13px;color:#475569;">Assigned to: <strong>${escHtml(c.blocking_faculty)}</strong></div>` : ''}
+            <div style="font-size:13px;color:#475569;margin-top:6px;display:flex;gap:16px;flex-wrap:wrap;">
+              <span><i class="fas fa-calendar-day" style="color:${tm.color};margin-right:4px;"></i>${escHtml(c.day || '')}</span>
+              <span><i class="fas fa-clock" style="color:${tm.color};margin-right:4px;"></i>${fmt(c.start_time)} – ${fmt(c.end_time)}</span>
+              ${c.room ? `<span><i class="fas fa-door-open" style="color:${tm.color};margin-right:4px;"></i>Room ${escHtml(c.room)}</span>` : ''}
+            </div>
+          </div>
+        </div>
+
+        <!-- Recommendations -->
+        <div style="padding:16px 24px 0;">
+          <div style="font-size:12px;font-weight:800;text-transform:uppercase;color:var(--text-secondary);margin-bottom:14px;display:flex;align-items:center;gap:6px;">
+            <i class="fas fa-lightbulb" style="color:#f59e0b;font-size:14px;"></i> Suggested Alternatives
+          </div>
+
+          <div style="margin-bottom:14px;">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-light);margin-bottom:8px;">
+              <i class="fas fa-door-open" style="margin-right:4px;"></i>Available Rooms — ${escHtml(c.day || '')} ${fmt(c.start_time)} to ${fmt(c.end_time)}
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">${roomPills}</div>
+          </div>
+
+          ${c.room ? `
+          <div style="margin-bottom:4px;">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-light);margin-bottom:8px;">
+              <i class="fas fa-clock" style="margin-right:4px;"></i>Free Windows for Room ${escHtml(c.room)} — ${escHtml(c.day || '')}
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">${timePills}</div>
+          </div>` : ''}
+        </div>
+
+        <!-- Footer -->
+        <div style="padding:16px 24px 20px;display:flex;align-items:center;gap:12px;margin-top:8px;">
+          <div style="flex:1;font-size:12px;color:var(--text-light);">
+            <i class="fas fa-info-circle" style="margin-right:4px;"></i>
+            Edit the offering's room or time in the <strong>Offerings</strong> tab, then try approving again.
+          </div>
+          <button onclick="document.getElementById('schedConflictModal').remove()" class="btn btn-secondary" style="flex-shrink:0;">Close</button>
+        </div>
+      </div>`;
+    overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+    document.body.appendChild(overlay);
+  }
+
+  window._reviewLoading = async (id, action) => {
+    let admin_remarks = '';
+    if (action === 'reject' || action === 'return') {
+      admin_remarks = await showSystemPrompt(action === 'reject' ? 'Reason for rejection (optional):' : 'What needs revision?') || '';
+      if (action === 'return' && !admin_remarks.trim()) { showToast('Please add a note for the faculty.', 'error'); return; }
+    }
+    try {
+      await api(`/api/loading/admin/requests/${id}/${action}`, { method: 'POST', body: JSON.stringify({ admin_remarks }) });
+      showToast(`Request ${action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'returned'}.`, 'success');
+      renderAdminRequests();
+    } catch (err) {
+      if (action === 'approve' && err.status === 409 && err.responseData?.conflict) {
+        showConflictModal(err.responseData);
+      } else {
+        showToast(err.message, 'error');
+      }
+    }
+  };
+
+  // ── Reschedule helpers ────────────────────────────────────────────────────
+  window._toggleReschedule = (id) => {
+    const panel = document.getElementById(`rsp-${id}`);
+    if (!panel) return;
+    const opening = panel.style.display === 'none';
+    panel.style.display = opening ? 'block' : 'none';
+    if (opening) {
+      // Wire up live conflict check for this panel
+      const term = state._ldAdminTerm;
+      let _rspTimer = null;
+
+      function _rspSetStatus(st, msg) {
+        const div = document.getElementById(`rsp-status-${id}`);
+        const btn = document.getElementById(`rsp-save-${id}`);
+        if (!div) return;
+        const styles = {
+          checking: { bg:'#f8fafc', border:'#e2e8f0', color:'#64748b', icon:'fa-spinner fa-spin' },
+          clear:    { bg:'#f0fdf4', border:'#86efac', color:'#15803d', icon:'fa-check-circle'   },
+          conflict: { bg:'#fee2e2', border:'#fca5a5', color:'#b91c1c', icon:'fa-times-circle'   },
+        };
+        if (st === 'idle') { div.style.display = 'none'; if (btn) { btn.disabled = false; btn.style.opacity = '1'; } return; }
+        const s = styles[st] || styles.checking;
+        div.style.cssText = `display:flex;gap:8px;align-items:flex-start;border-radius:7px;padding:8px 12px;font-size:12px;margin-bottom:10px;background:${s.bg};border:1px solid ${s.border};color:${s.color};`;
+        div.innerHTML = `<i class="fas ${s.icon}" style="margin-top:1px;flex-shrink:0;"></i><span>${escHtml(msg)}</span>`;
+        const ok = st === 'clear';
+        if (btn) { btn.disabled = !ok; btn.style.opacity = ok ? '1' : '.5'; }
+      }
+
+      async function _rspCheck() {
+        const day   = document.getElementById(`rsp-day-${id}`)?.value;
+        const start = document.getElementById(`rsp-start-${id}`)?.value;
+        const end   = document.getElementById(`rsp-end-${id}`)?.value;
+        const room  = document.getElementById(`rsp-room-${id}`)?.value.trim();
+        if (!start || !end) { _rspSetStatus('idle', ''); return; }
+        if (start >= end)   { _rspSetStatus('conflict', 'Start time must be before end time.'); return; }
+        _rspSetStatus('checking', 'Checking for conflicts…');
+        try {
+          const excludeId = panel.dataset.offeringId || null;
+          const result = await api('/api/loading/admin/offerings/check-conflict', {
+            method: 'POST',
+            body: JSON.stringify({ term, day_of_week: day, start_time: start, end_time: end, room: room || null, exclude_id: excludeId }),
+          });
+          if (result.clear === true)       _rspSetStatus('clear',    result.message);
+          else if (result.clear === false) _rspSetStatus('conflict', result.message);
+          else                             _rspSetStatus('idle', '');
+        } catch (e) { _rspSetStatus('conflict', e.message); }
+      }
+
+      [`rsp-day-${id}`, `rsp-start-${id}`, `rsp-end-${id}`, `rsp-room-${id}`].forEach(eid => {
+        const el = document.getElementById(eid);
+        if (el) {
+          el.addEventListener('change', () => { clearTimeout(_rspTimer); _rspTimer = setTimeout(_rspCheck, 600); });
+          if (el.type !== 'select-one') el.addEventListener('input', () => { clearTimeout(_rspTimer); _rspTimer = setTimeout(_rspCheck, 600); });
+        }
+      });
+      _rspCheck(); // run immediately when panel opens
+    }
+  };
+
+  window._saveReschedule = async (id) => {
+    const day   = document.getElementById(`rsp-day-${id}`)?.value;
+    const start = document.getElementById(`rsp-start-${id}`)?.value;
+    const end   = document.getElementById(`rsp-end-${id}`)?.value;
+    const room  = (document.getElementById(`rsp-room-${id}`)?.value || '').trim();
+    if (!start || !end) { showToast('Set start and end time.', 'error'); return; }
+    const btn = document.getElementById(`rsp-save-${id}`);
+    if (btn) btn.disabled = true;
+    try {
+      await api(`/api/loading/admin/requests/${id}/reschedule`, {
+        method: 'PATCH',
+        body: JSON.stringify({ day_of_week: day, start_time: start, end_time: end, room: room || null }),
+      });
+      showToast('Schedule updated. Faculty has been notified.', 'success');
+      renderAdminRequests();
+    } catch (err) {
+      const div = document.getElementById(`rsp-status-${id}`);
+      if (div) {
+        div.style.cssText = 'display:flex;gap:8px;align-items:flex-start;border-radius:7px;padding:8px 12px;font-size:12px;margin-bottom:10px;background:#fee2e2;border:1px solid #fca5a5;color:#b91c1c;';
+        div.innerHTML = `<i class="fas fa-times-circle" style="margin-top:1px;"></i><span>${escHtml(err.message)}</span>`;
+      }
+      if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+    }
+  };
 
   async function loadSchedules() {
     const pageArea = document.getElementById('pageArea');
@@ -4614,7 +7709,11 @@
 
   // ── FACULTY / ADMIN: manage embed links ──────────────────
   async function _loadScheduleManagement() {
+    if (!state.scheduleFilterTerm) state.scheduleFilterTerm = state.activeTerm || 'FIRST_SEMESTER';
+    if (!state.scheduleFilterYear) state.scheduleFilterYear2 = state.activeYear || '2025-2026';
     const params = new URLSearchParams();
+    if (state.scheduleFilterTerm) params.set('term', state.scheduleFilterTerm);
+    if (state.scheduleFilterYear2) params.set('academic_year', state.scheduleFilterYear2);
     if (state.scheduleFilterDept && state.scheduleFilterDept !== 'All') params.set('department', state.scheduleFilterDept);
     if (state.scheduleFilterYear)    params.set('year_level', state.scheduleFilterYear);
     if (state.scheduleFilterSection) params.set('section',    state.scheduleFilterSection);
@@ -4681,17 +7780,20 @@
         <!-- Toolbar -->
         <div class="schedule-mgmt-toolbar">
           ${isAdmin ? `
-          <div class="schedule-filters">
-            <select class="form-input form-select" id="sfDept" style="width:140px;">
-              ${departments.map(d => `<option value="${d}"${state.scheduleFilterDept === d ? ' selected' : ''}>${d}</option>`).join('')}
+          <div class="sched-filter-bar schedule-filters" style="margin-bottom: 0;">
+            <select class="sched-filter-select" id="sfTerm" style="max-width:180px;">
+              ${Object.entries(TERM_LABELS).map(([v, l]) => `<option value="${v}"${state.scheduleFilterTerm === v ? ' selected' : ''}>${l}</option>`).join('')}
             </select>
-            <select class="form-input form-select" id="sfYear" style="width:110px;">
+            <select class="sched-filter-select" id="sfDept" style="max-width:170px;">
+              ${departments.map(d => `<option value="${d}"${state.scheduleFilterDept === d ? ' selected' : ''}>${d === 'All' ? 'All Departments' : d}</option>`).join('')}
+            </select>
+            <select class="sched-filter-select" id="sfYear" style="max-width:140px;">
               <option value="">All Years</option>
-              ${yearLevelOpts.map(y => `<option value="${y}"${state.scheduleFilterYear === y ? ' selected' : ''}>${y}</option>`).join('')}
+              ${yearLevelOpts.map(y => `<option value="${y}"${state.scheduleFilterYear === y ? ' selected' : ''}>${y} Year</option>`).join('')}
             </select>
-            <select class="form-input form-select" id="sfSection" style="width:110px;">
+            <select class="sched-filter-select" id="sfSection" style="max-width:140px;">
               <option value="">All Sections</option>
-              ${sectionOpts.map(s => `<option value="${s}"${state.scheduleFilterSection === s ? ' selected' : ''}>${s}</option>`).join('')}
+              ${sectionOpts.map(s => `<option value="${s}"${state.scheduleFilterSection === s ? ' selected' : ''}>Section ${s}</option>`).join('')}
             </select>
           </div>` : ''}
         </div>
@@ -4706,36 +7808,38 @@
                 <!-- 1. Faculty Teaching Schedules Collapsible Tree (ON TOP) -->
                 ${facultyEmbeds.length === 0 ? '' : `
                   <details class="sched-dept-group" open style="margin-bottom: 24px;">
-                    <summary class="sched-dept-header" style="cursor: pointer; list-style: none;">
-                      <span class="sched-dept-name"><i class="fas fa-chalkboard-teacher"></i> Faculty Teaching Schedules</span>
-                      <span class="sched-dept-count">${facultyEmbeds.length}</span>
+                    <summary class="sched-dept-header">
+                      <div class="sched-dept-header-left">
+                        <i class="fas fa-chevron-right sched-dept-arrow"></i>
+                        <div class="sched-dept-icon-box"><i class="fas fa-chalkboard-teacher"></i></div>
+                        <span class="sched-dept-name">Faculty Teaching Schedules</span>
+                      </div>
+                      <span class="sched-dept-count">${facultyEmbeds.length} schedule${facultyEmbeds.length === 1 ? '' : 's'}</span>
                     </summary>
-                    <div class="sched-dept-body" style="padding:20px; display:flex; flex-direction:column; gap:16px;">
+                    <div class="sched-dept-body">
                       ${facultyEmbeds.map(em => `
-                        <details class="sched-embed-details-group" style="border:1px solid var(--border); border-radius:10px; background:var(--bg-card); box-shadow: var(--shadow-sm); margin-bottom: 12px; overflow: hidden; display: block;">
-                          <summary class="sched-embed-details-summary" style="display:flex; justify-content:space-between; align-items:center; width:100%; padding:16px 20px; cursor:pointer; list-style:none; outline:none; user-select:none;" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
-                            <div class="sched-embed-info" style="display:flex; flex-direction:column; align-items:flex-start; gap:4px;">
-                              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                                <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
-                                <i class="fas fa-link" style="color: var(--primary);"></i>
-                                <span class="sched-embed-title" style="font-weight:700; font-size:14px; color:var(--text-primary);">${escHtml(em.title || 'Untitled Schedule')}</span>
-                                <span class="status-pill status-active" style="background:var(--primary); color:white; font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px; text-transform:uppercase; margin-left:8px;">Faculty Schedule</span>
-                              </div>
-                              <div class="sched-embed-meta-badges" style="display:flex; gap:10px; font-size:11px; color:var(--text-secondary); margin-left:38px; opacity:0.85; flex-wrap:wrap; align-items:center; margin-top:4px;">
-                                <span style="font-weight: 600; color: var(--primary); display: inline-flex; align-items: center; gap: 4px; background: rgba(136,8,8,0.06); padding: 3px 8px; border-radius: 4px;">
-                                  <i class="fas fa-user-tie"></i> Faculty: ${escHtml(em.faculty_name || 'Unassigned')}
-                                </span>
-                                <span><i class="fas fa-building"></i> Dept: ${escHtml(em.department || 'General')}</span>
+                        <details class="sched-card">
+                          <summary class="sched-card-summary" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
+                            <div class="sched-card-left">
+                              <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
+                              <div class="sched-card-icon"><i class="fas fa-user-tie"></i></div>
+                              <div class="sched-card-title-group">
+                                <div class="sched-card-title">${escHtml(em.title || 'Untitled Schedule')}</div>
+                                <div class="sched-card-tags">
+                                  <span class="sched-tag sched-tag--type">Faculty</span>
+                                  <span class="sched-tag sched-tag--sec"><i class="fas fa-user-tie"></i> ${escHtml(em.faculty_name || 'Unassigned')}</span>
+                                  <span class="sched-tag sched-tag--dept"><i class="fas fa-building"></i> ${escHtml(em.department || 'General')}</span>
+                                </div>
                               </div>
                             </div>
-                            <div style="display:flex; align-items:center; gap:10px;" onclick="event.stopPropagation();">
-                              <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);">by ${escHtml(em.posted_by_name || 'Faculty')}</span>
+                            <div class="sched-card-right" onclick="event.stopPropagation();">
+                              <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);"><i class="fas fa-user-edit" style="margin-right:4px;"></i>by ${escHtml(em.posted_by_name || 'Faculty')}</span>
                               ${em.embed_url ? `
-                                <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; border-radius: 5px; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-primary);">
+                                <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;">
                                   <i class="fas fa-external-link-alt"></i> Open Sheet
                                 </a>
                               ` : ''}
-                              ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-trash"></i></button></div>` : ''}
+                              ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" title="Edit Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" title="Delete Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-trash"></i></button></div>` : ''}
                             </div>
                           </summary>
                           <div class="sched-embed-details-body" style="padding:20px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:16px;">
@@ -4752,103 +7856,101 @@
                     <i class="fas fa-users-class" style="color:var(--text-light); font-size: 24px;"></i>
                     <h3>No student class schedules match your filters.</h3>
                   </div>
-                ` : Object.entries(grouped).map(([dept, years]) => `
+                ` : Object.entries(grouped).map(([dept, years]) => {
+                  const deptCount = Object.values(years).flatMap(y => Object.values(y)).flat().length;
+                  return `
                   <details class="sched-dept-group" open>
                     <summary class="sched-dept-header">
-                      <span class="sched-dept-name"><i class="fas fa-graduation-cap"></i> ${escHtml(dept)}</span>
-                      <span class="sched-dept-count">${Object.values(years).flatMap(y => Object.values(y)).flat().length}</span>
+                      <div class="sched-dept-header-left">
+                        <i class="fas fa-chevron-right sched-dept-arrow"></i>
+                        <div class="sched-dept-icon-box"><i class="fas fa-graduation-cap"></i></div>
+                        <span class="sched-dept-name">${escHtml(dept)}</span>
+                      </div>
+                      <span class="sched-dept-count">${deptCount} schedule${deptCount === 1 ? '' : 's'}</span>
                     </summary>
                     <div class="sched-dept-body">
-                      ${Object.entries(years).map(([yr, sections]) => `
+                      ${Object.entries(years).map(([yr, sections]) => {
+                        const yearItems = Object.values(sections).flat();
+                        return `
                         <details class="sched-year-group" open>
                           <summary class="sched-year-header">
-                            <span>${escHtml(yr)} Year</span>
-                            <span>${Object.values(sections).flat().length} schedule(s)</span>
+                            <div class="sched-year-header-left">
+                              <i class="fas fa-chevron-right sched-year-arrow"></i>
+                              <span class="sched-year-pill"><i class="fas fa-layer-group" style="color:var(--primary); font-size:12px;"></i> ${escHtml(yr)} Year</span>
+                            </div>
+                            <span class="sched-year-count">${yearItems.length} schedule${yearItems.length === 1 ? '' : 's'}</span>
                           </summary>
-                          <div class="sched-year-body" style="padding-left:12px; display:flex; flex-direction:column; gap:12px; margin-top:12px;">
-                            ${Object.entries(sections).map(([sec, items]) => `
-                              <details class="sched-embed-details-group" style="border:1px solid var(--border); border-radius:10px; background:var(--bg-card); box-shadow: var(--shadow-sm); margin-bottom: 12px; overflow: hidden; display: block;">
-                                <summary class="sched-embed-details-summary" style="display:flex; justify-content:space-between; align-items:center; width:100%; padding:16px 20px; cursor:pointer; list-style:none; outline:none; user-select:none;" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
-                                  <div class="sched-embed-info" style="display:flex; flex-direction:column; align-items:flex-start; gap:4px;">
-                                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                                      <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
-                                      <i class="fas fa-users" style="color: var(--primary);"></i>
-                                      <span class="sched-embed-title" style="font-weight:700; font-size:14px; color:var(--text-primary);">Section ${escHtml(sec)}</span>
-                                      <span class="status-pill status-active" style="background:#880808; color:white; font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px; text-transform:uppercase; margin-left:8px;">Section Schedule</span>
-                                    </div>
-                                    <div class="sched-embed-meta-badges" style="display:flex; gap:10px; font-size:11px; color:var(--text-secondary); margin-left:38px; opacity:0.85; flex-wrap:wrap; align-items:center; margin-top:4px;">
-                                      <span><i class="fas fa-graduation-cap"></i> Dept: ${escHtml(dept)}</span>
-                                      <span><i class="fas fa-layer-group"></i> ${escHtml(yr)} Year</span>
+                          <div class="sched-year-body">
+                            ${yearItems.map(em => `
+                              <details class="sched-card">
+                                <summary class="sched-card-summary" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
+                                  <div class="sched-card-left">
+                                    <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
+                                    <div class="sched-card-icon"><i class="fas fa-users"></i></div>
+                                    <div class="sched-card-title-group">
+                                      <div class="sched-card-title">${escHtml(em.title || 'Untitled Schedule')}</div>
+                                      <div class="sched-card-tags">
+                                        <span class="sched-tag sched-tag--sec"><i class="fas fa-users"></i> Section ${escHtml(em.section || '—')}</span>
+                                        <span class="sched-tag sched-tag--dept"><i class="fas fa-graduation-cap"></i> ${escHtml(em.department || dept)}</span>
+                                        <span class="sched-tag sched-tag--year"><i class="fas fa-layer-group"></i> ${escHtml(em.year_level || yr)} Year</span>
+                                      </div>
                                     </div>
                                   </div>
-                                  <div style="display:flex; align-items:center; gap:10px;" onclick="event.stopPropagation();">
-                                    <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);">${items.length} schedule(s)</span>
+                                  <div class="sched-card-right" onclick="event.stopPropagation();">
+                                    <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);"><i class="fas fa-user-edit" style="margin-right:4px;"></i>by ${escHtml(em.posted_by_name || 'Faculty')}</span>
+                                    ${em.embed_url ? `
+                                      <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;">
+                                        <i class="fas fa-external-link-alt"></i> Open Sheet
+                                      </a>
+                                    ` : ''}
+                                    ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" title="Edit Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" title="Delete Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-trash"></i></button></div>` : ''}
                                   </div>
                                 </summary>
                                 <div class="sched-embed-details-body" style="padding:20px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:16px;">
-                                  ${items.map(em => `
-                                    <details class="sched-embed-details-group" style="border:1px solid var(--border); border-radius:10px; background:var(--bg-card); box-shadow: var(--shadow-sm); margin-bottom:12px; overflow: hidden; display: block;">
-                                      <summary class="sched-embed-details-summary" style="display:flex; justify-content:space-between; align-items:center; width:100%; padding:16px 20px; cursor:pointer; list-style:none; outline:none; user-select:none;" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
-                                        <div class="sched-embed-info" style="display:flex; flex-direction:column; align-items:flex-start; gap:4px;">
-                                          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                                            <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
-                                            <i class="fas fa-link" style="color: var(--primary);"></i>
-                                            <span class="sched-embed-title" style="font-weight:700; font-size:14px; color:var(--text-primary);">${escHtml(em.title || 'Untitled Schedule')}</span>
-                                          </div>
-                                          <div class="sched-embed-meta-badges" style="display:flex; gap:10px; font-size:11px; color:var(--text-secondary); margin-left:38px; opacity:0.85; flex-wrap:wrap; align-items:center; margin-top:4px;">
-                                            <span><i class="fas fa-graduation-cap"></i> ${escHtml(em.department || '—')}</span>
-                                            <span><i class="fas fa-layer-group"></i> ${escHtml(em.year_level || '—')} Year</span>
-                                            <span><i class="fas fa-users"></i> Section ${escHtml(em.section || '—')}</span>
-                                          </div>
-                                        </div>
-                                        <div style="display:flex; align-items:center; gap:10px;" onclick="event.stopPropagation();">
-                                          <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);">by ${escHtml(em.posted_by_name || 'Faculty')}</span>
-                                          ${em.embed_url ? `
-                                            <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; border-radius: 5px; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-primary);">
-                                              <i class="fas fa-external-link-alt"></i> Open Sheet
-                                            </a>
-                                          ` : ''}
-                                          ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-trash"></i></button></div>` : ''}
-                                        </div>
-                                      </summary>
-                                      <div class="sched-embed-details-body" style="padding:20px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:16px;">
-                                        ${window._buildFlexibleScheduleTableHtml(em.rows, em.error, em.embed_url, em.title, true)}
-                                      </div>
-                                    </details>`).join('')}
+                                  ${window._buildFlexibleScheduleTableHtml(em.rows, em.error, em.embed_url, em.title, true)}
                                 </div>
-                              </details>`).join('')}
+                              </details>
+                            `).join('')}
                           </div>
-                        </details>`).join('')}
+                        </details>
+                        `;
+                      }).join('')}
                     </div>
                   </details>
-                `).join('')}
+                  `;
+                }).join('')}
               `
               // ── Faculty: flat card list ──
-              : `<div style="display:flex;flex-direction:column;gap:16px;">
+              : `<div style="display:flex;flex-direction:column;gap:14px;">
                   ${embeds.map(em => `
-                    <details class="sched-embed-details-group" style="border:1px solid var(--border); border-radius:10px; background:var(--bg-card); box-shadow: var(--shadow-sm); overflow: hidden; display: block;">
-                      <summary class="sched-embed-details-summary" style="display:flex; justify-content:space-between; align-items:center; width:100%; padding:16px 20px; cursor:pointer; list-style:none; outline:none; user-select:none;" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
-                        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-                          <div class="sched-embed-info" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                            <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
-                            <i class="fas fa-link" style="color: var(--primary);"></i>
-                            <span class="sched-embed-title" style="font-weight:700; font-size:14px; color:var(--text-primary);">${escHtml(em.title || 'Untitled Schedule')}</span>
-                            <span class="status-pill status-active" style="background:var(--primary); color:white; font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px; text-transform:uppercase;">Faculty Schedule</span>
-                          </div>
-                          <div class="sched-embed-meta" style="font-size:12px; color:var(--text-secondary); display:flex; gap:10px; margin-left:12px; align-items:center; flex-wrap:wrap;">
-                            <span style="font-weight: 600; color: var(--primary); display: inline-flex; align-items: center; gap: 4px; background: rgba(136,8,8,0.06); padding: 3px 8px; border-radius: 4px;">
-                              <i class="fas fa-user-tie"></i> Faculty: ${escHtml(em.faculty_name || state.user.first_name + ' ' + state.user.last_name)}
-                            </span>
-                            <span><i class="fas fa-building"></i> Dept: ${escHtml(em.department || 'General')}</span>
+                    <details class="sched-card">
+                      <summary class="sched-card-summary" onclick="const target = event.target; if(target.closest('a') || target.closest('button')) event.stopPropagation();">
+                        <div class="sched-card-left">
+                          <i class="fas fa-chevron-right sched-arrow" style="font-size:12px; color:var(--text-light); transition: transform 0.2s;"></i>
+                          <div class="sched-card-icon"><i class="${em.schedule_type === 'faculty' ? 'fas fa-chalkboard-teacher' : 'fas fa-users'}"></i></div>
+                          <div class="sched-card-title-group">
+                            <div class="sched-card-title">${escHtml(em.title || 'Untitled Schedule')}</div>
+                            <div class="sched-card-tags">
+                              ${em.schedule_type === 'faculty' ? `
+                                <span class="sched-tag sched-tag--type">Faculty</span>
+                                <span class="sched-tag sched-tag--sec"><i class="fas fa-user-tie"></i> ${escHtml(em.faculty_name || (state.user ? state.user.first_name + ' ' + state.user.last_name : 'Faculty'))}</span>
+                                <span class="sched-tag sched-tag--dept"><i class="fas fa-building"></i> ${escHtml(em.department || 'General')}</span>
+                              ` : `
+                                <span class="sched-tag sched-tag--sec"><i class="fas fa-users"></i> Section ${escHtml(em.section || '—')}</span>
+                                <span class="sched-tag sched-tag--dept"><i class="fas fa-graduation-cap"></i> ${escHtml(em.department || '—')}</span>
+                                <span class="sched-tag sched-tag--year"><i class="fas fa-layer-group"></i> ${escHtml(em.year_level || '—')} Year</span>
+                              `}
+                            </div>
                           </div>
                         </div>
-                        <div style="display:flex; align-items:center; gap:10px;" onclick="event.stopPropagation();">
+                        <div class="sched-card-right" onclick="event.stopPropagation();">
+                          <span class="sched-embed-by" style="font-size:12px; color:var(--text-secondary);"><i class="fas fa-user-edit" style="margin-right:4px;"></i>by ${escHtml(em.posted_by_name || 'Faculty')}</span>
                           ${em.embed_url ? `
-                            <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; border-radius: 5px; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-primary);">
+                            <a href="${escHtml(em.embed_url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-xs" style="padding:5px 10px; font-size:11px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; border-radius: 6px;">
                               <i class="fas fa-external-link-alt"></i> Open Sheet
                             </a>
                           ` : ''}
-                          ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" style="padding: 5px 8px; border-radius: 5px;"><i class="fas fa-trash"></i></button></div>` : ''}
+                          ${canManageSchedules ? `<div class="sched-actions" style="display:flex; gap:6px;"><button class="btn btn-xs btn-secondary sched-edit-btn" data-id="${em.id}" title="Edit Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-edit"></i></button><button class="btn btn-xs btn-danger sched-del-btn" data-id="${em.id}" title="Delete Schedule" style="padding: 5px 8px; border-radius: 6px;"><i class="fas fa-trash"></i></button></div>` : ''}
                         </div>
                       </summary>
                       <div class="sched-embed-details-body" style="padding:20px; border-top:1px dashed var(--border); display:flex; flex-direction:column; gap:16px;">
@@ -4865,6 +7967,7 @@
     const schedAddBtnEl = document.getElementById('schedAddBtn');
     if (schedAddBtnEl) schedAddBtnEl.onclick = () => _openEmbedModal(null);
     if (isAdmin) {
+      document.getElementById('sfTerm').onchange    = e => { state.scheduleFilterTerm    = e.target.value; _loadScheduleManagement(); };
       document.getElementById('sfDept').onchange    = e => { state.scheduleFilterDept    = e.target.value; _loadScheduleManagement(); };
       document.getElementById('sfYear').onchange    = e => { state.scheduleFilterYear    = e.target.value; _loadScheduleManagement(); };
       document.getElementById('sfSection').onchange = e => { state.scheduleFilterSection = e.target.value; _loadScheduleManagement(); };
@@ -4909,6 +8012,53 @@
     } catch (err) {
       pageArea.querySelector('.page-content').innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><h3>Failed to load</h3><p>${escHtml(err.message)}</p></div>`;
     }
+  }
+
+  // Faculty credentials card — mirrors the PROFILE sheet (academic title,
+  // specializations, education, and portfolio links). Stored as JSON.
+  const CRED_GROUPS = [
+    { key: 'research', label: 'Research', hint: 'e.g. "Study on AI Ethics - https://..."' },
+    { key: 'trainings', label: 'Trainings', hint: 'e.g. "Advanced Python Training (2025) - https://..."' },
+    { key: 'extension', label: 'Extension', hint: 'e.g. "Coding for Kids Program (2024) - https://..."' },
+    { key: 'awards', label: 'Awards', hint: 'e.g. "Outstanding Faculty Award (2025) - https://..."' },
+  ];
+  function renderCredentialsCard(p) {
+    const c = p.faculty_credentials || {};
+    const arr = (v, n) => { const a = Array.isArray(v) ? v.slice(0, n) : []; while (a.length < n) a.push(''); return a; };
+    const rows = (key, n, ph) => arr(c[key], n).map((v, i) =>
+      `<input type="text" class="form-input cred-${key}" style="margin-bottom:6px;" placeholder="${ph} ${i + 1}" value="${escHtml(v || '')}">`).join('');
+    return `
+      <div class="card profile-section" style="grid-column:1 / -1;">
+        <div class="profile-section-header">
+          <i class="fas fa-award" style="color:var(--maroon);"></i>
+          <span>Faculty Credentials</span>
+        </div>
+        <p class="profile-section-desc">Used by admins when reviewing your loading requests. Filling this out does not guarantee a load.</p>
+        <div class="form-row">
+          <div class="form-group"><label class="form-label">Academic Title</label>
+            <input type="text" class="form-input" id="credTitle" placeholder="e.g., Assistant Professor 1" value="${escHtml(c.academic_title || '')}"></div>
+          <div class="form-group"><label class="form-label">Program</label>
+            <div class="form-input pf-readonly">${escHtml(p.department || '—')}</div></div>
+        </div>
+        <div class="form-group"><label class="form-label">Specializations</label>${rows('specializations', 3, 'Specialization')}</div>
+        <div class="form-group"><label class="form-label">Educational Background (Undergrad & Postgrad)</label>${rows('education', 3, 'Degree')}</div>
+        <div style="border-top:1px solid var(--border); margin:8px 0 12px;"></div>
+        <p class="form-label" style="margin-bottom:8px;"><strong>Portfolio Links (last 3 years)</strong></p>
+        ${CRED_GROUPS.map(g => `<div class="form-group"><label class="form-label">${g.label}</label>${rows(g.key, 3, g.label)}</div>`).join('')}
+        <button class="btn btn-primary" id="credSaveBtn"><i class="fas fa-save"></i> Save Credentials</button>
+      </div>`;
+  }
+  function collectCredentials() {
+    const vals = (cls) => [...document.querySelectorAll('.' + cls)].map(i => i.value.trim()).filter(Boolean);
+    return {
+      academic_title: (document.getElementById('credTitle')?.value || '').trim(),
+      specializations: vals('cred-specializations'),
+      education: vals('cred-education'),
+      research: vals('cred-research'),
+      trainings: vals('cred-trainings'),
+      extension: vals('cred-extension'),
+      awards: vals('cred-awards'),
+    };
   }
 
   function renderProfilePage() {
@@ -4977,19 +8127,15 @@
               </div>` : ''}
             </div>
 
+            ${(p.role === 'student') ? `
             <div class="form-row">
-              ${(p.role === 'student') ? `
               <div class="form-group">
                 <label class="form-label">Department</label>
                 <select class="form-input form-select" id="pfDept">
                   ${departments.filter(d => !['All','General','Campus'].includes(d)).map(d => `<option value="${d}" ${p.department===d?'selected':''}>${d}</option>`).join('')}
                 </select>
-              </div>` : ''}
-              <div class="form-group">
-                <label class="form-label">Phone Number</label>
-                <input type="text" class="form-input" id="pfPhone" placeholder="e.g., 09xx-xxx-xxxx" value="${escHtml(p.phone || '')}">
               </div>
-            </div>
+            </div>` : ''}
 
             ${p.role === 'student' ? `
             <div class="form-row">
@@ -5009,15 +8155,11 @@
               <input type="text" class="form-input" id="pfPosition" placeholder="e.g., Associate Professor" value="${escHtml(p.position || '')}">
             </div>` : ''}
 
-            <div class="form-group">
-              <label class="form-label">Bio</label>
-              <textarea class="form-input" id="pfBio" rows="3" placeholder="Tell others a bit about yourself...">${escHtml(p.bio || '')}</textarea>
-            </div>
-
             <button class="btn btn-primary profile-save-btn" id="pfSaveBtn">
               <i class="fas fa-save"></i> Save Changes
             </button>
           </div>
+
 
           <!-- Right sidebar cards -->
           <div class="profile-sidebar">
@@ -5037,6 +8179,15 @@
                   <span class="pil-label">Role</span>
                   <span class="pil-value" style="color:${roleColor};font-weight:700;">${roleLabel}</span>
                 </div>
+                ${p.role === 'faculty' && p.employment_type ? `
+                <div class="profile-info-row">
+                  <span class="pil-label">Employment Type</span>
+                  <span class="pil-value">
+                    ${p.employment_type === 'part_time'
+                      ? `<span style="background:#fef3c7;color:#92400e;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;">Part-Time</span>`
+                      : `<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;">Full-Time</span>`}
+                  </span>
+                </div>` : ''}
               </div>
             </div>
 
@@ -5111,8 +8262,6 @@
         first_name,
         last_name,
         department: pfDeptEl ? pfDeptEl.value : null,
-        phone: document.getElementById('pfPhone').value.trim(),
-        bio: document.getElementById('pfBio').value.trim(),
       };
       const posEl = document.getElementById('pfPosition');
       if (posEl) body.position = posEl.value.trim();
@@ -5135,6 +8284,7 @@
         renderProfilePage();
       } catch (err) { showToast(err.message, 'error'); }
     };
+
   }
 
   // ════════════════════════════════
@@ -5173,32 +8323,32 @@
         <div class="chat-welcome-sub">I'm PUPBot, your PUPSJ campus AI assistant. Ask me anything about class schedules, events, document templates, lost & found, or campus guidelines!</div>
         
         <div class="chat-welcome-suggestions">
-          <div class="suggestion-card" onclick="window._chipSendText('Class schedules')">
+          <div class="suggestion-card" onclick="window._chipSendText('What are the class schedules?')">
             <div class="suggestion-icon"><i class="fas fa-calendar-alt"></i></div>
             <div class="suggestion-title">Class schedules</div>
             <div class="suggestion-desc">View or search section timetables</div>
           </div>
-          <div class="suggestion-card" onclick="window._chipSendText('Lost & Found')">
+          <div class="suggestion-card" onclick="window._chipSendText('Check lost and found items')">
             <div class="suggestion-icon"><i class="fas fa-search"></i></div>
             <div class="suggestion-title">Lost & Found</div>
             <div class="suggestion-desc">Report or check lost items</div>
           </div>
-          <div class="suggestion-card" onclick="window._chipSendText('Enrollment steps')">
+          <div class="suggestion-card" onclick="window._chipSendText('What are the enrollment steps?')">
             <div class="suggestion-icon"><i class="fas fa-clipboard-list"></i></div>
             <div class="suggestion-title">Enrollment steps</div>
             <div class="suggestion-desc">Guide to campus enrollment</div>
           </div>
-          <div class="suggestion-card" onclick="window._chipSendText('Latest announcements')">
+          <div class="suggestion-card" onclick="window._chipSendText('What are the latest announcements?')">
             <div class="suggestion-icon"><i class="fas fa-bullhorn"></i></div>
             <div class="suggestion-title">Latest announcements</div>
             <div class="suggestion-desc">What is new on campus today</div>
           </div>
-          <div class="suggestion-card" onclick="window._chipSendText('Document templates')">
+          <div class="suggestion-card" onclick="window._chipSendText('Show available document templates')">
             <div class="suggestion-icon"><i class="fas fa-file-pdf"></i></div>
             <div class="suggestion-title">Document templates</div>
             <div class="suggestion-desc">Download forms & templates</div>
           </div>
-          <div class="suggestion-card" onclick="window._chipSendText('Faculty status')">
+          <div class="suggestion-card" onclick="window._chipSendText('Check faculty status and locator')">
             <div class="suggestion-icon"><i class="fas fa-user-tie"></i></div>
             <div class="suggestion-title">Faculty status</div>
             <div class="suggestion-desc">Check if professors are available</div>
@@ -5684,7 +8834,7 @@
         .doc-folder-theme-2{--fc-tab:rgba(52,152,219,.18);--fc-body:#f0f8ff;--fc-border:rgba(52,152,219,.22);--fc-icon:#2980b9}
         .doc-folder-theme-3{--fc-tab:rgba(46,204,113,.16);--fc-body:#f0fdf4;--fc-border:rgba(46,204,113,.2);--fc-icon:#16a34a}
         .doc-folder-theme-4{--fc-tab:rgba(107,6,6,.16);--fc-body:#fdf0ec;--fc-border:rgba(107,6,6,.2);--fc-icon:#6b0606}
-        .doc-folder-theme-5{--fc-tab:rgba(109,40,217,.14);--fc-body:#f5f3ff;--fc-border:rgba(109,40,217,.18);--fc-icon:#6d28d9}
+        .doc-folder-theme-5{--fc-tab:rgba(230,126,34,.16);--fc-body:#fff6ed;--fc-border:rgba(230,126,34,.2);--fc-icon:#d97706}
         html[data-theme="dark"] .doc-folder-theme-0{--fc-tab:rgba(160,64,64,0.24);--fc-body:#2A1E1E!important;--fc-border:rgba(160,64,64,0.3)!important;--fc-icon:#A04040}
         html[data-theme="dark"] .doc-folder-theme-1{--fc-tab:rgba(241,196,15,0.22);--fc-body:#2A261B!important;--fc-border:rgba(241,196,15,0.3)!important;--fc-icon:#F1C40F}
         html[data-theme="dark"] .doc-folder-theme-2{--fc-tab:rgba(52,152,219,0.22);--fc-body:#1E252C!important;--fc-border:rgba(52,152,219,0.3)!important;--fc-icon:#3498DB}
@@ -5754,7 +8904,7 @@
                 <div class="doc-folder-card">
                   ${isFacultyOrAdmin ? `
                   <div class="doc-folder-actions">
-                    <button class="doc-folder-action-btn" onclick="event.stopPropagation(); window._editCategory('${c.id}','${jsEsc(c.name)}','${jsEsc(c.description || '')}')"><i class="fas fa-pen"></i></button>
+                    <button class="doc-folder-action-btn" onclick="event.stopPropagation(); window._editCategory('${c.id}','${jsEsc(c.name)}','${jsEsc(c.description || '')}','${jsEsc(c.department || 'General')}')"><i class="fas fa-pen"></i></button>
                     <button class="doc-folder-action-btn doc-folder-del-btn" onclick="event.stopPropagation(); window._deleteCategory('${c.id}')"><i class="fas fa-trash-alt"></i></button>
                   </div>` : ''}
                   <div class="doc-folder-icon-wrap">
@@ -5790,7 +8940,7 @@
           </div>
           ${isFacultyOrAdmin && selectedCat ? `
           <div class="doc-breadcrumb-actions" style="margin-left: auto; display: flex; gap: 8px;">
-            <button class="doc-breadcrumb-action-btn btn-outlined" onclick="window._editCategory('${selectedCat.id}','${jsEsc(selectedCat.name)}','${jsEsc(selectedCat.description || '')}')"><i class="fas fa-pen"></i> Edit Folder</button>
+            <button class="doc-breadcrumb-action-btn btn-outlined" onclick="window._editCategory('${selectedCat.id}','${jsEsc(selectedCat.name)}','${jsEsc(selectedCat.description || '')}','${jsEsc(selectedCat.department || 'General')}')"><i class="fas fa-pen"></i> Edit Folder</button>
             <button class="doc-breadcrumb-action-btn btn-filled-red" onclick="window._deleteCategory('${selectedCat.id}')"><i class="fas fa-trash-alt"></i> Delete Folder</button>
           </div>` : ''}
         </div>
@@ -5952,8 +9102,10 @@
     } catch (err) { showToast(err.message, 'error'); }
   };
 
-  window._editCategory = (id, name, description) => {
-    openModal('doc-category-edit', { id, name, description });
+  window._editCategory = (id, name, description, department) => {
+    let cat = (state.docCategories || []).find(c => c.id === id);
+    const dept = department || cat?.department || 'General';
+    openModal('doc-category-edit', { id, name, description, department: dept });
   };
 
   window._editDocument = (id, title, description, categoryId, department) => {
@@ -5968,26 +9120,51 @@
     pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Admin Dashboard</h1><p class="page-subtitle">System overview</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;
 
     try {
-      const [stats, pendingAnn, pendingEv, allSchedules] = await Promise.all([
+      const isSuperAdmin = state.user?.role === 'superadmin';
+      const hasMod = (m) => isSuperAdmin || (Array.isArray(state.user?.modules) && state.user.modules.includes(m));
+
+      const [stats, pendingAnn, pendingEv] = await Promise.all([
         api('/api/admin/stats'),
-        api('/api/announcements/pending/list').catch(() => []),
-        api('/api/events/pending/list').catch(() => []),
-        api('/api/section-schedules').catch(() => []),
+        hasMod('announcements') ? api('/api/announcements/pending/list').catch(() => []) : Promise.resolve([]),
+        hasMod('events') ? api('/api/events/pending/list').catch(() => []) : Promise.resolve([]),
       ]);
       state.adminStats = stats;
       state.pendingAnnouncements = pendingAnn || [];
       state.pendingEvents = pendingEv || [];
 
-      // Extract faculty schedule embeds
-      const facultySchedules = Array.isArray(allSchedules) ? allSchedules.filter(s => s.target_type === 'faculty') : [];
-
       const annStat = typeof stats.announcements === 'object' ? stats.announcements : { total: stats.announcements, pending: 0 };
       const evStat  = typeof stats.events === 'object' ? stats.events : { total: stats.events, pending: 0 };
-      const totalPending = (annStat.pending || 0) + (evStat.pending || 0);
+      const annPending = hasMod('announcements') ? (annStat.pending || 0) : 0;
+      const evPending = hasMod('events') ? (evStat.pending || 0) : 0;
+      const totalPending = annPending + evPending;
 
       pageArea.innerHTML = `
         <div class="page-header"><h1 class="page-title">Admin Dashboard</h1><p class="page-subtitle">System overview & management</p></div>
         <div class="page-content">
+          <div class="card" style="padding:20px;">
+            <h3 style="font-family:var(--font-display);font-size:16px;font-weight:700;margin-bottom:16px;">Quick Actions</h3>
+            <div class="admin-quick-actions">
+              ${isSuperAdmin ? `<button class="btn btn-primary quick-action-full" onclick="navigateTo('admin-users')"><i class="fas fa-users-cog"></i> Manage Users</button>` : ''}
+              ${isSuperAdmin ? `
+                <div class="quick-action-row" style="margin-top: 6px;">
+                  <button class="btn btn-warning quick-action-full" style="background:#b45309; border-color:#b45309; color:#fff;" onclick="window._promoteSemester()">
+                    <i class="fas fa-graduation-cap"></i> Update Semester (Advance Year Levels)
+                  </button>
+                </div>
+              ` : ''}
+              <div class="quick-action-row" style="margin-top: 6px;">
+                ${hasMod('announcements') ? `<button class="btn btn-gold" onclick="openModal('announcement')"><i class="fas fa-bullhorn"></i> Post Announcement</button>` : ''}
+                ${hasMod('events') ? `<button class="btn btn-secondary" onclick="openModal('event')"><i class="fas fa-calendar-plus"></i> Create Event</button>` : ''}
+              </div>
+              ${hasMod('schedules') ? `
+              <div class="quick-action-row" style="margin-top: 10px;">
+                <button class="btn btn-primary quick-action-full" style="background:#2e7d32; border-color:#2e7d32;" onclick="openModal('section-schedule')">
+                  <i class="fas fa-calendar-alt"></i> Upload & Assign Schedule
+                </button>
+              </div>` : ''}
+            </div>
+          </div>
+
           <div class="stats-grid">
             <div class="card stat-card">
               <div class="stat-card-icon maroon"><i class="fas fa-users"></i></div>
@@ -6020,74 +9197,6 @@
             ${renderApprovalQueue(state.pendingAnnouncements, state.pendingEvents)}
           </div>
 
-          <!-- FACULTY SCHEDULES MASTER OVERVIEW -->
-          <div class="card" style="padding:20px;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
-              <h3 style="font-family:var(--font-display);font-size:16px;font-weight:700;margin:0;display:flex;align-items:center;gap:8px;">
-                <i class="fas fa-chalkboard-teacher" style="color:var(--primary);"></i> Faculty Schedules Master Overview
-              </h3>
-              <span class="status-pill status-active" style="background:var(--primary);color:white;font-weight:600;">${facultySchedules.length} Assigned</span>
-            </div>
-            
-            ${facultySchedules.length === 0 ? `
-              <div class="empty-state" style="padding:24px;">
-                <i class="fas fa-calendar-times" style="color:var(--text-light);font-size:32px;"></i>
-                <h3>No Faculty Schedules Uploaded</h3>
-                <p>Use the Quick Actions panel below to upload and assign schedules to faculty members.</p>
-              </div>
-            ` : `
-              <div class="table-responsive" style="margin-top:12px; border-radius:8px; border:1px solid var(--border); overflow-x:auto;">
-                <table class="table" style="width:100%; border-collapse:collapse; text-align:left; font-size:13px; min-width:600px;">
-                  <thead>
-                    <tr style="background:var(--border-soft); border-bottom:1px solid var(--border); color:var(--text-secondary); font-weight:700;">
-                      <th style="padding:12px 16px;">Faculty Member</th>
-                      <th style="padding:12px 16px;">Schedule Title</th>
-                      <th style="padding:12px 16px;">Department</th>
-                      <th style="padding:12px 16px;">Embed Link</th>
-                      <th style="padding:12px 16px; text-align:right;">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${facultySchedules.map(fs => `
-                      <tr style="border-bottom:1px solid var(--border); transition: background 0.2s;">
-                        <td style="padding:12px 16px; font-weight:600; color:var(--text-primary);">
-                          <i class="fas fa-user-tie" style="color:var(--primary); margin-right:6px;"></i> ${escHtml(fs.faculty_name || 'Unassigned')}
-                        </td>
-                        <td style="padding:12px 16px; color:var(--text-primary); font-weight:500;">${escHtml(fs.title)}</td>
-                        <td style="padding:12px 16px; color:var(--text-secondary);"><i class="fas fa-building" style="font-size:11px;"></i> ${escHtml(fs.department || 'General')}</td>
-                        <td style="padding:12px 16px;">
-                          <a href="${escHtml(fs.embed_url)}" target="_blank" rel="noopener" style="color:var(--primary); text-decoration:none; font-weight:600; display:inline-flex; align-items:center; gap:4px;">
-                            <i class="fas fa-external-link-alt" style="font-size:11px;"></i> Open Link
-                          </a>
-                        </td>
-                        <td style="padding:12px 16px; text-align:right;">
-                          <button class="btn btn-xs btn-danger" onclick="window._deleteSectionSchedule('${fs.id}').then(() => loadAdminDashboard())" title="Delete Schedule" style="padding:4px 8px; border-radius:4px;">
-                            <i class="fas fa-trash"></i>
-                          </button>
-                        </td>
-                      </tr>
-                    `).join('')}
-                  </tbody>
-                </table>
-              </div>
-            `}
-          </div>
-
-          <div class="card" style="padding:20px;">
-            <h3 style="font-family:var(--font-display);font-size:16px;font-weight:700;margin-bottom:16px;">Quick Actions</h3>
-            <div class="admin-quick-actions">
-              ${state.user.role === 'superadmin' ? `<button class="btn btn-primary quick-action-full" onclick="navigateTo('admin-users')"><i class="fas fa-users-cog"></i> Manage Users</button>` : ''}
-              <div class="quick-action-row">
-                <button class="btn btn-gold" onclick="openModal('announcement')"><i class="fas fa-bullhorn"></i> Post Announcement</button>
-                <button class="btn btn-secondary" onclick="openModal('event')"><i class="fas fa-calendar-plus"></i> Create Event</button>
-              </div>
-              <div class="quick-action-row" style="margin-top: 10px;">
-                <button class="btn btn-primary quick-action-full" style="background:#2e7d32; border-color:#2e7d32;" onclick="openModal('section-schedule')">
-                  <i class="fas fa-calendar-alt"></i> Upload & Assign Schedule
-                </button>
-              </div>
-            </div>
-          </div>
         </div>`;
 
       bindApprovalActions();
@@ -6096,6 +9205,20 @@
       pageArea.querySelector('.page-content').innerHTML = `<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><h3>Failed to load dashboard</h3><p>${escHtml(err.message || '')}</p></div>`;
     }
   }
+
+  window._promoteSemester = async () => {
+    const confirmed = await window.showSystemConfirm(
+      'Are you sure you want to update the semester? This will advance all students by one year level: 1st → 2nd, 2nd → 3rd, 3rd → 4th, and 4th Year students will be marked as Graduated.'
+    );
+    if (!confirmed) return;
+    try {
+      const res = await api('/api/admin/promote-year-levels', { method: 'POST' });
+      showToast(res.message || 'Semester updated successfully!', 'success');
+      loadAdminDashboard();
+    } catch (err) {
+      showToast(err.message || 'Failed to update semester', 'error');
+    }
+  };
 
   // Render the admin approval queue (announcements + events).
   function renderApprovalQueue(pendingAnn, pendingEv) {
@@ -6145,7 +9268,7 @@
         } catch (err) { showToast(err.message, 'error'); }
       };
       row.querySelector('.reject-btn').onclick = async () => {
-        const reason = prompt('Optional reason for rejection (leave empty to skip):') || '';
+        const reason = await showSystemPrompt('Optional reason for rejection (leave empty to skip):') || '';
         try {
           await api(`${base}/${id}/reject`, {
             method: 'POST',
@@ -6187,7 +9310,7 @@
     pageArea.innerHTML = `
       <div class="page-header">
         <h1 class="page-title">System Maintenance</h1>
-        <p class="page-subtitle">Configure application branding, title, logo, and landing page image</p>
+        <p class="page-subtitle">Configure application branding, titles, hero slides, showcase sections, and landing page features</p>
       </div>
       <div class="page-content">
         <div class="loader"><div class="spinner"></div></div>
@@ -6195,206 +9318,621 @@
 
     try {
       state.systemSettings = await api('/api/system-settings');
-      
-      const title = state.systemSettings.app_title || 'PUPSJ HUB';
-      const subtitle = state.systemSettings.app_title_subtitle || 'San Juan Campus Hub';
-      const logo = state.systemSettings.app_logo || '/icons/pup_logo.png';
-      const hero = state.systemSettings.app_landing_hero || '/landing_hero.png';
-      const description = state.systemSettings.app_description || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.';
+      const s = state.systemSettings || {};
 
-      // Parse current hero images (split by commas)
-      let currentHeroImages = hero.split(',').map(u => u.trim()).filter(Boolean);
+      let currentTab = 'branding';
 
-      window._removeHeroImage = (idx) => {
-        currentHeroImages.splice(idx, 1);
-        renderHeroGallery();
+      // Working state for images, slides, features, and text inputs
+      const formState = {
+        app_title: s.app_title || 'PUPSJ HUB',
+        app_title_subtitle: s.app_title_subtitle || 'San Juan Campus Hub',
+        app_description: s.app_description || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.',
+        app_logo: s.app_logo || '/icons/pup_logo.png',
+        landing_footer_text: s.landing_footer_text || '© 2026 PUPSJ HUB. All Rights Reserved. Dedicated to Academic Excellence.',
+
+        landing_hero_kicker: s.landing_hero_kicker || 'ABOUT US',
+        landing_hero_title: s.landing_hero_title || s.app_title || 'PUPSJ HUB',
+        landing_hero_subtitle: s.landing_hero_subtitle || s.app_title_subtitle || 'San Juan Campus Hub',
+        landing_hero_body: s.landing_hero_body || 'Welcome to the complete campus progressive web application. Access class schedules, stay updated with campus announcements, report or find lost items, download academic forms & templates, and interact with our smart AI companion, PUPBot.',
+        landing_hero_cta_primary: s.landing_hero_cta_primary || 'Explore as Guest',
+        landing_hero_cta_secondary: s.landing_hero_cta_secondary || 'Log In / Sign Up',
+
+        landing_showcase1_kicker: s.landing_showcase1_kicker || 'One hub. Every campus day.',
+        landing_showcase1_title: s.landing_showcase1_title || 'Everything that keeps San Juan moving.',
+        landing_showcase1_desc: s.landing_showcase1_desc || 'From the first announcement to the last class of the day, PUPSJ HUB keeps the essentials close, clear, and easy to use.',
+        landing_showcase1_btn_text: s.landing_showcase1_btn_text || 'Explore the hub',
+        landing_showcase1_image: s.landing_showcase1_image || '/landing_hero.png',
+        landing_showcase1_badge_title: s.landing_showcase1_badge_title || 'Campus updates',
+        landing_showcase1_badge_desc: s.landing_showcase1_badge_desc || 'Always within reach',
+        landing_showcase1_badge_num: s.landing_showcase1_badge_num || '01',
+        landing_showcase1_badge_sub: s.landing_showcase1_badge_sub || 'Stay connected',
+
+        landing_features_title: s.landing_features_title || 'Features',
+
+        landing_showcase2_kicker: s.landing_showcase2_kicker || 'Designed around you',
+        landing_showcase2_title: s.landing_showcase2_title || 'A calmer way to navigate campus.',
+        landing_showcase2_desc: s.landing_showcase2_desc || 'No more jumping between links, group chats, and scattered files. Your everyday campus tools live together in one thoughtful experience.',
+        landing_showcase2_point1: s.landing_showcase2_point1 || 'Clear and organized',
+        landing_showcase2_point2: s.landing_showcase2_point2 || 'Built for the PUP community',
+        landing_showcase2_point3: s.landing_showcase2_point3 || 'Available wherever you are',
+        landing_showcase2_dash_title: s.landing_showcase2_dash_title || 'Today at PUP San Juan',
+        landing_showcase2_row1: s.landing_showcase2_row1 || 'Class schedules',
+        landing_showcase2_row2: s.landing_showcase2_row2 || 'Document templates',
+        landing_showcase2_row3: s.landing_showcase2_row3 || 'PUPBot AI assistant',
+
+        landing_about_title: s.landing_about_title || ('About ' + (s.app_title || 'PUPSJ HUB')),
+        landing_about_desc: s.landing_about_desc || s.app_description || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.'
       };
 
-      window._uploadHeroImage = async (inputEl) => {
+      // Slide manager working list
+      let slidesList = getCarouselSlides().map(sl => ({
+        image: sl.image || '/landing_hero.png',
+        title: sl.title || formState.app_title,
+        subtitle: sl.subtitle || ''
+      }));
+
+      // Features manager working list
+      let featuresList = JSON.parse(JSON.stringify(getLandingFeatures()));
+
+      // Upload helper function
+      async function uploadSystemFile(file) {
+        const fd = new FormData();
+        fd.append('file', file);
+        const uploadRes = await fetch('/api/admin/system-settings/upload', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${sessionStorage.getItem('pupsj_token')}` },
+          body: fd
+        });
+        if (!uploadRes.ok) {
+          const err = await uploadRes.json().catch(() => ({}));
+          throw new Error(err.error || 'Upload failed');
+        }
+        const data = await uploadRes.json();
+        return data.url;
+      }
+
+      function syncInputsToFormState() {
+        const textKeys = [
+          'app_title', 'app_title_subtitle', 'app_description', 'landing_footer_text',
+          'landing_hero_kicker', 'landing_hero_title', 'landing_hero_subtitle', 'landing_hero_body',
+          'landing_hero_cta_primary', 'landing_hero_cta_secondary',
+          'landing_showcase1_kicker', 'landing_showcase1_title', 'landing_showcase1_desc', 'landing_showcase1_btn_text',
+          'landing_showcase1_badge_title', 'landing_showcase1_badge_desc', 'landing_showcase1_badge_num', 'landing_showcase1_badge_sub',
+          'landing_features_title',
+          'landing_showcase2_kicker', 'landing_showcase2_title', 'landing_showcase2_desc',
+          'landing_showcase2_point1', 'landing_showcase2_point2', 'landing_showcase2_point3',
+          'landing_showcase2_dash_title', 'landing_showcase2_row1', 'landing_showcase2_row2', 'landing_showcase2_row3',
+          'landing_about_title', 'landing_about_desc'
+        ];
+        textKeys.forEach(k => {
+          const el = document.getElementById(`sys_${k}`);
+          if (el) formState[k] = el.value.trim();
+        });
+
+        // Sync slides title/subtitle from DOM
+        slidesList.forEach((sl, idx) => {
+          const tEl = document.getElementById(`sys_slide_title_${idx}`);
+          const sEl = document.getElementById(`sys_slide_sub_${idx}`);
+          if (tEl) sl.title = tEl.value;
+          if (sEl) sl.subtitle = sEl.value;
+        });
+
+        // Sync features title/desc/icon from DOM
+        featuresList.forEach((f, idx) => {
+          const iEl = document.getElementById(`sys_feat_icon_${idx}`);
+          const tEl = document.getElementById(`sys_feat_title_${idx}`);
+          const dEl = document.getElementById(`sys_feat_desc_${idx}`);
+          if (iEl) f.icon = iEl.value.trim();
+          if (tEl) f.title = tEl.value.trim();
+          if (dEl) f.desc = dEl.value.trim();
+        });
+      }
+
+      window._setSysTab = (tabName) => {
+        syncInputsToFormState();
+        currentTab = tabName;
+        renderMaintenanceView();
+      };
+
+      // Slide manager functions
+      window._uploadSlideImage = async (inputEl, idx) => {
         const file = inputEl.files[0];
         if (!file) return;
-
-        const addBox = document.querySelector('.hero-gallery-add');
-        if (addBox) {
-          addBox.innerHTML = '<i class="fas fa-spinner fa-spin" style="font-size:16px;"></i><span style="font-size:10px;font-weight:700;margin-top:6px;">Uploading...</span>';
-          addBox.style.pointerEvents = 'none';
-        }
-
         try {
-          const fd = new FormData();
-          fd.append('file', file);
-          const uploadRes = await fetch('/api/admin/system-settings/upload', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${sessionStorage.getItem('pupsj_token')}` },
-            body: fd
-          });
-          if (!uploadRes.ok) throw new Error('Hero image upload failed');
-          const data = await uploadRes.json();
-          currentHeroImages.push(data.url);
-          showToast('Hero image added successfully!', 'success');
+          showToast('Uploading slide image...', 'info');
+          const url = await uploadSystemFile(file);
+          if (idx >= 0 && idx < slidesList.length) {
+            slidesList[idx].image = url;
+          } else {
+            slidesList.push({
+              image: url,
+              title: formState.app_title || 'PUPSJ HUB',
+              subtitle: 'Campus Community & Highlights'
+            });
+          }
+          showToast('Slide image uploaded successfully!', 'success');
+          renderMaintenanceView();
         } catch (err) {
-          showToast(err.message || 'Upload failed', 'error');
-        } finally {
-          renderHeroGallery();
-          inputEl.value = ''; // reset file input
+          showToast(err.message || 'Failed to upload image', 'error');
         }
       };
 
-      function renderHeroGallery() {
-        const galleryContainer = document.getElementById('heroGalleryContainer');
-        if (!galleryContainer) return;
+      window._removeSlide = (idx) => {
+        if (slidesList.length <= 1) {
+          showToast('At least one hero slide is required.', 'warning');
+          return;
+        }
+        syncInputsToFormState();
+        slidesList.splice(idx, 1);
+        renderMaintenanceView();
+      };
 
-        galleryContainer.innerHTML = `
-          <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; margin-top: 10px; width: 100%;">
-            ${currentHeroImages.map((img, i) => `
-              <div style="position: relative; aspect-ratio: 16/9; border-radius: var(--radius-md); border: 1.5px solid var(--border); overflow: hidden; background: var(--bg-secondary); box-shadow: var(--shadow-sm); transition: all 0.2s ease;">
-                <img src="${img}" style="width: 100%; height: 100%; object-fit: cover;">
-                <button type="button" onclick="window._removeHeroImage(${i})" style="position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,0.75); color: #fff; border: none; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px; font-weight: bold; transition: all 0.2s ease; box-shadow: 0 2px 4px rgba(0,0,0,0.35);" onmouseover="this.style.background='var(--primary)'" onmouseout="this.style.background='rgba(0,0,0,0.75)'">&times;</button>
+      // Feature manager functions
+      window._addFeature = () => {
+        syncInputsToFormState();
+        featuresList.push({
+          icon: 'fas fa-star',
+          title: 'New Campus Feature',
+          desc: 'Description of this new campus service or feature.'
+        });
+        renderMaintenanceView();
+      };
+
+      window._removeFeature = (idx) => {
+        if (featuresList.length <= 1) {
+          showToast('At least one feature is required.', 'warning');
+          return;
+        }
+        syncInputsToFormState();
+        featuresList.splice(idx, 1);
+        renderMaintenanceView();
+      };
+
+      // Logo upload
+      window._uploadSysLogo = async (inputEl) => {
+        const file = inputEl.files[0];
+        if (!file) return;
+        try {
+          showToast('Uploading logo...', 'info');
+          const url = await uploadSystemFile(file);
+          formState.app_logo = url;
+          showToast('Logo uploaded successfully!', 'success');
+          renderMaintenanceView();
+        } catch (err) {
+          showToast(err.message || 'Logo upload failed', 'error');
+        }
+      };
+
+      // Showcase 1 image upload
+      window._uploadShowcase1Img = async (inputEl) => {
+        const file = inputEl.files[0];
+        if (!file) return;
+        try {
+          showToast('Uploading showcase image...', 'info');
+          const url = await uploadSystemFile(file);
+          formState.landing_showcase1_image = url;
+          showToast('Showcase image uploaded successfully!', 'success');
+          renderMaintenanceView();
+        } catch (err) {
+          showToast(err.message || 'Showcase image upload failed', 'error');
+        }
+      };
+
+      // Save handler
+      window._saveSystemSettings = async () => {
+        syncInputsToFormState();
+
+        const saveBtns = document.querySelectorAll('.sys-save-trigger');
+        saveBtns.forEach(btn => {
+          btn.disabled = true;
+          btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+        });
+
+        try {
+          // Prepare clean slides JSON & legacy comma-separated images
+          const validSlides = slidesList.map(s => ({
+            image: s.image || '/landing_hero.png',
+            title: s.title || formState.app_title || 'PUPSJ HUB',
+            subtitle: s.subtitle || ''
+          }));
+
+          const heroImagesCsv = validSlides.map(s => s.image).join(',');
+
+          // Prepare clean features JSON
+          const validFeatures = featuresList.map(f => ({
+            icon: f.icon || 'fas fa-star',
+            title: f.title || 'Feature',
+            desc: f.desc || ''
+          }));
+
+          const payload = {
+            ...formState,
+            app_landing_hero: heroImagesCsv,
+            landing_carousel_slides: JSON.stringify(validSlides),
+            landing_features_json: JSON.stringify(validFeatures)
+          };
+
+          await api('/api/admin/system-settings', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+          });
+
+          // Update local state live
+          state.systemSettings = payload;
+          if (payload.app_title) document.title = payload.app_title;
+
+          showToast('All system & landing page settings saved successfully!', 'success');
+
+          // Re-render and stay on system maintenance
+          render();
+          navigateTo('system-maintenance');
+        } catch (err) {
+          console.error(err);
+          showToast(err.message || 'Failed to save settings', 'error');
+          saveBtns.forEach(btn => {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-save"></i> Save All Changes';
+          });
+        }
+      };
+
+      function renderMaintenanceView() {
+        pageArea.innerHTML = `
+          <div class="page-header">
+            <h1 class="page-title">System Maintenance</h1>
+            <p class="page-subtitle">Customize every text, image, carousel slide, and section on your public landing page</p>
+          </div>
+          <div class="page-content">
+            <div class="sys-maint-wrapper">
+              
+              <!-- Top Header Bar with Tabs and Quick Save -->
+              <div class="sys-maint-header-bar">
+                <div class="sys-tabs-nav">
+                  <button type="button" class="sys-tab-btn ${currentTab === 'branding' ? 'active' : ''}" onclick="window._setSysTab('branding')">
+                    <i class="fas fa-palette"></i> Branding
+                  </button>
+                  <button type="button" class="sys-tab-btn ${currentTab === 'hero' ? 'active' : ''}" onclick="window._setSysTab('hero')">
+                    <i class="fas fa-images"></i> Hero & Slides (${slidesList.length})
+                  </button>
+                  <button type="button" class="sys-tab-btn ${currentTab === 'showcase1' ? 'active' : ''}" onclick="window._setSysTab('showcase1')">
+                    <i class="fas fa-layer-group"></i> Showcase 1
+                  </button>
+                  <button type="button" class="sys-tab-btn ${currentTab === 'features' ? 'active' : ''}" onclick="window._setSysTab('features')">
+                    <i class="fas fa-th-large"></i> Features (${featuresList.length})
+                  </button>
+                  <button type="button" class="sys-tab-btn ${currentTab === 'showcase2' ? 'active' : ''}" onclick="window._setSysTab('showcase2')">
+                    <i class="fas fa-info-circle"></i> Showcase 2 & About
+                  </button>
+                </div>
+                <button type="button" class="btn btn-primary sys-save-trigger" onclick="window._saveSystemSettings()" style="padding: 9px 20px; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                  <i class="fas fa-save"></i> Save All Changes
+                </button>
               </div>
-            `).join('')}
-            <div class="hero-gallery-add" onclick="document.getElementById('sysHeroFile').click()" style="aspect-ratio: 16/9; border-radius: var(--radius-md); border: 1.5px dashed var(--primary); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; cursor: pointer; background: var(--primary-soft); transition: all 0.2s ease; color: var(--primary);" onmouseover="this.style.background='rgba(136,8,8,0.09)'" onmouseout="this.style.background='var(--primary-soft)'">
-              <i class="fas fa-plus" style="font-size: 14px;"></i>
-              <span style="font-size: 10px; font-weight: 700;">Add Image</span>
+
+              <!-- TAB 1: BRANDING -->
+              <div class="sys-tab-pane ${currentTab === 'branding' ? 'active' : ''}">
+                <div class="sys-section-card">
+                  <h3><i class="fas fa-university" style="color: var(--primary);"></i> Campus Identity & Branding</h3>
+                  
+                  <div class="sys-form-grid">
+                    <div class="sys-form-group">
+                      <label>Application / Portal Title</label>
+                      <input type="text" id="sys_app_title" value="${escHtml(formState.app_title)}" class="form-input" placeholder="e.g. PUPSJ HUB">
+                      <small>Displayed in browser tab, header navbar, and hero title.</small>
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Campus Subtitle / Tagline</label>
+                      <input type="text" id="sys_app_title_subtitle" value="${escHtml(formState.app_title_subtitle)}" class="form-input" placeholder="e.g. San Juan Campus Hub">
+                      <small>Secondary title shown below main app branding.</small>
+                    </div>
+
+                    <div class="sys-form-group full-width">
+                      <label>Application Logo</label>
+                      <div style="display: flex; align-items: center; gap: 16px; margin-top: 4px;">
+                        <div class="sys-img-preview-box" style="width: 72px; height: 72px; border-radius: 50%;">
+                          <img src="${formState.app_logo}" alt="App Logo" style="width: 100%; height: 100%; object-fit: contain;">
+                        </div>
+                        <div>
+                          <input type="file" id="sysLogoInput" accept="image/*" style="display: none;" onchange="window._uploadSysLogo(this)">
+                          <button type="button" class="btn btn-outlined btn-sm" onclick="document.getElementById('sysLogoInput').click()">
+                            <i class="fas fa-upload"></i> Upload New Logo
+                          </button>
+                          <small style="display: block; margin-top: 4px;">Recommended: 128x128 PNG transparent</small>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="sys-form-group full-width">
+                      <label>Footer Copyright & Accreditation Notice</label>
+                      <input type="text" id="sys_landing_footer_text" value="${escHtml(formState.landing_footer_text)}" class="form-input" placeholder="© 2026 PUPSJ HUB. All Rights Reserved.">
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 2: HERO & CAROUSEL SLIDES -->
+              <div class="sys-tab-pane ${currentTab === 'hero' ? 'active' : ''}">
+                <div class="sys-section-card">
+                  <h3><i class="fas fa-heading" style="color: var(--primary);"></i> Hero Main Text & CTAs</h3>
+                  <div class="sys-form-grid">
+                    <div class="sys-form-group">
+                      <label>Hero Category Badge (Kicker)</label>
+                      <input type="text" id="sys_landing_hero_kicker" value="${escHtml(formState.landing_hero_kicker)}" class="form-input" placeholder="ABOUT US">
+                    </div>
+                    <div class="sys-form-group">
+                      <label>Hero Main Title</label>
+                      <input type="text" id="sys_landing_hero_title" value="${escHtml(formState.landing_hero_title)}" class="form-input" placeholder="PUPSJ HUB">
+                    </div>
+                    <div class="sys-form-group full-width">
+                      <label>Hero Subtitle</label>
+                      <input type="text" id="sys_landing_hero_subtitle" value="${escHtml(formState.landing_hero_subtitle)}" class="form-input" placeholder="San Juan Campus Hub">
+                    </div>
+                    <div class="sys-form-group full-width">
+                      <label>Hero Description Paragraph</label>
+                      <textarea id="sys_landing_hero_body" class="form-input" rows="3" placeholder="Welcome to the complete campus progressive web application...">${escHtml(formState.landing_hero_body)}</textarea>
+                    </div>
+                    <div class="sys-form-group">
+                      <label>Primary Button Text (Guest)</label>
+                      <input type="text" id="sys_landing_hero_cta_primary" value="${escHtml(formState.landing_hero_cta_primary)}" class="form-input" placeholder="Explore as Guest">
+                    </div>
+                    <div class="sys-form-group">
+                      <label>Secondary Button Text (Auth)</label>
+                      <input type="text" id="sys_landing_hero_cta_secondary" value="${escHtml(formState.landing_hero_cta_secondary)}" class="form-input" placeholder="Log In / Sign Up">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="sys-section-card" style="margin-top: 18px;">
+                  <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 12px;">
+                    <h3 style="margin: 0; border-bottom: none; padding-bottom: 0;">
+                      <i class="fas fa-images" style="color: var(--primary);"></i> Hero Carousel Slides Manager
+                    </h3>
+                    <div>
+                      <input type="file" id="sysNewSlideFileInput" accept="image/*" style="display: none;" onchange="window._uploadSlideImage(this, -1)">
+                      <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('sysNewSlideFileInput').click()">
+                        <i class="fas fa-plus"></i> Add New Slide
+                      </button>
+                    </div>
+                  </div>
+
+                  <p style="font-size: 12px; color: var(--text-muted); margin: 0;">
+                    Each slide appears in the hero carousel with its own custom image, title, and subtitle overlay.
+                  </p>
+
+                  <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-top: 10px;">
+                    ${slidesList.map((sl, idx) => `
+                      <div class="sys-slide-card">
+                        <div class="sys-slide-thumb">
+                          <img src="${sl.image}" alt="Slide ${idx + 1}">
+                          <button type="button" onclick="window._removeSlide(${idx})" title="Delete Slide" style="position: absolute; top: 6px; right: 6px; background: rgba(220, 38, 38, 0.9); color: #fff; border: none; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 11px;">
+                            <i class="fas fa-trash-alt"></i>
+                          </button>
+                        </div>
+                        <div>
+                          <input type="file" id="sysSlideFile_${idx}" accept="image/*" style="display: none;" onchange="window._uploadSlideImage(this, ${idx})">
+                          <button type="button" class="btn btn-outlined btn-sm" style="width: 100%; font-size: 11px; padding: 5px;" onclick="document.getElementById('sysSlideFile_${idx}').click()">
+                            <i class="fas fa-image"></i> Replace Slide Image
+                          </button>
+                        </div>
+                        <div class="sys-form-group">
+                          <label>Slide Title</label>
+                          <input type="text" id="sys_slide_title_${idx}" value="${escHtml(sl.title)}" class="form-input" style="font-size: 12px;" placeholder="Slide Heading">
+                        </div>
+                        <div class="sys-form-group">
+                          <label>Slide Subtitle</label>
+                          <input type="text" id="sys_slide_sub_${idx}" value="${escHtml(sl.subtitle)}" class="form-input" style="font-size: 12px;" placeholder="Slide Subtitle / Description">
+                        </div>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 3: SHOWCASE 1 -->
+              <div class="sys-tab-pane ${currentTab === 'showcase1' ? 'active' : ''}">
+                <div class="sys-section-card">
+                  <h3><i class="fas fa-layer-group" style="color: var(--primary);"></i> Showcase Section 1 (Campus Collage)</h3>
+                  
+                  <div class="sys-form-grid">
+                    <div class="sys-form-group">
+                      <label>Section Kicker</label>
+                      <input type="text" id="sys_landing_showcase1_kicker" value="${escHtml(formState.landing_showcase1_kicker)}" class="form-input" placeholder="One hub. Every campus day.">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Section Heading</label>
+                      <input type="text" id="sys_landing_showcase1_title" value="${escHtml(formState.landing_showcase1_title)}" class="form-input" placeholder="Everything that keeps San Juan moving.">
+                    </div>
+
+                    <div class="sys-form-group full-width">
+                      <label>Section Description</label>
+                      <textarea id="sys_landing_showcase1_desc" class="form-input" rows="3" placeholder="From the first announcement...">${escHtml(formState.landing_showcase1_desc)}</textarea>
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Action Link Text</label>
+                      <input type="text" id="sys_landing_showcase1_btn_text" value="${escHtml(formState.landing_showcase1_btn_text)}" class="form-input" placeholder="Explore the hub">
+                    </div>
+
+                    <div class="sys-form-group full-width">
+                      <label>Showcase Collage Main Image</label>
+                      <div style="display: flex; align-items: center; gap: 16px; margin-top: 4px;">
+                        <div class="sys-img-preview-box" style="width: 140px; aspect-ratio: 16/9;">
+                          <img src="${formState.landing_showcase1_image}" alt="Showcase" style="width: 100%; height: 100%; object-fit: cover;">
+                        </div>
+                        <div>
+                          <input type="file" id="sysSc1FileInput" accept="image/*" style="display: none;" onchange="window._uploadShowcase1Img(this)">
+                          <button type="button" class="btn btn-outlined btn-sm" onclick="document.getElementById('sysSc1FileInput').click()">
+                            <i class="fas fa-upload"></i> Upload Showcase Image
+                          </button>
+                          <small style="display: block; margin-top: 4px;">Recommended: High-resolution campus photo (PNG or JPG)</small>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Floating Card Title</label>
+                      <input type="text" id="sys_landing_showcase1_badge_title" value="${escHtml(formState.landing_showcase1_badge_title)}" class="form-input" placeholder="Campus updates">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Floating Card Subtitle</label>
+                      <input type="text" id="sys_landing_showcase1_badge_desc" value="${escHtml(formState.landing_showcase1_badge_desc)}" class="form-input" placeholder="Always within reach">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Circular Badge Number</label>
+                      <input type="text" id="sys_landing_showcase1_badge_num" value="${escHtml(formState.landing_showcase1_badge_num)}" class="form-input" placeholder="01">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Circular Badge Text</label>
+                      <input type="text" id="sys_landing_showcase1_badge_sub" value="${escHtml(formState.landing_showcase1_badge_sub)}" class="form-input" placeholder="Stay connected">
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 4: FEATURES GRID -->
+              <div class="sys-tab-pane ${currentTab === 'features' ? 'active' : ''}">
+                <div class="sys-section-card">
+                  <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 12px;">
+                    <h3 style="margin: 0; border-bottom: none; padding-bottom: 0;">
+                      <i class="fas fa-th-large" style="color: var(--primary);"></i> Landing Features Grid
+                    </h3>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="window._addFeature()">
+                      <i class="fas fa-plus"></i> Add Feature Card
+                    </button>
+                  </div>
+
+                  <div class="sys-form-group" style="margin-top: 8px;">
+                    <label>Features Section Title</label>
+                    <input type="text" id="sys_landing_features_title" value="${escHtml(formState.landing_features_title)}" class="form-input" placeholder="Features">
+                  </div>
+
+                  <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; margin-top: 12px;">
+                    ${featuresList.map((f, idx) => `
+                      <div class="sys-feature-item">
+                        <div style="display: flex; align-items: center; justify-content: space-between;">
+                          <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="width: 28px; height: 28px; border-radius: 6px; background: var(--primary-soft); color: var(--primary); display: flex; align-items: center; justify-content: center; font-size: 12px;">
+                              <i class="${f.icon || 'fas fa-star'}"></i>
+                            </span>
+                            <span style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Card #${idx + 1}</span>
+                          </div>
+                          <button type="button" onclick="window._removeFeature(${idx})" title="Delete Feature" style="background: transparent; color: #dc2626; border: none; cursor: pointer; font-size: 13px;">
+                            <i class="fas fa-trash-alt"></i>
+                          </button>
+                        </div>
+                        <div class="sys-form-group">
+                          <label>FontAwesome Icon Class</label>
+                          <input type="text" id="sys_feat_icon_${idx}" value="${escHtml(f.icon || 'fas fa-star')}" class="form-input" style="font-size: 12px;" placeholder="fas fa-bullhorn">
+                        </div>
+                        <div class="sys-form-group">
+                          <label>Feature Title</label>
+                          <input type="text" id="sys_feat_title_${idx}" value="${escHtml(f.title)}" class="form-input" style="font-size: 12px;" placeholder="Feature Name">
+                        </div>
+                        <div class="sys-form-group">
+                          <label>Feature Description</label>
+                          <textarea id="sys_feat_desc_${idx}" class="form-input" style="font-size: 12px;" rows="2" placeholder="Feature details...">${escHtml(f.desc)}</textarea>
+                        </div>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+              </div>
+
+              <!-- TAB 5: SHOWCASE 2 & ABOUT -->
+              <div class="sys-tab-pane ${currentTab === 'showcase2' ? 'active' : ''}">
+                <div class="sys-section-card">
+                  <h3><i class="fas fa-sliders-h" style="color: var(--primary);"></i> Showcase Section 2 (Dashboard & Highlights)</h3>
+                  
+                  <div class="sys-form-grid">
+                    <div class="sys-form-group">
+                      <label>Section Kicker</label>
+                      <input type="text" id="sys_landing_showcase2_kicker" value="${escHtml(formState.landing_showcase2_kicker)}" class="form-input" placeholder="Designed around you">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Section Title</label>
+                      <input type="text" id="sys_landing_showcase2_title" value="${escHtml(formState.landing_showcase2_title)}" class="form-input" placeholder="A calmer way to navigate campus.">
+                    </div>
+
+                    <div class="sys-form-group full-width">
+                      <label>Section Description</label>
+                      <textarea id="sys_landing_showcase2_desc" class="form-input" rows="3" placeholder="No more jumping between links...">${escHtml(formState.landing_showcase2_desc)}</textarea>
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Key Bullet 1</label>
+                      <input type="text" id="sys_landing_showcase2_point1" value="${escHtml(formState.landing_showcase2_point1)}" class="form-input" placeholder="Clear and organized">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Key Bullet 2</label>
+                      <input type="text" id="sys_landing_showcase2_point2" value="${escHtml(formState.landing_showcase2_point2)}" class="form-input" placeholder="Built for the PUP community">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Key Bullet 3</label>
+                      <input type="text" id="sys_landing_showcase2_point3" value="${escHtml(formState.landing_showcase2_point3)}" class="form-input" placeholder="Available wherever you are">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Dashboard Box Header Title</label>
+                      <input type="text" id="sys_landing_showcase2_dash_title" value="${escHtml(formState.landing_showcase2_dash_title)}" class="form-input" placeholder="Today at PUP San Juan">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Dashboard Item Row 1</label>
+                      <input type="text" id="sys_landing_showcase2_row1" value="${escHtml(formState.landing_showcase2_row1)}" class="form-input" placeholder="Class schedules">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Dashboard Item Row 2</label>
+                      <input type="text" id="sys_landing_showcase2_row2" value="${escHtml(formState.landing_showcase2_row2)}" class="form-input" placeholder="Document templates">
+                    </div>
+
+                    <div class="sys-form-group">
+                      <label>Dashboard Item Row 3</label>
+                      <input type="text" id="sys_landing_showcase2_row3" value="${escHtml(formState.landing_showcase2_row3)}" class="form-input" placeholder="PUPBot AI assistant">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="sys-section-card" style="margin-top: 18px;">
+                  <h3><i class="fas fa-info-circle" style="color: var(--primary);"></i> About Us Section</h3>
+                  <div class="sys-form-grid">
+                    <div class="sys-form-group full-width">
+                      <label>About Heading</label>
+                      <input type="text" id="sys_landing_about_title" value="${escHtml(formState.landing_about_title)}" class="form-input" placeholder="About PUPSJ HUB">
+                    </div>
+                    <div class="sys-form-group full-width">
+                      <label>About Description</label>
+                      <textarea id="sys_landing_about_desc" class="form-input" rows="4" placeholder="PUPSJ HUB is the centralized campus portal...">${escHtml(formState.landing_about_desc)}</textarea>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Bottom Actions Bar -->
+              <div class="sys-actions-bar">
+                <button type="button" class="btn btn-primary sys-save-trigger" onclick="window._saveSystemSettings()" style="padding: 10px 28px; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                  <i class="fas fa-save"></i> Save All Changes
+                </button>
+              </div>
+
             </div>
           </div>
         `;
       }
 
-      pageArea.innerHTML = `
-        <div class="page-header">
-          <h1 class="page-title">System Maintenance</h1>
-          <p class="page-subtitle">Configure application branding, title, logo, and landing page image</p>
-        </div>
-        <div class="page-content">
-          <div class="card" style="padding: 24px; max-width: 700px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px;">
-            <h3 style="font-family: var(--font-display); font-size: 18px; font-weight: 700; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin: 0; color: var(--text-primary);">
-              <i class="fas fa-palette" style="color: var(--primary); margin-right: 8px;"></i> Application Branding
-            </h3>
-
-            <!-- App Title Input -->
-            <div style="display: flex; flex-direction: column; gap: 6px;">
-              <label style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">Application Title</label>
-              <input type="text" id="sysAppTitle" value="${escHtml(title)}" class="form-input" style="width: 100%;" placeholder="e.g. PUPSJ HUB">
-            </div>
-
-            <!-- App Subtitle Input -->
-            <div style="display: flex; flex-direction: column; gap: 6px;">
-              <label style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">Landing Page Subtitle</label>
-              <input type="text" id="sysAppSubtitle" value="${escHtml(subtitle)}" class="form-input" style="width: 100%;" placeholder="e.g. San Juan Campus Hub">
-            </div>
-
-            <!-- App Description Input -->
-            <div style="display: flex; flex-direction: column; gap: 6px;">
-              <label style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">System Description</label>
-              <textarea id="sysAppDescription" class="form-input" style="width: 100%; min-height: 100px; resize: vertical;" placeholder="Enter system/campus description text...">${escHtml(description)}</textarea>
-            </div>
-
-            <!-- App Logo Picker -->
-            <div style="display: flex; flex-direction: column; gap: 8px; border-top: 1px dashed var(--border); padding-top: 16px;">
-              <label style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">Application Logo</label>
-              <div style="display: flex; align-items: center; gap: 16px;">
-                <div style="width: 60px; height: 60px; border-radius: 50%; border: 1px solid var(--border); background: var(--bg-secondary); display: flex; align-items: center; justify-content: center; overflow: hidden;">
-                  <img id="sysLogoPreview" src="${logo}" style="width: 100%; height: 100%; object-fit: contain;">
-                </div>
-                <div style="flex: 1;">
-                  <input type="file" id="sysLogoFile" accept="image/*" style="display: none;" onchange="
-                    const file = this.files[0];
-                    if (file) {
-                      const reader = new FileReader();
-                      reader.onload = (e) => document.getElementById('sysLogoPreview').src = e.target.result;
-                      reader.readAsDataURL(file);
-                    }
-                  ">
-                  <button class="btn btn-outlined" onclick="document.getElementById('sysLogoFile').click()" style="padding: 6px 14px; font-size: 12px;">Choose New Logo</button>
-                  <p style="font-size: 11px; color: var(--text-muted); margin: 4px 0 0 0;">Recommended: 128x128px PNG</p>
-                </div>
-              </div>
-            </div>
-
-            <!-- App Landing Hero Image Gallery Grid -->
-            <div style="display: flex; flex-direction: column; gap: 8px; border-top: 1px dashed var(--border); padding-top: 16px;">
-              <label style="font-size: 13px; font-weight: 600; color: var(--text-secondary);">Landing Page Hero Images (Carousel Gallery)</label>
-              <p style="font-size: 11px; color: var(--text-muted); margin: 0 0 4px 0;">Upload multiple hero images to dynamically display in your landing page hero slide carousel.</p>
-              <div id="heroGalleryContainer" style="width: 100%;"></div>
-              <input type="file" id="sysHeroFile" accept="image/*" style="display: none;" onchange="window._uploadHeroImage(this)">
-            </div>
-
-            <!-- Save Action -->
-            <div style="border-top: 1px solid var(--border); padding-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
-              <button id="sysSaveBtn" class="btn btn-primary" style="padding: 10px 24px; font-weight: 600; display: flex; align-items: center; gap: 8px; width: auto;">
-                <i class="fas fa-save"></i> Save Settings
-              </button>
-            </div>
-          </div>
-        </div>`;
-
-      // Render the gallery items
-      renderHeroGallery();
-
-      // Event listener for saving
-      const saveBtn = document.getElementById('sysSaveBtn');
-      if (saveBtn) {
-        saveBtn.onclick = async () => {
-          saveBtn.disabled = true;
-          saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
-
-          try {
-            const titleInput = document.getElementById('sysAppTitle').value.trim();
-            const subtitleInput = document.getElementById('sysAppSubtitle').value.trim();
-            const descriptionInput = document.getElementById('sysAppDescription').value.trim();
-            const logoFile = document.getElementById('sysLogoFile').files[0];
-
-            let logoUrl = logo;
-
-            // 1. Upload files first if selected
-            if (logoFile) {
-              const fd = new FormData();
-              fd.append('file', logoFile);
-              const uploadRes = await fetch('/api/admin/system-settings/upload', {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${sessionStorage.getItem('pupsj_token')}` },
-                body: fd
-              });
-              if (!uploadRes.ok) throw new Error('Logo upload failed');
-              const logoData = await uploadRes.json();
-              logoUrl = logoData.url;
-            }
-
-            // 2. Save text settings and image urls
-            const settingsPayload = {
-              app_title: titleInput || 'PUPSJ HUB',
-              app_title_subtitle: subtitleInput || 'San Juan Campus Hub',
-              app_description: descriptionInput || 'PUPSJ HUB is the centralized campus portal designed exclusively for the Polytechnic University of the Philippines San Juan Campus. Engineered to optimize campus communication and student organization coordination, this portal serves as a unified progressive portal for faculty, students, and campus administrators alike.',
-              app_logo: logoUrl,
-              app_landing_hero: currentHeroImages.length > 0 ? currentHeroImages.join(',') : '/landing_hero.png'
-            };
-
-            await api('/api/admin/system-settings', {
-              method: 'POST',
-              body: JSON.stringify(settingsPayload)
-            });
-
-            // Update local state immediately
-            state.systemSettings = settingsPayload;
-            document.title = settingsPayload.app_title;
-
-            showToast('Branding and system settings updated successfully!', 'success');
-            
-            // Re-render everything so changes apply live!
-            render();
-            // Re-navigate to stay on system-maintenance view
-            navigateTo('system-maintenance');
-          } catch (err) {
-            console.error(err);
-            showToast(err.message || 'Failed to save system settings', 'error');
-          } finally {
-            saveBtn.disabled = false;
-            saveBtn.innerHTML = '<i class="fas fa-save"></i> Save Settings';
-          }
-        };
-      }
+      // Initial render of maintenance view
+      renderMaintenanceView();
 
     } catch (e) {
+      console.error(e);
       pageArea.querySelector('.page-content').innerHTML = `
         <div class="empty-state">
           <i class="fas fa-exclamation-triangle"></i>
@@ -6411,9 +9949,54 @@
       ${u.is_active
         ? `<button class="btn btn-secondary btn-sm" style="width:auto;" onclick="window._toggleUser('${u.id}','deactivate')">Disable</button>`
         : `<button class="btn btn-secondary btn-sm" style="width:auto;" onclick="window._toggleUser('${u.id}','activate')">Enable</button>`}
+      ${u.role === 'student' ? `<button class="btn btn-secondary btn-sm" style="width:auto;" onclick="window._editStudentYearLevel('${u.id}', '${escHtml(u.year_level || '1st')}', '${escHtml(u.first_name)} ${escHtml(u.last_name)}')"><i class="fas fa-graduation-cap"></i> Year Level</button>` : ''}
+      <button class="btn btn-secondary btn-sm" style="width:auto;" onclick="window._adminResetUserPassword('${u.id}', '${escHtml(u.first_name)}')"><i class="fas fa-key"></i> Reset PW</button>
       <button class="btn btn-danger btn-sm" style="width:auto;" onclick="window._deleteUser('${u.id}')">Delete</button>
     </div>`;
   }
+  window._adminResetUserPassword = async (id, name) => {
+    if (!await window.showSystemConfirm(`Send password reset email to ${name}?`)) return;
+    try {
+      const res = await api(`/api/admin/users/${id}/reset-password`, { method: 'POST' });
+      showToast(res.message || 'Password reset link sent!', 'success');
+    } catch (err) {
+      showToast(err.message || 'Failed to send password reset', 'error');
+    }
+  };
+  window._editStudentYearLevel = (id, currentYear, name) => {
+    openModal('custom-confirm', {
+      title: 'Edit Student Year Level',
+      message: `Select year level for ${name}:`,
+      submessage: `
+        <div style="margin-top:10px;">
+          <select id="editStudentYearSelect" class="form-input form-select" style="width:100%; font-size:14px; padding:8px 12px;">
+            <option value="1st"${currentYear === '1st' ? ' selected' : ''}>1st Year</option>
+            <option value="2nd"${currentYear === '2nd' ? ' selected' : ''}>2nd Year</option>
+            <option value="3rd"${currentYear === '3rd' ? ' selected' : ''}>3rd Year</option>
+            <option value="4th"${currentYear === '4th' ? ' selected' : ''}>4th Year</option>
+            <option value="Graduated"${currentYear === 'Graduated' ? ' selected' : ''}>Graduated</option>
+          </select>
+        </div>
+      `,
+      yesLabel: 'Save Changes',
+      icon: 'fa-graduation-cap',
+      onConfirm: async () => {
+        const select = document.getElementById('editStudentYearSelect');
+        const newYear = select ? select.value : '';
+        if (!newYear) return;
+        try {
+          const res = await api(`/api/admin/users/${id}/year-level`, {
+            method: 'PATCH',
+            body: JSON.stringify({ year_level: newYear })
+          });
+          showToast(res.message || 'Year level updated!', 'success');
+          if (typeof loadAdminUsers === 'function') loadAdminUsers();
+        } catch (err) {
+          showToast(err.message || 'Failed to update year level', 'error');
+        }
+      }
+    });
+  };
   function _adminActions(u) {
     return `<div style="display:flex;flex-direction:row;flex-wrap:wrap;gap:6px;align-items:center;">
       ${u.is_active
@@ -6429,7 +10012,7 @@
 
   // ── Renders the Registered Users tab content ─────────────────────────────────
   function _renderGroupedUsers(users) {
-    const YEAR_ORDER = ['1st', '2nd', '3rd', '4th'];
+    const YEAR_ORDER = ['1st', '2nd', '3rd', '4th', 'Graduated'];
     const admins   = users.filter(u => u.role === 'admin');
     const faculty  = users.filter(u => u.role === 'faculty');
     const students = users.filter(u => u.role !== 'faculty' && u.role !== 'admin');
@@ -6517,7 +10100,7 @@
           </tr>`).join('');
           return `<details class="admin-year-group" open>
             <summary class="admin-year-summary">
-              ${year} Year <span class="admin-dept-badge" style="margin-left:6px;">${list.length}</span>
+              ${year === 'Graduated' ? 'Graduated' : `${year} Year`} <span class="admin-dept-badge" style="margin-left:6px;">${list.length}</span>
             </summary>
             <div class="admin-table-wrap">
               <table class="admin-table">
@@ -6874,6 +10457,7 @@
 
   // Make navigateTo globally accessible for inline onclick
   window.navigateTo = navigateTo;
+  window._navigate = navigateTo;
   window.openModal = openModal;
 
   // ════════════════════════════════
@@ -6963,6 +10547,7 @@
 
   function openModal(type, modalData) {
     let title, bodyHtml, onSubmit, footerHtml = null;
+    let getWhitelistedUserIds = () => [];
     pendingFiles = [];
 
     switch (type) {
@@ -6985,12 +10570,39 @@
             <label>Position / Title <span class="muted-hint">(optional)</span></label>
             <input type="text" class="form-input" id="adminCreatePosition" placeholder="e.g., Associate Dean" autocomplete="off">
           </div>
+          <div class="form-group">
+            <label>Office / Department <span class="muted-hint">(label only)</span></label>
+            <input type="text" class="form-input" id="adminCreateDept" placeholder="e.g., Student Affairs / Academic Affairs" autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label>Module Access <span class="req">*</span></label>
+            <p class="muted-hint" style="margin:2px 0 8px;">Choose which admin areas this account can access.</p>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px;">
+              ${[
+                ['loading_requests','Loading Requests (schedules)'],
+                ['lost_found','Lost & Found'],
+                ['announcements','Announcements'],
+                ['events','Events'],
+                ['feedback','Feedback'],
+                ['documents','Documents'],
+                ['schedules','Class Schedules'],
+                ['faculty','Faculty'],
+                ['notifications','Notifications'],
+                ['chatbot','PUPBot'],
+                ['pages','Pages'],
+                ['queueing','Queueing'],
+              ].map(([m, label]) => `<label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;cursor:pointer;">
+                <input type="checkbox" class="adminModuleChk" value="${m}"> ${label}</label>`).join('')}
+            </div>
+          </div>
         `;
         onSubmit = async () => {
           const first_name = document.getElementById('adminCreateName').value.trim();
           const email = document.getElementById('adminCreateEmail').value.trim();
           const password = document.getElementById('adminCreatePassword').value;
           const position = document.getElementById('adminCreatePosition').value.trim() || null;
+          const department = document.getElementById('adminCreateDept').value.trim() || null;
+          const modules = [...document.querySelectorAll('.adminModuleChk:checked')].map(c => c.value);
 
           if (!first_name || !email || !password) {
             showToast('Please fill in all required fields', 'error');
@@ -7000,8 +10612,12 @@
             showToast('Password must be at least 6 characters', 'error');
             return;
           }
+          if (!modules.length) {
+            showToast('Select at least one module this admin can access', 'error');
+            return;
+          }
 
-          const payload = { first_name, email, password, department: null, position };
+          const payload = { first_name, email, password, department, position, modules };
           try {
             await api('/api/admin/create-admin', {
               method: 'POST',
@@ -7093,16 +10709,22 @@
         };
         break;
       }
-      case 'announcement':
-        title = 'New Announcement';
+      case 'announcement': {
+        const isEdit = !!modalData;
+        title = isEdit ? 'Edit Announcement' : 'New Announcement';
+        const currentDept = isEdit ? (modalData.department || 'General') : 'General';
+        const currentTitle = isEdit ? (modalData.title || '') : '';
+        const currentContent = isEdit ? (modalData.content || '') : '';
+        const rawImages = isEdit ? normalizeImages(modalData.images) : [];
+
         bodyHtml = `
           <div class="form-group">
             <label>Title</label>
-            <input type="text" class="form-input" id="modalTitle" placeholder="Announcement title">
+            <input type="text" class="form-input" id="modalTitle" placeholder="Announcement title" value="${escHtml(currentTitle)}">
           </div>
           <div class="form-group">
             <label>Content</label>
-            <textarea class="form-input" id="modalContent" rows="4" placeholder="Write your announcement..." style="resize:vertical;"></textarea>
+            <textarea class="form-input" id="modalContent" rows="4" placeholder="Write your announcement..." style="resize:vertical;">${escHtml(currentContent)}</textarea>
           </div>
           <div class="form-group">
             <label>Visibility</label>
@@ -7110,15 +10732,23 @@
               ${(state.user.role === 'admin' || state.user.role === 'faculty' || state.user.role === 'superadmin'
                 ? departments.filter(d => d !== 'All')
                 : ['General', state.user.department].filter(Boolean).filter((v,i,a) => a.indexOf(v)===i)
-              ).map(d => `<option value="${d}"${d === 'General' ? ' selected' : ''}>${d}</option>`).join('')}
+              ).map(d => `<option value="${d}"${d === currentDept ? ' selected' : ''}>${d}</option>`).join('')}
             </select>
             <div class="form-help"><i class="fas fa-info-circle"></i> <strong>General</strong> and <strong>Campus</strong> are visible to everyone. Department options limit the audience to that department.</div>
           </div>
+          ${isEdit && rawImages.length > 0 ? `
           <div class="form-group">
-            <label>Photos</label>
+            <label>Current Photos (${rawImages.length})</label>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+              ${rawImages.map(img => `<img src="${img.image_url}" style="width:54px; height:54px; object-fit:cover; border-radius:6px; border:1px solid var(--border);">`).join('')}
+            </div>
+          </div>
+          ` : ''}
+          <div class="form-group">
+            <label>${isEdit ? 'Upload New Photos (Replaces existing photos if selected)' : 'Photos'}</label>
             ${renderImageUploadWidget('annImages')}
           </div>
-          ${state.user.role !== 'admin' ? '<div class="form-note"><i class="fas fa-clock"></i> Your post will be reviewed by an admin before it appears in the feed.</div>' : ''}`;
+          ${state.user.role !== 'admin' && !isEdit ? '<div class="form-note"><i class="fas fa-clock"></i> Your post will be reviewed by an admin before it appears in the feed.</div>' : ''}`;
         onSubmit = async () => {
           const titleVal = document.getElementById('modalTitle').value.trim();
           const content = document.getElementById('modalContent').value.trim();
@@ -7129,14 +10759,30 @@
           formData.append('title', titleVal);
           formData.append('content', content);
           formData.append('department', department);
+          if (isEdit && pendingFiles.length > 0) {
+            formData.append('replace_images', 'true');
+          }
           pendingFiles.forEach(f => formData.append('images', f));
 
-          const res = await apiFormData('/api/announcements', formData);
-          showToast(res.message || 'Announcement posted!', 'success');
-          closeModal();
-          loadAnnouncements();
+          try {
+            if (isEdit) {
+              const res = await apiFormData(`/api/announcements/${modalData.id}`, formData, 'PATCH');
+              showToast(res.message || 'Announcement updated!', 'success');
+            } else {
+              const res = await apiFormData('/api/announcements', formData);
+              showToast(res.message || 'Announcement posted!', 'success');
+            }
+            closeModal();
+            loadAnnouncements();
+            if (state.currentPageProfile && typeof openPageProfile === 'function' && state.currentPageProfile.page) {
+              openPageProfile(state.currentPageProfile.page.id);
+            }
+          } catch (err) {
+            showToast(err.message || 'Failed to save announcement', 'error');
+          }
         };
         break;
+      }
 
       case 'event': {
         const isEdit = !!modalData;
@@ -7195,14 +10841,32 @@
               </div>
               <div class="form-group">
                 <label>Visibility</label>
-                <select class="form-input form-select" id="modalDept">
-                  ${(state.user.role === 'admin' || state.user.role === 'faculty' || state.user.role === 'superadmin'
-                    ? departments.filter(d => d !== 'All')
-                    : ['General', state.user.department].filter(Boolean).filter((v,i,a) => a.indexOf(v)===i)
-                  ).map(d => `<option value="${d}"${isEdit && modalData.department === d ? ' selected' : (d === 'General' ? ' selected' : '')}>${d}</option>`).join('')}
-                </select>
-                <div class="form-help"><i class="fas fa-info-circle"></i> <strong>General</strong> and <strong>Campus</strong> are visible to everyone. Department options limit the event to that department.</div>
+                ${state.user.role === 'student' ? `
+                  <select class="form-input form-select" id="modalDept">
+                    ${['General', state.user.department].filter(Boolean).filter((v,i,a) => a.indexOf(v)===i)
+                      .map(d => `<option value="${d}"${isEdit && modalData.department === d ? ' selected' : (d === 'General' ? ' selected' : '')}>${d}</option>`).join('')}
+                  </select>
+                  <div class="form-help"><i class="fas fa-info-circle"></i> <strong>General</strong> is visible to everyone. Your department option limits the event to your department only.</div>
+                ` : `
+                  <select class="form-input form-select" id="modalDept">
+                    ${(state.user.role === 'admin' || state.user.role === 'faculty' || state.user.role === 'superadmin'
+                      ? departments.filter(d => d !== 'All')
+                      : [state.user.department].filter(Boolean)
+                    ).map(d => `<option value="${d}"${isEdit && modalData.department === d ? ' selected' : ''}>${d}</option>`).join('')}
+                  </select>
+                  <div class="form-help"><i class="fas fa-info-circle"></i> <strong>General</strong> and <strong>Campus</strong> are visible to everyone. Department options limit the event to that department.</div>
+                `}
               </div>
+              ${state.user.role === 'student' ? `
+              <div class="form-group">
+                <label>Posting As (Page) <span class="req">*</span></label>
+                <select class="form-input form-select" id="modalPageId">
+                  <option value="">-- Select a page --</option>
+                  ${state.myPages.filter(p => p.status === 'approved').map(p => `<option value="${p.id}"${isEdit && modalData.page_id === p.id ? ' selected' : ''}>${escHtml(p.name)}</option>`).join('')}
+                </select>
+                <div class="form-help"><i class="fas fa-info-circle"></i> Your event will be posted on behalf of this page and requires admin approval.</div>
+              </div>
+              ` : ''}
               ${isEdit ? '' : `
               <div class="form-group">
                 <label>Event Photos</label>
@@ -7210,7 +10874,7 @@
               </div>
               `}
             </div>
-            
+
             <div class="event-modal-survey-column">
               <!-- CUSTOM QUESTIONNAIRE BUILDER SECTION -->
               ${state.isEventEnded ? `
@@ -7230,8 +10894,8 @@
               <div id="builderQuestionsList" style="display:flex; flex-direction:column; gap:12px;"></div>
             </div>
           </div>
-          
-          ${state.user.role !== 'admin' ? '<div class="form-note" style="margin-top: 16px;"><i class="fas fa-clock"></i> Your event will be reviewed by an admin before it appears in the calendar.</div>' : ''}
+
+          ${state.user.role !== 'admin' && state.user.role !== 'superadmin' ? '<div class="form-note" style="margin-top: 16px;"><i class="fas fa-clock"></i> Your event will be reviewed by an admin before it appears in the calendar.</div>' : ''}
         `;
         
         onSubmit = async () => {
@@ -7242,7 +10906,10 @@
           const start_time = document.getElementById('modalStart').value;
           const end_time = document.getElementById('modalEnd').value;
           const department = document.getElementById('modalDept').value;
+          const pageIdEl = document.getElementById('modalPageId');
+          const page_id = pageIdEl ? pageIdEl.value : null;
           if (!titleVal || !event_date) { showToast('Please fill in title and date', 'error'); return; }
+          if (state.user.role === 'student' && !page_id) { showToast('Please select a page to post on behalf of', 'error'); return; }
 
           const compiledSchema = compileFormBuilderSchema();
 
@@ -7273,6 +10940,7 @@
             formData.append('start_time', start_time);
             formData.append('end_time', end_time);
             formData.append('department', department);
+            if (page_id) formData.append('page_id', page_id);
             formData.append('feedback_form_schema', JSON.stringify(compiledSchema));
             pendingFiles.forEach(f => formData.append('images', f));
 
@@ -7490,6 +11158,11 @@
             if (submitButton) submitButton.disabled = false;
             return; 
           }
+          if (!/[a-zA-Z]{3,}/.test(data.description)) {
+            showToast('Description must include descriptive words, not just numbers or symbols', 'error');
+            if (submitButton) submitButton.disabled = false;
+            return;
+          }
           if (!data.contact_info) {
             showToast('Contact Information is required', 'error');
             if (submitButton) submitButton.disabled = false;
@@ -7523,14 +11196,7 @@
       case 'section-schedule':
         title = 'Upload Schedule';
         bodyHtml = `
-          <div class="form-group">
-            <label>Schedule Target Category</label>
-            <div class="lf-tabs" style="margin-bottom:16px;">
-              <button type="button" class="lf-tab active" id="ssTargetStudent">Student</button>
-              <button type="button" class="lf-tab" id="ssTargetFaculty">Faculty</button>
-            </div>
-            <input type="hidden" id="ssTargetType" value="section">
-          </div>
+          <input type="hidden" id="ssTargetType" value="section">
           <div class="form-group">
             <label>Schedule Title <span class="req">*</span></label>
             <input type="text" class="form-input" id="ssTitle" placeholder="e.g., BSIT 1-A Schedule AY 2024-2025" required>
@@ -7542,7 +11208,7 @@
               <div class="form-group">
                 <label>Department</label>
                 <select class="form-input form-select" id="ssDept">
-                  ${departments.filter(d => d !== 'All').map(d => `<option value="${d}">${d}</option>`).join('')}
+                  ${departments.filter(d => !['All', 'General', 'Campus'].includes(d)).map(d => `<option value="${d}">${d}</option>`).join('')}
                 </select>
               </div>
               <div class="form-group">
@@ -7561,21 +11227,6 @@
             </div>
           </div>
 
-          <!-- FACULTY FIELDS -->
-          <div id="ssFacultyFields" style="display:none;">
-            <div class="form-group" style="position:relative;">
-              <label>Search & Select Faculty Member <span class="req">*</span></label>
-              <div style="position:relative;">
-                <input type="text" class="form-input" id="ssFacultySearch" placeholder="Type faculty name to search..." autocomplete="off">
-                <div id="ssFacultySuggestions" class="autocomplete-suggestions" style="display:none; position:absolute; top:100%; left:0; right:0; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; max-height:180px; overflow-y:auto; z-index:1000; box-shadow:var(--shadow-lg); padding: 4px 0;"></div>
-              </div>
-              <input type="hidden" id="ssFacultyId" value="">
-              <div id="ssFacultySelectedName" style="margin-top:8px; font-weight:600; font-size:13px; color:#1565c0; display:none;">
-                <i class="fas fa-check-circle"></i> Selected Faculty: <span id="ssFacultySelectedLabel" style="font-weight:700;"></span>
-              </div>
-            </div>
-          </div>
-
           <div class="form-group">
             <label id="ssUrlLabel">Schedule Link (optional)</label>
             <input type="url" class="form-input" id="ssUrl" placeholder="https://drive.google.com/...">
@@ -7583,7 +11234,6 @@
           </div>`;
           
         onSubmit = async () => {
-          const target_type = document.getElementById('ssTargetType').value;
           const title_val = document.getElementById('ssTitle').value.trim();
           const embed_url = document.getElementById('ssUrl').value.trim();
 
@@ -7592,47 +11242,25 @@
             return;
           }
 
-          if (target_type === 'section') {
-            const department = document.getElementById('ssDept').value;
-            const year_level = document.getElementById('ssYear').value;
-            const section = document.getElementById('ssSection').value.trim();
-            if (!section) {
-              showToast('Section is required for Student schedules', 'error');
-              return;
-            }
-
-            await api('/api/section-schedules', {
-              method: 'POST',
-              body: JSON.stringify({
-                target_type: 'section',
-                title: title_val,
-                department,
-                year_level,
-                section,
-                embed_url
-              })
-            });
-          } else {
-            const faculty_id = document.getElementById('ssFacultyId').value;
-            if (!faculty_id) {
-              showToast('Please search and select a faculty member', 'error');
-              return;
-            }
-            if (!embed_url) {
-              showToast('Embedded link is required for Faculty schedules', 'error');
-              return;
-            }
-
-            await api('/api/section-schedules', {
-              method: 'POST',
-              body: JSON.stringify({
-                target_type: 'faculty',
-                title: title_val,
-                faculty_id,
-                embed_url
-              })
-            });
+          const department = document.getElementById('ssDept').value;
+          const year_level = document.getElementById('ssYear').value;
+          const section = document.getElementById('ssSection').value.trim();
+          if (!section) {
+            showToast('Section is required', 'error');
+            return;
           }
+
+          await api('/api/section-schedules', {
+            method: 'POST',
+            body: JSON.stringify({
+              target_type: 'section',
+              title: title_val,
+              department,
+              year_level,
+              section,
+              embed_url
+            })
+          });
 
           showToast('Schedule posted!', 'success');
           closeModal();
@@ -7799,8 +11427,56 @@
         break;
       }
 
-      case 'doc-category':
+      case 'feedback-edit': {
+        const fbData = modalData || {};
+        const currentRating = parseInt(fbData.rating, 10) || 5;
+        const currentComment = fbData.comment || '';
+        title = 'Edit Feedback';
+        bodyHtml = `
+          <div class="feedback-form" style="display:flex; flex-direction:column; gap:16px;">
+            <div class="star-picker" id="modalFeedbackStarPicker" style="display:flex; align-items:center; gap:10px;">
+              <span style="font-weight:600; font-size:14px;">Your Rating:</span>
+              <div class="star-rating" id="modalFeedbackStars" style="display:flex; gap:6px; font-size:20px; color:var(--warning, #f59e0b); cursor:pointer;">
+                ${[1, 2, 3, 4, 5].map(i => `<i class="${i <= currentRating ? 'fas' : 'far'} fa-star" data-val="${i}"></i>`).join('')}
+              </div>
+            </div>
+            <input type="hidden" id="modalFeedbackRating" value="${currentRating}">
+            <div class="form-group" style="margin-bottom:0;">
+              <label>Your Review</label>
+              <textarea class="form-input" id="modalFeedbackComment" rows="4" placeholder="Share your experience about this event..." style="resize:vertical;">${escHtml(currentComment)}</textarea>
+            </div>
+          </div>
+        `;
+        onSubmit = async () => {
+          const rating = parseInt(document.getElementById('modalFeedbackRating').value, 10) || 5;
+          const comment = document.getElementById('modalFeedbackComment').value.trim();
+
+          try {
+            await api(`/api/feedback/${fbData.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ rating, comment })
+            });
+            showToast('Feedback updated successfully', 'success');
+            closeModal();
+            if (fbData.eventId && typeof window._openEventDetail === 'function') {
+              window._openEventDetail(fbData.eventId);
+            }
+          } catch (err) {
+            showToast(err.message || 'Failed to update feedback', 'error');
+          }
+        };
+        break;
+      }
+
+      case 'doc-category': {
         title = 'New Category';
+        const deptOptions = (state.user.role === 'admin' || state.user.role === 'superadmin' || state.user.role === 'faculty'
+          ? departments.filter(d => d !== 'All')
+          : Array.from(new Set(['General', state.user.department].filter(Boolean)))
+        ).filter(d => d !== 'Campus');
+        if (!deptOptions.includes('Specific Students')) {
+          deptOptions.push('Specific Students');
+        }
         bodyHtml = `
           <div class="form-group">
             <label>Category Name</label>
@@ -7809,16 +11485,46 @@
           <div class="form-group">
             <label>Description (optional)</label>
             <textarea class="form-input" id="modalCatDesc" rows="3" placeholder="Brief description of this category..." style="resize:vertical;"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Visible to</label>
+            <select class="form-input form-select" id="modalCatDept">
+              ${deptOptions.map(d => `<option value="${d}"${d === 'General' ? ' selected' : ''}>${d === 'Specific Students' ? 'Specific Users' : escHtml(d)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="form-group" id="catAutocompleteGroup" style="display:none; margin-top: 14px;">
+            <label>Search and Whitelist Users (Students & Faculty)</label>
+            <div class="user-autocomplete-wrap" style="position:relative;">
+              <i class="fas fa-user-plus search-box-icon" style="position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--text-light); font-size:12px;"></i>
+              <input type="text" class="form-input" id="catUserSearchInput" placeholder="Search by name, email, or ID..." style="padding-left:34px;">
+              <div class="user-autocomplete-results" id="catUserSearchResults" style="display:none;"></div>
+            </div>
+            <div class="user-tags-container" id="catUserTagsContainer" style="margin-top:10px;"></div>
           </div>`;
         onSubmit = async () => {
           const name = document.getElementById('modalCatName').value.trim();
           if (!name) { showToast('Please enter a category name', 'error'); return; }
-          await api('/api/documents/categories', { method: 'POST', body: JSON.stringify({ name, description: document.getElementById('modalCatDesc').value.trim() }) });
+          const department = document.getElementById('modalCatDept').value;
+          const whitelist_student_ids = getWhitelistedUserIds();
+          if (department === 'Specific Students' && whitelist_student_ids.length === 0) {
+            showToast('Please select at least one user for Specific Users visibility', 'error');
+            return;
+          }
+          await api('/api/documents/categories', {
+            method: 'POST',
+            body: JSON.stringify({
+              name,
+              description: document.getElementById('modalCatDesc').value.trim(),
+              department,
+              whitelist_student_ids
+            })
+          });
           showToast('Category created!', 'success');
           closeModal();
           loadDocuments();
         };
         break;
+      }
 
       case 'doc-category-edit': {
         title = 'Edit Folder';
@@ -7854,12 +11560,15 @@
             </div>
             <div class="user-tags-container" id="catUserTagsContainer" style="margin-top:10px;"></div>
           </div>`;
-        let getWhitelistedUserIds = () => [];
         onSubmit = async () => {
           const name = document.getElementById('modalCatName').value.trim();
           if (!name) { showToast('Please enter a category name', 'error'); return; }
           const department = document.getElementById('modalCatDept').value;
           const whitelist_student_ids = getWhitelistedUserIds();
+          if (department === 'Specific Students' && whitelist_student_ids.length === 0) {
+            showToast('Please select at least one user for Specific Users visibility', 'error');
+            return;
+          }
           await api(`/api/documents/categories/${modalData.id}`, { 
             method: 'PATCH', 
             body: JSON.stringify({ 
@@ -7876,8 +11585,15 @@
         break;
       }
 
-      case 'doc-upload':
+      case 'doc-upload': {
         title = 'Upload Document';
+        const deptOptions = (state.user.role === 'admin' || state.user.role === 'superadmin' || state.user.role === 'faculty'
+          ? departments.filter(d => d !== 'All')
+          : Array.from(new Set(['General', state.user.department].filter(Boolean)))
+        ).filter(d => d !== 'Campus');
+        if (!deptOptions.includes('Specific Students')) {
+          deptOptions.push('Specific Students');
+        }
         bodyHtml = `
           <div class="form-group">
             <label>Title</label>
@@ -7898,12 +11614,18 @@
             <div class="form-group">
               <label>Visible to</label>
               <select class="form-input form-select" id="modalDocDept">
-                ${(state.user.role === 'admin' || state.user.role === 'superadmin' || state.user.role === 'faculty'
-                  ? departments.filter(d => d !== 'All')
-                  : ['General', state.user.department].filter(Boolean)
-                ).filter(d => d !== 'Campus').map(d => `<option value="${d}"${(state.user.role !== 'admin' && state.user.role !== 'superadmin' && state.user.role !== 'faculty') && d === state.user.department ? ' selected' : ''}>${escHtml(d)}</option>`).join('')}
+                ${deptOptions.map(d => `<option value="${d}"${d === 'General' ? ' selected' : ''}>${d === 'Specific Students' ? 'Specific Users' : escHtml(d)}</option>`).join('')}
               </select>
             </div>
+          </div>
+          <div class="form-group" id="docAutocompleteGroup" style="display:none; margin-top: 14px;">
+            <label>Search and Whitelist Users (Students & Faculty)</label>
+            <div class="user-autocomplete-wrap" style="position:relative;">
+              <i class="fas fa-user-plus search-box-icon" style="position:absolute; left:12px; top:50%; transform:translateY(-50%); color:var(--text-light); font-size:12px;"></i>
+              <input type="text" class="form-input" id="docUserSearchInput" placeholder="Search by name, email, or ID..." style="padding-left:34px;">
+              <div class="user-autocomplete-results" id="docUserSearchResults" style="display:none;"></div>
+            </div>
+            <div class="user-tags-container" id="docUserTagsContainer" style="margin-top:10px;"></div>
           </div>
           <div class="form-group">
             <label>File</label>
@@ -7924,20 +11646,32 @@
           if (!category_id) { showToast('Please select a category', 'error'); return; }
           if (!pendingFiles[0]) { showToast('Please select a file', 'error'); return; }
 
+          const department = document.getElementById('modalDocDept').value;
+          const whitelist_student_ids = getWhitelistedUserIds();
+          if (department === 'Specific Students' && whitelist_student_ids.length === 0) {
+            showToast('Please select at least one user for Specific Users visibility', 'error');
+            return;
+          }
+
           const formData = new FormData();
           formData.append('title', docTitle);
           formData.append('description', document.getElementById('modalDocDesc').value.trim());
           formData.append('category_id', category_id);
-          const deptEl = document.getElementById('modalDocDept');
-          if (deptEl) formData.append('department', deptEl.value);
+          formData.append('department', department);
+          formData.append('whitelist_student_ids', JSON.stringify(whitelist_student_ids));
           formData.append('file', pendingFiles[0]);
 
-          await apiFormData('/api/documents', formData);
-          showToast('Document uploaded!', 'success');
-          closeModal();
-          loadDocuments();
+          try {
+            await apiFormData('/api/documents', formData);
+            showToast('Document uploaded!', 'success');
+            closeModal();
+            loadDocuments();
+          } catch (err) {
+            showToast(err.message || 'Failed to upload document', 'error');
+          }
         };
         break;
+      }
 
       case 'doc-edit': {
         title = 'Edit Document';
@@ -7981,25 +11715,33 @@
             </div>
             <div class="user-tags-container" id="docUserTagsContainer" style="margin-top:10px;"></div>
           </div>`;
-        let getWhitelistedUserIds = () => [];
         onSubmit = async () => {
           const docTitle = document.getElementById('modalDocTitle').value.trim();
           const category_id = document.getElementById('modalDocCat').value;
           const department = document.getElementById('modalDocDept').value;
           if (!docTitle) { showToast('Please enter a title', 'error'); return; }
-          await api(`/api/documents/${modalData.id}`, {
-            method: 'PATCH',
-            body: JSON.stringify({
-              title: docTitle,
-              description: document.getElementById('modalDocDesc').value.trim(),
-              category_id,
-              department,
-              whitelist_student_ids: getWhitelistedUserIds()
-            }),
-          });
-          showToast('Document updated!', 'success');
-          closeModal();
-          loadDocuments();
+          const whitelist_student_ids = getWhitelistedUserIds();
+          if (department === 'Specific Students' && whitelist_student_ids.length === 0) {
+            showToast('Please select at least one user for Specific Users visibility', 'error');
+            return;
+          }
+          try {
+            await api(`/api/documents/${modalData.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({
+                title: docTitle,
+                description: document.getElementById('modalDocDesc').value.trim(),
+                category_id,
+                department,
+                whitelist_student_ids
+              }),
+            });
+            showToast('Document updated!', 'success');
+            closeModal();
+            loadDocuments();
+          } catch (err) {
+            showToast(err.message || 'Failed to update document', 'error');
+          }
         };
         break;
       }
@@ -8204,10 +11946,10 @@
         break;
 
       case 'teachingUpload':
-        title = 'Upload Teaching Schedule';
+        title = 'Upload Course Preference';
         bodyHtml = `
           <div class="csv-upload-info">
-            <p><strong>Heads up:</strong> uploading replaces your current teaching schedule.</p>
+            <p><strong>Heads up:</strong> uploading replaces your current course preferences.</p>
             <p>CSV columns: <code>subject_code, subject_name, day_of_week, start_time, end_time, room, section</code></p>
             <p>Times can be <code>08:00</code>, <code>8:00 AM</code>, or <code>13:30</code>. Need a starter? <a href="/api/faculty-schedules/template" download>Download template</a>.</p>
           </div>
@@ -8357,18 +12099,11 @@
         const e         = existing || {};
         const yearOpts  = ['1st','2nd','3rd','4th'];
         const sectOpts  = ['1-1','1-2','1-3','2-1','2-2','2-3','3-1','3-2','3-3','4-1','4-2','4-3'];
-        const deptOpts  = departments.filter(d => d !== 'All');
+        const deptOpts  = departments.filter(d => !['All', 'General', 'Campus'].includes(d));
         
         title = existing ? 'Edit Schedule' : 'Upload Schedule';
         bodyHtml = `
-          <div class="form-group">
-            <label>Schedule Target Category</label>
-            <div class="lf-tabs" style="margin-bottom:16px;">
-              <button type="button" class="lf-tab active" id="ssTargetStudent">Student</button>
-              <button type="button" class="lf-tab" id="ssTargetFaculty">Faculty</button>
-            </div>
-            <input type="hidden" id="ssTargetType" value="section">
-          </div>
+          <input type="hidden" id="ssTargetType" value="section">
           <div class="form-group">
             <label>Schedule Title <span class="req">*</span></label>
             <input type="text" class="form-input" id="ssTitle" placeholder="e.g., BSIT 1-A Schedule AY 2024-2025" value="${escHtml(e.title || '')}" required>
@@ -8397,21 +12132,6 @@
             </div>
           </div>
 
-          <!-- FACULTY FIELDS -->
-          <div id="ssFacultyFields" style="display:none;">
-            <div class="form-group" style="position:relative;">
-              <label>Search & Select Faculty Member <span class="req">*</span></label>
-              <div style="position:relative;">
-                <input type="text" class="form-input" id="ssFacultySearch" placeholder="Type faculty name to search..." autocomplete="off">
-                <div id="ssFacultySuggestions" class="autocomplete-suggestions" style="display:none; position:absolute; top:100%; left:0; right:0; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; max-height:180px; overflow-y:auto; z-index:1000; box-shadow:var(--shadow-lg); padding: 4px 0;"></div>
-              </div>
-              <input type="hidden" id="ssFacultyId" value="${escHtml(e.faculty_id || '')}">
-              <div id="ssFacultySelectedName" style="margin-top:8px; font-weight:600; font-size:13px; color:#1565c0; display:${e.faculty_id ? 'block' : 'none'};">
-                <i class="fas fa-check-circle"></i> Selected Faculty: <span id="ssFacultySelectedLabel" style="font-weight:700;">${escHtml(e.faculty_name || '')}</span>
-              </div>
-            </div>
-          </div>
-
           <div class="form-group">
             <label id="ssUrlLabel">Schedule Link (optional)</label>
             <input type="url" class="form-input" id="ssUrl" placeholder="https://drive.google.com/..." value="${escHtml(e.embed_url || '')}">
@@ -8419,7 +12139,6 @@
           </div>`;
           
         onSubmit = async () => {
-          const target_type = document.getElementById('ssTargetType').value;
           const title_val = document.getElementById('ssTitle').value.trim();
           const embed_url = document.getElementById('ssUrl').value.trim();
 
@@ -8428,56 +12147,29 @@
             return;
           }
 
-          if (target_type === 'section') {
-            const department = document.getElementById('ssDept').value;
-            const year_level = document.getElementById('ssYear').value;
-            const section = document.getElementById('ssSection').value.trim();
-            if (!section) {
-              showToast('Section is required for Student schedules', 'error');
-              return;
-            }
+          const department = document.getElementById('ssDept').value;
+          const year_level = document.getElementById('ssYear').value;
+          const section = document.getElementById('ssSection').value.trim();
+          if (!section) {
+            showToast('Section is required for Student schedules', 'error');
+            return;
+          }
 
-            const body = JSON.stringify({
-              target_type: 'section',
-              title: title_val,
-              department,
-              year_level,
-              section,
-              embed_url
-            });
+          const body = JSON.stringify({
+            target_type: 'section',
+            title: title_val,
+            department,
+            year_level,
+            section,
+            embed_url
+          });
 
-            if (existing) {
-              await api(`/api/section-schedules/${existing.id}`, { method: 'PATCH', body });
-              showToast('Schedule updated', 'success');
-            } else {
-              await api('/api/section-schedules', { method: 'POST', body });
-              showToast('Schedule posted!', 'success');
-            }
+          if (existing) {
+            await api(`/api/section-schedules/${existing.id}`, { method: 'PATCH', body });
+            showToast('Schedule updated', 'success');
           } else {
-            const faculty_id = document.getElementById('ssFacultyId').value;
-            if (!faculty_id) {
-              showToast('Please search and select a faculty member', 'error');
-              return;
-            }
-            if (!embed_url) {
-              showToast('Embedded link is required for Faculty schedules', 'error');
-              return;
-            }
-
-            const body = JSON.stringify({
-              target_type: 'faculty',
-              title: title_val,
-              faculty_id,
-              embed_url
-            });
-
-            if (existing) {
-              await api(`/api/section-schedules/${existing.id}`, { method: 'PATCH', body });
-              showToast('Schedule updated', 'success');
-            } else {
-              await api('/api/section-schedules', { method: 'POST', body });
-              showToast('Schedule posted!', 'success');
-            }
+            await api('/api/section-schedules', { method: 'POST', body });
+            showToast('Schedule posted!', 'success');
           }
 
           closeModal();
@@ -8841,6 +12533,40 @@
     if (type === 'lostfound') bindImageUpload('lfImages');
     if (type === 'lostfound-edit') bindImageUpload('lfImagesEdit');
     if (type === 'post-as-page') bindImageUpload('pagePostImages');
+
+    if (type === 'feedback-edit') {
+      const stars = document.querySelectorAll('#modalFeedbackStars i');
+      const ratingInput = document.getElementById('modalFeedbackRating');
+      if (stars && ratingInput) {
+        stars.forEach(star => {
+          star.onclick = () => {
+            const val = parseInt(star.dataset.val, 10);
+            ratingInput.value = val;
+            stars.forEach((s, i) => {
+              const active = i < val;
+              s.classList.toggle('fas', active);
+              s.classList.toggle('far', !active);
+            });
+          };
+          star.onmouseenter = () => {
+            const val = parseInt(star.dataset.val, 10);
+            stars.forEach((s, i) => {
+              const hover = i < val;
+              s.classList.toggle('fas', hover || i < parseInt(ratingInput.value, 10));
+              s.classList.toggle('far', !(hover || i < parseInt(ratingInput.value, 10)));
+            });
+          };
+          star.onmouseleave = () => {
+            const currentVal = parseInt(ratingInput.value, 10);
+            stars.forEach((s, i) => {
+              const active = i < currentVal;
+              s.classList.toggle('fas', active);
+              s.classList.toggle('far', !active);
+            });
+          };
+        });
+      }
+    }
 
     // Autocomplete for Category Create
     if (type === 'doc-category') {
@@ -9680,24 +13406,58 @@
       if (state.systemSettings && state.systemSettings.app_title) {
         document.title = state.systemSettings.app_title;
       }
+      state.activeTerm = (state.systemSettings && state.systemSettings.active_term) || 'FIRST_SEMESTER';
+      state.activeYear = (state.systemSettings && state.systemSettings.active_year) || '2025-2026';
     } catch (err) {
       console.warn('System settings failed to load, falling back to default branding.', err);
       state.systemSettings = {};
+      state.activeTerm = 'FIRST_SEMESTER';
+      state.activeYear = '2025-2026';
     }
 
     // Handle email verification / password reset tokens in the URL
     const urlParams = new URLSearchParams(window.location.search);
     const verifyToken = urlParams.get('verify');
-    const resetToken  = urlParams.get('reset');
+    const verifySuccessMsg = urlParams.get('verify_success');
+    const verifyErrorMsg = urlParams.get('verify_error');
+    const resetToken  = urlParams.get('reset') || sessionStorage.getItem('pupsj_reset_token');
+
+    if (verifySuccessMsg) {
+      window.history.replaceState({}, document.title, '/');
+      authMode = 'verify-success';
+      state.verifyMessage = verifySuccessMsg;
+      state.user = null;
+      render();
+      return;
+    }
+
+    if (verifyErrorMsg) {
+      window.history.replaceState({}, document.title, '/');
+      authMode = 'verify-error';
+      state.verifyMessage = verifyErrorMsg;
+      state.user = null;
+      render();
+      return;
+    }
 
     if (verifyToken) {
       // Clean URL immediately
+      const verifyEmail = urlParams.get('email') || '';
       window.history.replaceState({}, document.title, '/');
       authMode = 'verifying';
       state.user = null;
       render();
       try {
-        const data = await api(`/api/auth/verify-email?token=${encodeURIComponent(verifyToken)}`);
+        const queryStr = `/api/auth/verify-email?token=${encodeURIComponent(verifyToken.trim())}${verifyEmail ? `&email=${encodeURIComponent(verifyEmail.trim())}` : ''}`;
+        const data = await api(queryStr);
+        if (data.token && data.user) {
+          sessionStorage.setItem('pupsj_token', data.token);
+          localStorage.removeItem('pupsj_token');
+          state.user = data.user;
+          showToast(`${getGreeting()}, ${state.user.first_name}! Your email is verified and you are now logged in.`, 'success');
+          render();
+          return;
+        }
         authMode = 'verify-success';
         state.verifyMessage = data.message;
       } catch (err) {
@@ -9709,9 +13469,13 @@
     }
 
     if (resetToken) {
-      window.history.replaceState({}, document.title, '/');
+      sessionStorage.setItem('pupsj_reset_token', resetToken);
+      if (urlParams.get('reset')) {
+        window.history.replaceState({}, document.title, '/');
+      }
       authMode = 'reset-password';
       state.resetToken = resetToken;
+      state.authViewActive = true;
       state.user = null;
       render();
       return;
@@ -9719,6 +13483,7 @@
 
     // Only hit /api/auth/me if we actually have a stored token — avoids a
     // noisy 401 in the browser console when the user is simply not logged in.
+    localStorage.removeItem('pupsj_token'); // Clean up any old cross-tab token
     const storedToken = sessionStorage.getItem('pupsj_token');
     if (storedToken) {
       try {
@@ -9727,6 +13492,7 @@
       } catch (e) {
         // Token is expired or invalid — clear it silently
         sessionStorage.removeItem('pupsj_token');
+        localStorage.removeItem('pupsj_token');
         state.user = null;
       }
     } else {
@@ -9737,6 +13503,7 @@
 
   window._guestExit = () => {
     sessionStorage.removeItem('pupsj_token');
+    localStorage.removeItem('pupsj_token');
     stopNotificationsPolling();
     state.user = null;
     state.currentPage = 'announcements';
@@ -9752,12 +13519,17 @@
     }, 100);
   };
 
-  window._guestLogin = async () => {
+  window._guestLogin = async (targetPage = 'announcements') => {
     try {
+      if (state.user && sessionStorage.getItem('pupsj_token')) {
+        navigateTo(targetPage || 'announcements');
+        return;
+      }
       const data = await api('/api/auth/guest-login', { method: 'POST' });
       sessionStorage.setItem('pupsj_token', data.token);
+      localStorage.removeItem('pupsj_token');
       state.user = data.user;
-      state.currentPage = 'announcements';
+      state.currentPage = targetPage || 'announcements';
       showToast('Welcome! You are browsing as a guest.', 'info');
       render();
     } catch (err) {
@@ -9765,6 +13537,1630 @@
     }
   };
 
+  async function renderStudentQueueing() {
+    const pageArea = document.getElementById('pageArea');
+    pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Office Queueing & Appointments</h1><p class="page-subtitle">Get a same-day queue ticket or schedule a future appointment with campus offices.</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;
+    try {
+      const offices = await api('/api/queueing/offices');
+
+      // Format date helper that avoids UTC timezone day shifts
+      const formatLocalDate = (dateStr) => {
+        if (!dateStr) return '';
+        const parts = String(dateStr).split('-');
+        if (parts.length === 3) {
+          const y = parseInt(parts[0], 10);
+          const m = parseInt(parts[1], 10) - 1;
+          const d = parseInt(parts[2], 10);
+          const dt = new Date(y, m, d);
+          return {
+            full: dt.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }),
+            month: dt.toLocaleDateString('en-US', { month: 'short' }),
+            day: String(d),
+            dayOfWeek: dt.getDay()
+          };
+        }
+        return { full: dateStr, month: '', day: '', dayOfWeek: -1 };
+      };
+
+      // Calculate local minimum date (strictly tomorrow in local time)
+      const now = new Date();
+      const tmrw = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      const minDateStr = `${tmrw.getFullYear()}-${String(tmrw.getMonth() + 1).padStart(2, '0')}-${String(tmrw.getDate()).padStart(2, '0')}`;
+      const localToday = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+      pageArea.innerHTML = `
+        <div class="page-header">
+          <h1 class="page-title">Office Queueing & Appointments</h1>
+          <p class="page-subtitle">Get a same-day queue ticket or book a scheduled appointment before visiting an office.</p>
+        </div>
+        <div class="page-content">
+          <div class="student-queue-layout">
+            <!-- LEFT MAIN CARD -->
+            <section class="student-queue-ticket-card">
+              <!-- Side-by-side Tabs -->
+              <div class="tabs queue-tabs" role="tablist">
+                <button type="button" class="tab-btn active" id="queueTabWalkIn" role="tab" aria-selected="true">
+                  <i class="fas fa-ticket-alt"></i>
+                  <span>Walk-in Queue</span>
+                </button>
+                <button type="button" class="tab-btn" id="queueTabAppointment" role="tab" aria-selected="false">
+                  <i class="fas fa-calendar-check"></i>
+                  <span>Book Appointment</span>
+                </button>
+              </div>
+
+              <!-- Active Live Ticket Notice (Visible whenever an active ticket exists) -->
+              <div id="studentQueueActive" class="queue-student-status-area"></div>
+
+              <!-- ═════════════════════════════════════════
+                   TAB 1: WALK-IN QUEUE
+                   ═════════════════════════════════════════ -->
+              <div id="queueWalkInSection" class="queue-tab-panel">
+                <div class="queue-panel-header">
+                  <div class="queue-panel-header-icon"><i class="fas fa-ticket-alt"></i></div>
+                  <div>
+                    <span class="queue-panel-kicker">Same-Day Walk-in</span>
+                    <h2 class="queue-panel-title">Get a Queue Ticket</h2>
+                    <p class="queue-panel-desc">Join today's live office queue. Walk-in queueing is open daily from 06:00 to 18:00.</p>
+                  </div>
+                </div>
+
+                <!-- Instant Ticket Result Alert -->
+                <div id="studentQueueResult"></div>
+
+                <div class="form-group">
+                  <label for="walkInOffice">Office</label>
+                  <select id="walkInOffice" class="form-input form-select">
+                    <option value="">Select an office</option>
+                    ${offices.map(o => `<option value="${o.id}">${escHtml(o.name)}</option>`).join('')}
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="walkInPurpose">Purpose <span class="muted-hint" style="font-weight:400;text-transform:none;letter-spacing:0;">(optional)</span></label>
+                  <input id="walkInPurpose" class="form-input" placeholder="e.g. Document request, Inquiries, Clearance">
+                </div>
+
+                <div class="form-group">
+                  <label for="walkInPriority">Are you part of a priority group?</label>
+                  <select id="walkInPriority" class="form-input form-select">
+                    <option value="no">No</option>
+                    <option value="yes">Yes (PWD, Senior Citizen, Pregnant)</option>
+                  </select>
+                </div>
+
+                <div id="walkInPriorityGroup" class="form-group" style="display:none;">
+                  <label for="walkInPriorityType">Specify Priority Group</label>
+                  <input id="walkInPriorityType" class="form-input" placeholder="e.g. PWD, Senior Citizen, Pregnant" maxlength="80">
+                </div>
+
+                <button type="button" id="studentQueueJoin" class="btn btn-primary btn-queue-action">
+                  <i class="fas fa-ticket-alt"></i> Get Queue Ticket
+                </button>
+              </div>
+
+              <!-- ═════════════════════════════════════════
+                   TAB 2: SCHEDULE AN APPOINTMENT
+                   (Strictly NO 'Get queue ticket' button!)
+                   ═════════════════════════════════════════ -->
+              <div id="queueAppointmentSection" class="queue-tab-panel is-hidden" style="display:none;">
+                <div class="queue-panel-header">
+                  <div class="queue-panel-header-icon"><i class="fas fa-calendar-check"></i></div>
+                  <div>
+                    <span class="queue-panel-kicker">Advance Booking</span>
+                    <h2 class="queue-panel-title">Schedule an Appointment</h2>
+                    <p class="queue-panel-desc">Reserve a guaranteed future time slot. Scheduled appointments are called with priority once their scheduled time arrives.</p>
+                  </div>
+                </div>
+
+                <!-- Booking Confirmation Banner -->
+                <div id="appointmentBookingAlert"></div>
+
+                ${state.user?.role === 'guest' ? `
+                <div class="guest-appointment-notice" style="background:rgba(136,8,8,0.06);border:1.5px solid rgba(136,8,8,0.18);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:flex;align-items:flex-start;gap:10px;">
+                  <i class="fas fa-id-card" style="color:var(--maroon);font-size:16px;margin-top:2px;flex-shrink:0;"></i>
+                  <div>
+                    <strong style="font-size:13px;color:var(--maroon);display:block;">Guest Visitor Details Required</strong>
+                    <span style="font-size:12px;color:var(--text-secondary);line-height:1.4;display:block;">As a guest, please provide your full name and contact number so the office can identify your appointment and reach you.</span>
+                  </div>
+                </div>
+
+                <div class="form-row-2col">
+                  <div class="form-group">
+                    <label for="guestApptName">Your Full Name <span style="color:#dc2626;">*</span></label>
+                    <input id="guestApptName" class="form-input" placeholder="e.g. Juan Dela Cruz" required maxlength="100">
+                    <span class="form-field-hint">Your complete name</span>
+                  </div>
+                  <div class="form-group">
+                    <label for="guestApptContact">Contact Number <span style="color:#dc2626;">*</span></label>
+                    <input id="guestApptContact" class="form-input" type="tel" placeholder="e.g. 09123456789" required maxlength="20">
+                    <span class="form-field-hint">Active mobile number</span>
+                  </div>
+                </div>
+                ` : ''}
+
+                <div class="form-group">
+                  <label for="apptOffice">Office</label>
+                  <select id="apptOffice" class="form-input form-select">
+                    <option value="">Select an office</option>
+                    ${offices.map(o => `<option value="${o.id}">${escHtml(o.name)}</option>`).join('')}
+                  </select>
+                </div>
+
+                <div class="form-group">
+                  <label for="apptPurpose">Purpose <span class="muted-hint" style="font-weight:400;text-transform:none;letter-spacing:0;">(optional)</span></label>
+                  <input id="apptPurpose" class="form-input" placeholder="e.g. Consultation, Enrollment, Document claiming">
+                </div>
+
+                <div class="form-group">
+                  <label for="apptPriority">Are you part of a priority group?</label>
+                  <select id="apptPriority" class="form-input form-select">
+                    <option value="no">No</option>
+                    <option value="yes">Yes (PWD, Senior Citizen, Pregnant)</option>
+                  </select>
+                </div>
+
+                <div id="apptPriorityGroup" class="form-group" style="display:none;">
+                  <label for="apptPriorityType">Specify Priority Group</label>
+                  <input id="apptPriorityType" class="form-input" placeholder="e.g. PWD, Senior Citizen, Pregnant" maxlength="80">
+                </div>
+
+                <div class="form-row-2col">
+                  <div class="form-group" style="margin:0;">
+                    <label for="queueAppointmentDate">Appointment Date</label>
+                    <input id="queueAppointmentDate" class="form-input" type="date" min="${minDateStr}">
+                    <span class="form-field-hint" id="queueDateHint">Must be at least 1 day in advance (Mon–Sat)</span>
+                  </div>
+
+                  <div class="form-group" style="margin:0;">
+                    <label for="queueAppointmentTime">Available Time Slot</label>
+                    <select id="queueAppointmentTime" class="form-input form-select" disabled>
+                      <option value="">Choose office & date first</option>
+                    </select>
+                    <span class="form-field-hint" id="queueBookingNote">15-minute slot intervals</span>
+                  </div>
+                </div>
+
+                <button type="button" id="queueBookAppointment" class="btn btn-primary btn-queue-action" disabled>
+                  <i class="fas fa-calendar-plus"></i> Book Appointment
+                </button>
+
+                <!-- Upcoming Appointments List (Within Appointment Tab) -->
+                <div id="appointmentListContainer" class="queue-my-appointments-section"></div>
+              </div>
+            </section>
+
+            <!-- RIGHT COLUMN: GUIDE -->
+            <aside class="student-queue-guide" id="queueGuideSidebar"></aside>
+          </div>
+        </div>
+      `;
+
+      // Guide Renderer
+      const updateGuide = (mode) => {
+        const guide = document.getElementById('queueGuideSidebar');
+        if (!guide) return;
+        if (mode === 'appointment') {
+          guide.innerHTML = `
+            <div class="student-queue-guide-head">
+              <i class="fas fa-calendar-check"></i>
+              <div>
+                <p>Appointment Guide</p>
+                <h2>How Booking Works</h2>
+              </div>
+            </div>
+            <ol class="student-queue-steps">
+              <li>
+                <span>1</span>
+                <div>
+                  <strong>Choose office & date</strong>
+                  <p>Pick an office and select any future day from Monday to Saturday.</p>
+                </div>
+              </li>
+              <li>
+                <span>2</span>
+                <div>
+                  <strong>Select an available time slot</strong>
+                  <p>Choose an open 15-minute slot that fits your schedule.</p>
+                </div>
+              </li>
+              <li>
+                <span>3</span>
+                <div>
+                  <strong>Check in on your visit day</strong>
+                  <p>Open this tab on your scheduled date to check in and be called first at your booked time.</p>
+                </div>
+              </li>
+            </ol>
+            <div class="student-queue-guide-note">
+              <i class="fas fa-bell"></i>
+              <span>Scheduled appointments receive priority over walk-ins once their time arrives.</span>
+            </div>
+          `;
+        } else {
+          guide.innerHTML = `
+            <div class="student-queue-guide-head">
+              <i class="fas fa-route"></i>
+              <div>
+                <p>Walk-in Guide</p>
+                <h2>How Walk-in Works</h2>
+              </div>
+            </div>
+            <ol class="student-queue-steps">
+              <li>
+                <span>1</span>
+                <div>
+                  <strong>Choose an office</strong>
+                  <p>Select the office you need to visit and add an optional purpose.</p>
+                </div>
+              </li>
+              <li>
+                <span>2</span>
+                <div>
+                  <strong>Keep your ticket number</strong>
+                  <p>Your ticket is saved to your account and shown right on this screen.</p>
+                </div>
+              </li>
+              <li>
+                <span>3</span>
+                <div>
+                  <strong>Watch for your turn</strong>
+                  <p>Keep an eye on the office monitor or this page. You will be alerted when called.</p>
+                </div>
+              </li>
+            </ol>
+            <div class="student-queue-guide-note">
+              <i class="fas fa-tv"></i>
+              <span>Office monitors and your status update live whenever a ticket is called.</span>
+            </div>
+          `;
+        }
+      };
+
+      updateGuide('walk_in');
+
+      // Tab Switching Logic
+      const tabWalkIn = document.getElementById('queueTabWalkIn');
+      const tabAppointment = document.getElementById('queueTabAppointment');
+      const walkInSection = document.getElementById('queueWalkInSection');
+      const appointmentSection = document.getElementById('queueAppointmentSection');
+
+      const setTab = (mode) => {
+        const isAppt = mode === 'appointment';
+        tabWalkIn.classList.toggle('active', !isAppt);
+        tabWalkIn.setAttribute('aria-selected', !isAppt);
+        tabAppointment.classList.toggle('active', isAppt);
+        tabAppointment.setAttribute('aria-selected', isAppt);
+
+        walkInSection.style.display = isAppt ? 'none' : 'block';
+        walkInSection.classList.toggle('is-hidden', isAppt);
+
+        appointmentSection.style.display = isAppt ? 'block' : 'none';
+        appointmentSection.classList.toggle('is-hidden', !isAppt);
+
+        updateGuide(mode);
+        if (isAppt) {
+          refreshAppointments();
+        }
+      };
+
+      tabWalkIn.addEventListener('click', () => setTab('walk_in'));
+      tabAppointment.addEventListener('click', () => setTab('appointment'));
+
+      // Priority field toggles
+      const setupPriorityToggle = (selectId, groupId, inputId) => {
+        const select = document.getElementById(selectId);
+        const group = document.getElementById(groupId);
+        const input = document.getElementById(inputId);
+        select.addEventListener('change', (e) => {
+          const isYes = e.target.value === 'yes';
+          group.style.display = isYes ? 'block' : 'none';
+          if (!isYes && input) input.value = '';
+        });
+      };
+
+      setupPriorityToggle('walkInPriority', 'walkInPriorityGroup', 'walkInPriorityType');
+      setupPriorityToggle('apptPriority', 'apptPriorityGroup', 'apptPriorityType');
+
+      // ── WALK-IN SUBMISSION & TICKET HANDLING ──
+      const walkInOffice = document.getElementById('walkInOffice');
+      const walkInPurpose = document.getElementById('walkInPurpose');
+      const walkInPriority = document.getElementById('walkInPriority');
+      const walkInPriorityType = document.getElementById('walkInPriorityType');
+      const joinButton = document.getElementById('studentQueueJoin');
+      const ticketResult = document.getElementById('studentQueueResult');
+
+      joinButton.addEventListener('click', async () => {
+        const officeId = walkInOffice.value;
+        if (!officeId) { showToast('Please select an office.', 'error'); return; }
+
+        const isPriority = walkInPriority.value === 'yes';
+        const priorityTypeVal = walkInPriorityType.value.trim();
+        if (isPriority && !priorityTypeVal) {
+          showToast('Please specify your priority group (e.g., PWD, Senior Citizen, Pregnant).', 'error');
+          return;
+        }
+
+        joinButton.disabled = true;
+        try {
+          const payload = {
+            office_id: officeId,
+            service_name: walkInPurpose.value.trim(),
+            is_priority: isPriority,
+            priority_type: isPriority ? priorityTypeVal : undefined,
+            visitor_name: state.user.role === 'guest'
+              ? `${state.user.first_name || ''} ${state.user.last_name || ''}`.trim() || 'Guest Visitor'
+              : undefined
+          };
+
+          const ticket = await api('/api/queueing/tickets', {
+            method: 'POST',
+            body: JSON.stringify(payload)
+          });
+
+          // Store ticket in localStorage for instant retrieval (especially guest users)
+          try {
+            localStorage.setItem('pupsj_active_ticket', JSON.stringify(ticket));
+            localStorage.setItem('activeQueueTicket', ticket.id);
+          } catch (_) {}
+
+          const officeText = walkInOffice.options[walkInOffice.selectedIndex]?.text || 'Office';
+
+          // Prominently display the ticket result
+          ticketResult.innerHTML = `
+            <div class="queue-ticket-result">
+              <span class="queue-ticket-result-badge">
+                <i class="fas fa-check-circle"></i> Ticket Generated Successfully
+              </span>
+              <div class="queue-ticket-result-number">${escHtml(ticket.ticket_number)}</div>
+              <p style="margin:0 0 8px;font-size:14px;color:var(--text-primary);font-weight:700;">
+                <i class="fas fa-building" style="color:var(--primary);margin-right:6px;"></i>${escHtml(officeText)}
+                ${ticket.is_priority ? '<span class="badge badge-warning" style="margin-left:6px;">Priority</span>' : ''}
+              </p>
+              <p style="margin:0;font-size:12.5px;color:var(--text-secondary);line-height:1.45;">
+                Your number is saved to your session. Please watch the monitor or this screen for updates.
+              </p>
+            </div>
+          `;
+
+          ticketResult.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          showToast(`Queue Ticket ${ticket.ticket_number} created!`, 'success');
+
+          // Reset inputs
+          walkInPurpose.value = '';
+          walkInPriority.value = 'no';
+          document.getElementById('walkInPriorityGroup').style.display = 'none';
+          walkInPriorityType.value = '';
+
+          await refreshStudentTicket();
+        } catch (err) {
+          showToast(err.message || 'Could not create ticket.', 'error');
+        } finally {
+          joinButton.disabled = false;
+        }
+      });
+
+      // ── ACTIVE TICKET REFRESH ──
+      let previouslyCalled = false;
+      const refreshStudentTicket = async () => {
+        if (!state.user || !document.getElementById('studentQueueActive')) {
+          if (window._studentQueueInterval) {
+            clearInterval(window._studentQueueInterval);
+            window._studentQueueInterval = null;
+          }
+          return;
+        }
+        try {
+          let ticket = null;
+          try {
+            ticket = await api('/api/queueing/my-tickets/active/current');
+          } catch (_) {}
+
+          // Fallback to localStorage if guest session or network hiccup
+          if (!ticket) {
+            try {
+              const cached = localStorage.getItem('pupsj_active_ticket');
+              if (cached) {
+                const parsed = JSON.parse(cached);
+                if (parsed && parsed.queue_date === localToday && ['waiting', 'called', 'serving'].includes(parsed.status)) {
+                  ticket = parsed;
+                }
+              }
+            } catch (_) {}
+          }
+
+          const statusEl = document.getElementById('studentQueueActive');
+          if (!statusEl) return;
+
+          if (!ticket) {
+            statusEl.innerHTML = '';
+            return;
+          }
+
+          const isCalled = ticket.status === 'called';
+          const isServing = ticket.status === 'serving';
+          const canCancel = ['waiting', 'called'].includes(ticket.status);
+
+          statusEl.innerHTML = `
+            <div class="active-ticket-card ${isCalled ? 'called' : ''}">
+              <div class="active-ticket-top">
+                <div>
+                  <span class="active-ticket-badge ${ticket.status}">
+                    <i class="fas ${isCalled ? 'fa-bullhorn' : isServing ? 'fa-user-check' : 'fa-hourglass-half'}"></i>
+                    ${isCalled ? 'NOW CALLED · PROCEED TO COUNTER' : isServing ? 'NOW SERVING · IN PROGRESS' : 'WAITING IN QUEUE'}
+                  </span>
+                  <h3 class="active-ticket-num">${escHtml(ticket.ticket_number)}</h3>
+                  <p class="active-ticket-office">
+                    <i class="fas fa-building" style="color:var(--primary);"></i>
+                    <strong>${escHtml(ticket.office_name || 'Campus Office')}</strong>
+                    ${ticket.service_name ? ` · <span>${escHtml(ticket.service_name)}</span>` : ''}
+                    ${ticket.is_priority ? '<span class="badge badge-warning" style="font-size:10px;padding:2px 6px;">Priority</span>' : ''}
+                  </p>
+                </div>
+                ${canCancel ? `<button type="button" class="btn btn-secondary queue-cancel-ticket" data-id="${ticket.id}" style="width:auto!important;padding:6px 12px!important;font-size:12px!important;"><i class="fas fa-times"></i> Cancel Ticket</button>` : ''}
+              </div>
+              <div class="active-ticket-msg">
+                ${isCalled
+                  ? '<strong style="color:#dc2626;font-size:14px;"><i class="fas fa-bullhorn"></i> Your number has been called! Please proceed to the office counter now.</strong>'
+                  : isServing
+                  ? '<span style="color:#166534;font-weight:600;"><i class="fas fa-user-check"></i> Your transaction is currently being processed at the office counter.</span>'
+                  : '<span><i class="fas fa-info-circle"></i> You are currently waiting in queue. The office monitor will alert you when it is your turn.</span>'}
+              </div>
+            </div>
+          `;
+
+          statusEl.querySelector('.queue-cancel-ticket')?.addEventListener('click', async (event) => {
+            const btn = event.currentTarget;
+            if (!window.confirm('Cancel this queue ticket? The office will no longer call this number.')) return;
+            btn.disabled = true;
+            try {
+              await api(`/api/queueing/my-tickets/${btn.dataset.id}/cancel`, { method: 'POST' });
+              showToast('Your queue ticket has been cancelled.', 'success');
+              try {
+                localStorage.removeItem('pupsj_active_ticket');
+                localStorage.removeItem('activeQueueTicket');
+              } catch (_) {}
+              previouslyCalled = false;
+              ticketResult.innerHTML = '';
+              await refreshStudentTicket();
+            } catch (err) {
+              showToast(err.message || 'Unable to cancel ticket.', 'error');
+              btn.disabled = false;
+            }
+          });
+
+          if (isCalled && !previouslyCalled) {
+            showToast(`Your ticket ${ticket.ticket_number} has been called! Please proceed to the office.`, 'success');
+            previouslyCalled = true;
+          }
+        } catch (_) {}
+      };
+
+      // ── APPOINTMENT LOGIC & TIME SLOTS ──
+      const apptOffice = document.getElementById('apptOffice');
+      const apptPurpose = document.getElementById('apptPurpose');
+      const apptPriority = document.getElementById('apptPriority');
+      const apptPriorityType = document.getElementById('apptPriorityType');
+      const appointmentDate = document.getElementById('queueAppointmentDate');
+      const appointmentTime = document.getElementById('queueAppointmentTime');
+      const appointmentButton = document.getElementById('queueBookAppointment');
+      const appointmentNote = document.getElementById('queueBookingNote');
+      const bookingAlert = document.getElementById('appointmentBookingAlert');
+      const appointmentList = document.getElementById('appointmentListContainer');
+
+      let officeUnavailableDates = new Set();
+      const loadAppointmentSlots = async () => {
+        const officeId = apptOffice.value;
+        const dateVal = appointmentDate.value;
+        appointmentButton.disabled = true;
+        appointmentTime.disabled = true;
+
+        if (!officeId || !dateVal) {
+          appointmentTime.innerHTML = '<option value="">Choose office and date first</option>';
+          appointmentNote.textContent = 'Select an office and a future date to see available time slots.';
+          return;
+        }
+
+        // Sunday check
+        const dateInfo = formatLocalDate(dateVal);
+        if (dateInfo.dayOfWeek === 0) {
+          appointmentTime.innerHTML = '<option value="">Offices closed on Sundays</option>';
+          appointmentNote.innerHTML = '<span style="color:#dc2626;font-weight:600;"><i class="fas fa-exclamation-circle"></i> Offices are closed on Sundays. Please choose Monday through Saturday.</span>';
+          return;
+        }
+
+        // Check if office marked this date as unavailable / closed
+        if (officeUnavailableDates.has(dateVal)) {
+          appointmentTime.innerHTML = '<option value="">Office unavailable on this date</option>';
+          appointmentNote.innerHTML = '<span style="color:#dc2626;font-weight:700;"><i class="fas fa-ban"></i> The office/admin is unavailable for appointments on this date. Please choose another date.</span>';
+          return;
+        }
+
+        appointmentNote.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Checking available time slots...';
+
+        try {
+          const data = await api(`/api/queueing/offices/${officeId}/availability?date=${encodeURIComponent(dateVal)}`);
+          if (data.is_unavailable || (data.slots && !data.slots.length && data.message && data.message.toLowerCase().includes('closed'))) {
+            appointmentTime.innerHTML = '<option value="">Office unavailable on this date</option>';
+            appointmentTime.disabled = true;
+            appointmentNote.innerHTML = `<span style="color:#dc2626;font-weight:700;"><i class="fas fa-ban"></i> ${escHtml(data.message || 'The office/admin is unavailable for appointments on this date. Please choose another date.')}</span>`;
+            return;
+          }
+          if (data.slots && data.slots.length) {
+            appointmentTime.innerHTML = `<option value="">Select a time slot</option>${data.slots.map(t => `<option value="${t}">${t}</option>`).join('')}`;
+            appointmentTime.disabled = false;
+            appointmentNote.innerHTML = `<span style="color:#16a34a;font-weight:600;"><i class="fas fa-clock"></i> ${data.slots.length} time slot(s) available</span>`;
+          } else {
+            appointmentTime.innerHTML = '<option value="">No available time slots</option>';
+            appointmentTime.disabled = true;
+            appointmentNote.textContent = data.message || 'No appointment slots are available on this date.';
+          }
+        } catch (err) {
+          appointmentTime.innerHTML = '<option value="">Unable to load time slots</option>';
+          appointmentTime.disabled = true;
+          appointmentNote.textContent = err.message || 'Could not load appointment slots.';
+        }
+      };
+
+      const updateOfficeClosures = async () => {
+        const officeId = apptOffice.value;
+        officeUnavailableDates = new Set();
+        if (officeId) {
+          try {
+            const closures = await api(`/api/queueing/offices/${officeId}/closures`);
+            if (Array.isArray(closures)) {
+              closures.forEach(d => officeUnavailableDates.add(d));
+            }
+          } catch (_) {}
+        }
+        await loadAppointmentSlots();
+      };
+
+      apptOffice.addEventListener('change', updateOfficeClosures);
+      appointmentDate.addEventListener('change', loadAppointmentSlots);
+      appointmentTime.addEventListener('change', () => {
+        appointmentButton.disabled = !appointmentTime.value;
+      });
+
+      // Book appointment click
+      appointmentButton.addEventListener('click', async () => {
+        const officeId = apptOffice.value;
+        const officeName = apptOffice.options[apptOffice.selectedIndex]?.text || 'Office';
+        const dateVal = appointmentDate.value;
+        const timeVal = appointmentTime.value;
+
+        if (!officeId) { showToast('Please select an office.', 'error'); return; }
+        if (!dateVal) { showToast('Please select an appointment date.', 'error'); return; }
+        if (!timeVal) { showToast('Please select an available time slot.', 'error'); return; }
+
+        const isGuest = state.user?.role === 'guest';
+        const guestNameInput = document.getElementById('guestApptName');
+        const guestContactInput = document.getElementById('guestApptContact');
+
+        let visitorName = undefined;
+        let contactNumber = undefined;
+
+        if (isGuest) {
+          visitorName = guestNameInput ? guestNameInput.value.trim() : '';
+          contactNumber = guestContactInput ? guestContactInput.value.trim() : '';
+
+          if (!visitorName) {
+            showToast('Please enter your full name for the appointment.', 'error');
+            if (guestNameInput) guestNameInput.focus();
+            return;
+          }
+          if (!contactNumber) {
+            showToast('Please enter your contact number for the appointment.', 'error');
+            if (guestContactInput) guestContactInput.focus();
+            return;
+          }
+          const cleanPhone = contactNumber.replace(/[\s\-\(\)]/g, '');
+          if (!/^(\+?63|0)?[0-9]{7,12}$/.test(cleanPhone)) {
+            showToast('Please enter a valid mobile number (e.g. 09123456789).', 'error');
+            if (guestContactInput) guestContactInput.focus();
+            return;
+          }
+        }
+
+        const isPriority = apptPriority.value === 'yes';
+        const priorityTypeVal = apptPriorityType.value.trim();
+        if (isPriority && !priorityTypeVal) {
+          showToast('Please specify your priority group.', 'error');
+          return;
+        }
+
+        appointmentButton.disabled = true;
+        try {
+          const appointment = await api('/api/queueing/appointments', {
+            method: 'POST',
+            body: JSON.stringify({
+              office_id: officeId,
+              date: dateVal,
+              time: timeVal,
+              service_name: apptPurpose.value.trim(),
+              is_priority: isPriority,
+              priority_type: isPriority ? priorityTypeVal : undefined,
+              visitor_name: visitorName,
+              contact_number: contactNumber
+            })
+          });
+
+          const formattedInfo = formatLocalDate(dateVal);
+
+          bookingAlert.innerHTML = `
+            <div class="appointment-success-card">
+              <i class="fas fa-calendar-check"></i>
+              <div>
+                <h4>Appointment Successfully Booked!</h4>
+                <p><strong>${escHtml(formattedInfo.full)} at ${escHtml(timeVal)}</strong> · ${escHtml(officeName)}</p>
+                ${visitorName ? `<p style="font-size:12px;color:var(--text-secondary);margin:2px 0 0;"><strong>Visitor:</strong> ${escHtml(visitorName)} (${escHtml(contactNumber)})</p>` : ''}
+                <span>Please arrive on time. On your appointment day, return to this tab and click "Check In" to receive your priority queue number.</span>
+              </div>
+            </div>
+          `;
+
+          bookingAlert.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          showToast('Appointment booked successfully.', 'success');
+
+          // Reset appointment inputs
+          appointmentDate.value = '';
+          appointmentTime.innerHTML = '<option value="">Choose office and date first</option>';
+          appointmentTime.disabled = true;
+          apptPurpose.value = '';
+          if (guestNameInput) guestNameInput.value = '';
+          if (guestContactInput) guestContactInput.value = '';
+          apptPriority.value = 'no';
+          document.getElementById('apptPriorityGroup').style.display = 'none';
+          apptPriorityType.value = '';
+          appointmentNote.textContent = '15-minute slot intervals';
+
+          await refreshAppointments();
+        } catch (err) {
+          showToast(err.message || 'Could not book appointment.', 'error');
+          appointmentButton.disabled = false;
+        }
+      });
+
+      // ── REFRESH APPOINTMENTS LIST ──
+      const refreshAppointments = async () => {
+        try {
+          const appointments = await api('/api/queueing/my-appointments');
+          if (!appointments || !appointments.length) {
+            appointmentList.innerHTML = `
+              <div style="padding:24px 0 10px;text-align:center;color:var(--text-secondary);">
+                <i class="fas fa-calendar-xmark" style="font-size:28px;margin-bottom:8px;opacity:.4;"></i>
+                <p style="margin:0;font-size:13px;">There are no appointments yet.</p>
+              </div>
+            `;
+            return;
+          }
+
+          appointmentList.innerHTML = `
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+              <p class="queue-overline" style="margin:0;">Your Appointments</p>
+              <span class="badge" style="background:var(--primary-soft);color:var(--primary);font-size:11px;">${appointments.length} booked</span>
+            </div>
+            <div class="queue-appointments-list">
+              ${appointments.map(item => {
+                const dateInfo = formatLocalDate(item.date);
+                const isToday = item.date === localToday;
+                const isCheckedIn = item.status === 'checked_in';
+
+                return `
+                  <article class="queue-appointment-card">
+                    <div class="queue-appt-left">
+                      <div class="queue-appt-date-box">
+                        <span class="month">${escHtml(dateInfo.month || 'DAY')}</span>
+                        <span class="day">${escHtml(dateInfo.day || '')}</span>
+                      </div>
+                      <div class="queue-appt-details">
+                        <h4>${escHtml(item.office_name)}</h4>
+                        <div class="queue-appt-meta">
+                          <span><i class="fas fa-clock" style="color:var(--primary);"></i> ${escHtml(formatTime(item.time))}</span>
+                          <span>·</span>
+                          <span>${escHtml(dateInfo.full)}</span>
+                          ${item.service_name ? `<span>·</span><span>${escHtml(item.service_name)}</span>` : ''}
+                          ${item.visitor_name ? `<span>·</span><span title="Visitor"><i class="fas fa-user"></i> ${escHtml(item.visitor_name)}</span>` : ''}
+                          ${item.contact_number ? `<span>·</span><span title="Contact"><i class="fas fa-phone-alt"></i> ${escHtml(item.contact_number)}</span>` : ''}
+                          ${item.is_priority ? '<span class="badge badge-warning" style="font-size:10px;padding:2px 6px;">Priority</span>' : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <div class="queue-appt-actions" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+                      ${isCheckedIn
+                        ? '<span class="badge" style="background:rgba(46,204,113,.15);color:#2ecc71;font-weight:700;"><i class="fas fa-check"></i> Checked in</span>'
+                        : isToday
+                        ? `<button class="btn btn-primary queue-check-in-btn" data-id="${item.id}" style="padding:7px 12px!important;font-size:12px!important;"><i class="fas fa-sign-in-alt"></i> Check In</button>`
+                        : '<span class="badge" style="background:var(--primary-soft);color:var(--primary);font-size:11px;padding:4px 8px;">Upcoming</span>'}
+                      ${!isCheckedIn ? `
+                        <button class="btn btn-secondary queue-cancel-appt-btn" data-id="${item.id}" data-office="${escHtml(item.office_name)}" data-date="${escHtml(dateInfo.full)}" data-time="${escHtml(formatTime(item.time))}" style="padding:7px 10px!important;font-size:12px!important;color:#dc2626!important;border-color:rgba(220,38,38,0.35)!important;" title="Cancel this appointment">
+                          <i class="fas fa-times"></i> Cancel
+                        </button>` : ''}
+                    </div>
+                  </article>
+                `;
+              }).join('')}
+            </div>
+          `;
+
+          appointmentList.querySelectorAll('.queue-check-in-btn').forEach(btn => {
+            btn.onclick = async () => {
+              btn.disabled = true;
+              try {
+                const ticket = await api(`/api/queueing/appointments/${btn.dataset.id}/check-in`, { method: 'POST' });
+                showToast(`Checked in successfully! Your ticket number is ${ticket.ticket_number}.`, 'success');
+                try {
+                  localStorage.setItem('pupsj_active_ticket', JSON.stringify(ticket));
+                  localStorage.setItem('activeQueueTicket', ticket.id);
+                } catch (_) {}
+                await refreshAppointments();
+                await refreshStudentTicket();
+                setTab('walk_in');
+              } catch (err) {
+                btn.disabled = false;
+                showToast(err.message || 'Unable to check in.', 'error');
+              }
+            };
+          });
+
+          appointmentList.querySelectorAll('.queue-cancel-appt-btn').forEach(btn => {
+            btn.onclick = async () => {
+              const officeName = btn.dataset.office || 'this office';
+              const dateStr = btn.dataset.date || '';
+              const timeStr = btn.dataset.time || '';
+              if (!window.confirm(`Cancel your appointment for ${officeName} on ${dateStr} at ${timeStr}?`)) return;
+              btn.disabled = true;
+              try {
+                await api(`/api/queueing/my-appointments/${btn.dataset.id}/cancel`, { method: 'POST' });
+                showToast('Appointment cancelled successfully.', 'success');
+                await refreshAppointments();
+                await refreshStudentTicket();
+              } catch (err) {
+                showToast(err.message || 'Unable to cancel appointment.', 'error');
+                btn.disabled = false;
+              }
+            };
+          });
+        } catch (_) {}
+      };
+
+      // Initial loads
+      await refreshStudentTicket();
+      await refreshAppointments();
+
+      // Clear any existing polling interval before starting a clean one
+      if (window._studentQueueInterval) clearInterval(window._studentQueueInterval);
+      window._studentQueueInterval = setInterval(refreshStudentTicket, 3000);
+
+    } catch (err) {
+      pageArea.innerHTML = `<div class="page-content"><div class="empty-state"><p>${escHtml(err.message)}</p></div></div>`;
+    }
+  }
+
+  async function renderQueueing() {
+    const pageArea = document.getElementById('pageArea');
+    pageArea.innerHTML = `<div class="page-header"><h1 class="page-title">Office Queueing</h1><p class="page-subtitle">Manage walk-in tickets for your assigned office.</p></div><div class="page-content"><div class="loader"><div class="spinner"></div></div></div>`;
+    try {
+      const superadmin = state.user.role === 'superadmin';
+      const offices = await api('/api/queueing/manage/offices');
+      const admins = superadmin ? await api('/api/queueing/manage/admins') : [];
+      pageArea.innerHTML = `<div class="page-header"><p style="margin:0 0 5px;color:var(--primary);font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Queue operations</p><h1 class="page-title">Office Queueing</h1><p class="page-subtitle">Choose an office, then manage its live queue and scheduled visitors.</p></div><div class="page-content" style="display:grid;gap:18px;">
+        ${superadmin ? `<section class="card" style="padding:22px 24px;"><div style="display:flex;align-items:flex-start;gap:12px;"><span style="width:38px;height:38px;display:grid;place-items:center;flex:0 0 38px;border-radius:10px;background:#fff0f0;color:#880808;"><i class="fas fa-plus"></i></span><div><p style="margin:0 0 3px;color:#880808;font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Administration</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">Add an office</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Create an office and optionally assign its queue manager.</p></div></div><div style="display:grid;grid-template-columns:minmax(180px,1fr) minmax(180px,1fr) auto;gap:10px;margin-top:18px;"><input id="queueOfficeName" class="form-input" placeholder="Office name, e.g. OSAS"><select id="queueOfficeAdmin" class="form-input form-select"><option value="">Assign later</option>${admins.map(a=>`<option value="${a.id}">${escHtml(a.first_name)}${a.department?' · '+escHtml(a.department):''}</option>`).join('')}</select><button id="queueAddOffice" class="btn btn-primary">Add office</button></div></section>` : ''}
+        <section class="card" style="padding:22px 24px;"><div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;"><div><p style="margin:0 0 3px;color:#880808;font-size:10px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Step 1</p><h3 style="margin:0;color:var(--text-primary);font-size:18px;">${superadmin ? 'Choose an office to manage' : 'Your assigned offices'}</h3><p style="margin:4px 0 0;color:var(--text-secondary);font-size:12px;">Select an office to open its queue workspace.</p></div><span style="width:38px;height:38px;display:grid;place-items:center;border-radius:10px;background:#fff0f0;color:#880808;"><i class="fas fa-building"></i></span></div><div id="queueOfficeButtons" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;">${offices.map(o=>`<div style="display:flex;align-items:stretch;"><button class="btn btn-secondary queue-office-btn" data-id="${o.id}" data-code="${escHtml(o.code)}" data-name="${escHtml(o.name)}" style="border-radius:9px 0 0 9px;"><i class="fas fa-building"></i> ${escHtml(o.name)}</button>${superadmin?`<button class="queue-office-delete" data-id="${o.id}" data-name="${escHtml(o.name)}" title="Delete ${escHtml(o.name)}" aria-label="Delete ${escHtml(o.name)}" style="width:35px;border:1px solid #ecd4d4;border-left:0;border-radius:0 9px 9px 0;background:#fff7f7;color:#9d1616;cursor:pointer;"><i class="fas fa-trash"></i></button>`:''}</div>`).join('') || '<p style="margin:0;color:var(--text-secondary);font-size:13px;">No office is assigned to this account.</p>'}</div></section>
+        <section class="card" id="queuePanel" style="padding:24px;"><div style="display:flex;gap:12px;align-items:center;color:var(--text-secondary);"><i class="fas fa-arrow-up-right-dots" style="color:var(--primary);"></i><span>Select an office above to open its live queue workspace.</span></div></section></div>`;
+      if (superadmin) document.getElementById('queueAddOffice').onclick = async () => { const name=document.getElementById('queueOfficeName').value.trim(); if(!name)return; await api('/api/queueing/manage/offices',{method:'POST',body:JSON.stringify({name,manager_user_id:document.getElementById('queueOfficeAdmin').value||null})}); renderQueueing(); };
+      document.querySelectorAll('.queue-office-btn').forEach(btn => {
+        btn.onclick = () => {
+          document.querySelectorAll('.queue-office-btn').forEach(b => {
+            b.classList.remove('btn-primary', 'is-active');
+            b.classList.add('btn-secondary');
+            const badge = b.querySelector('.active-office-badge');
+            if (badge) badge.remove();
+          });
+          btn.classList.remove('btn-secondary');
+          btn.classList.add('btn-primary', 'is-active');
+          if (!btn.querySelector('.active-office-badge')) {
+            const badge = document.createElement('span');
+            badge.className = 'active-office-badge';
+            badge.style.cssText = 'background:#16a34a;color:#fff;font-size:9.5px;font-weight:800;padding:2px 6px;border-radius:10px;margin-left:6px;';
+            badge.textContent = 'Active';
+            btn.appendChild(badge);
+          }
+          loadQueueOffice(btn.dataset.id, btn.dataset.code, btn.dataset.name);
+        };
+      });
+      document.querySelectorAll('.queue-office-delete').forEach(button => button.onclick = async () => { const name=button.dataset.name; if (!window.confirm(`Delete ${name}? This permanently removes its queue tickets and appointments.`)) return; button.disabled=true; try { await api(`/api/queueing/manage/offices/${button.dataset.id}`,{method:'DELETE'}); showToast(`${name} was deleted.`,'success'); renderQueueing(); } catch (err) { showToast(err.message || 'Unable to delete the office.','error'); button.disabled=false; } });
+    } catch (err) { pageArea.innerHTML = `<div class="page-content"><div class="empty-state"><p>${escHtml(err.message)}</p></div></div>`; }
+  }
+  async function loadQueueOffice(officeId, code, officeName) {
+    const panel = document.getElementById('queuePanel'); panel.innerHTML = '<div class="loader"><div class="spinner"></div></div>';
+    try {
+      if (!officeName) {
+        const btn = document.querySelector(`.queue-office-btn[data-id="${officeId}"]`);
+        officeName = btn ? btn.dataset.name : code;
+      }
+      // Keep office button highlighted
+      document.querySelectorAll('.queue-office-btn').forEach(b => {
+        if (b.dataset.id === officeId) {
+          b.classList.remove('btn-secondary');
+          b.classList.add('btn-primary', 'is-active');
+          if (!b.querySelector('.active-office-badge')) {
+            const badge = document.createElement('span');
+            badge.className = 'active-office-badge';
+            badge.style.cssText = 'background:#16a34a;color:#fff;font-size:9.5px;font-weight:800;padding:2px 6px;border-radius:10px;margin-left:6px;';
+            badge.textContent = 'Active';
+            b.appendChild(badge);
+          }
+        } else {
+          b.classList.remove('btn-primary', 'is-active');
+          b.classList.add('btn-secondary');
+          const badge = b.querySelector('.active-office-badge');
+          if (badge) badge.remove();
+        }
+      });
+
+      const [tickets, appointments, closures] = await Promise.all([
+        api(`/api/queueing/manage/offices/${officeId}/tickets`),
+        api(`/api/queueing/manage/offices/${officeId}/appointments`),
+        api(`/api/queueing/manage/offices/${officeId}/schedule-closures`).catch(() => [])
+      ]);
+      const closedDates = new Set(Array.isArray(closures) ? closures : []);
+      const queueStatus = {
+        waiting: { icon: 'fa-hourglass-half', label: 'Waiting', color: '#9a6700', bg: '#fff8db' },
+        called: { icon: 'fa-bullhorn', label: 'Called', color: '#a10909', bg: '#fff0f0' },
+        serving: { icon: 'fa-user-check', label: 'In progress', color: '#166534', bg: '#dcfce7' },
+        skipped: { icon: 'fa-forward', label: 'Skipped', color: '#64748b', bg: '#f1f5f9' },
+      };
+      const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date());
+
+      function formatTime(timeStr) {
+        if (!timeStr) return '';
+        const [hStr, mStr] = timeStr.split(':');
+        const h = parseInt(hStr, 10);
+        if (isNaN(h)) return timeStr;
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const hour12 = h % 12 || 12;
+        return `${hour12}:${mStr || '00'} ${ampm}`;
+      }
+
+      function formatApptDate(dateStr, timeStr) {
+        if (!dateStr) return '';
+        const parts = dateStr.split('-');
+        if (parts.length === 3) {
+          const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+          const datePart = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+          return `${datePart} · ${formatTime(timeStr)}`;
+        }
+        return `${dateStr} · ${formatTime(timeStr)}`;
+      }
+
+      const todayAppts = appointments.filter(a => a.date === localDate);
+      const upcomingAppts = appointments.filter(a => a.date > localDate);
+      const pastAppts = appointments.filter(a => a.date < localDate);
+
+      panel.innerHTML = `
+        <!-- ACTIVE OFFICE LOCATION & STATUS INDICATOR -->
+        <div class="queue-active-office-banner" style="background:linear-gradient(135deg, rgba(136,8,8,0.06) 0%, rgba(136,8,8,0.01) 100%);border:1.5px solid rgba(136,8,8,0.22);border-radius:12px;padding:14px 18px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:var(--primary,#880808);color:#fff;display:grid;place-items:center;font-size:17px;flex-shrink:0;box-shadow:0 2px 6px rgba(136,8,8,0.2);">
+              <i class="fas fa-building"></i>
+            </div>
+            <div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--primary,#880808);background:rgba(136,8,8,0.09);padding:2px 7px;border-radius:4px;">Currently Open Office</span>
+                <span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:#16a34a;background:#dcfce7;padding:2px 8px;border-radius:10px;">
+                  <span style="width:6px;height:6px;border-radius:50%;background:#16a34a;display:inline-block;"></span> Active Workspace
+                </span>
+              </div>
+              <h2 style="margin:3px 0 0;font-size:18px;font-weight:800;color:var(--text-primary);">${escHtml(officeName || code)} <span style="font-size:13px;font-weight:600;color:var(--text-secondary);opacity:.85;">(${escHtml(code)})</span></h2>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <span style="font-size:12px;color:var(--text-secondary);"><i class="fas fa-users" style="color:var(--primary);margin-right:4px;"></i> <strong>${tickets.length}</strong> active in queue</span>
+            <span style="color:var(--border-light);">|</span>
+            <span style="font-size:12px;color:var(--text-secondary);"><i class="fas fa-calendar-check" style="color:#0284c7;margin-right:4px;"></i> <strong>${appointments.length}</strong> scheduled</span>
+          </div>
+        </div>
+
+        <div class="queue-panel-head" style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding-bottom:16px;border-bottom:1px solid var(--border-light);flex-wrap:wrap;">
+          <div>
+            <p class="queue-overline" style="margin:0 0 5px;color:var(--primary);font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;">Live queue workspace · ${escHtml(code)}</p>
+            <h3 style="margin:0;color:var(--text-primary);font-size:20px;font-weight:700;line-height:1.25;">Today’s Operations · ${escHtml(officeName || code)}</h3>
+          </div>
+          <div class="queue-primary-actions" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <button id="queueCallNext" class="btn btn-primary"><i class="fas fa-bullhorn"></i> Call next</button>
+            <a class="btn btn-secondary" target="_blank" href="/queue-display/${encodeURIComponent(code)}"><i class="fas fa-tv"></i> Monitor controls</a>
+          </div>
+        </div>
+
+        <div class="queue-admin-grid">
+          <!-- COLUMN 1: Scheduled Appointments -->
+          <div class="queue-admin-col">
+            <div class="queue-admin-col-head">
+              <h4 class="queue-admin-col-title">
+                <i class="fas fa-calendar-check" style="color:var(--primary);"></i> Scheduled Appointments
+              </h4>
+              <span class="badge" style="background:#e0f2fe;color:#0369a1;font-weight:700;font-size:11px;">
+                ${appointments.length} ${appointments.length === 1 ? 'appointment' : 'appointments'}
+              </span>
+            </div>
+
+            <p style="margin:0 0 12px;font-size:12px;color:var(--text-secondary);line-height:1.45;">
+              Upcoming reservations. When a scheduled student arrives, click <strong>Admit / Check In</strong> to place them directly into the live queue.
+            </p>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+              <div class="queue-appt-filters" role="tablist" style="margin-bottom:0;">
+                <button class="queue-appt-filter-btn ${todayAppts.length > 0 ? 'is-active' : ''}" data-filter="today" type="button">
+                  Today <span class="queue-appt-filter-badge">${todayAppts.length}</span>
+                </button>
+                <button class="queue-appt-filter-btn ${todayAppts.length === 0 ? 'is-active' : ''}" data-filter="all" type="button">
+                  All <span class="queue-appt-filter-badge">${appointments.length}</span>
+                </button>
+                <button class="queue-appt-filter-btn" data-filter="upcoming" type="button">
+                  Upcoming <span class="queue-appt-filter-badge">${upcomingAppts.length}</span>
+                </button>
+              </div>
+              <div style="position:relative;flex:1;min-width:140px;max-width:210px;">
+                <input type="text" id="queueApptSearch" class="form-input" placeholder="Search name or service…" style="padding:5px 8px 5px 26px;font-size:11.5px;border-radius:8px;width:100%;box-sizing:border-box;">
+                <i class="fas fa-search" style="position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--text-light);pointer-events:none;"></i>
+              </div>
+            </div>
+
+            <div id="queueAppointmentsList" class="queue-appointments-list" style="display:flex;flex-direction:column;gap:7px;">
+            </div>
+          </div>
+
+          <!-- COLUMN 2: Today's Live Queue -->
+          <div class="queue-admin-col">
+            <div class="queue-admin-col-head">
+              <h4 class="queue-admin-col-title">
+                <i class="fas fa-users-line" style="color:var(--primary);"></i> Today’s Live Queue
+              </h4>
+              <span class="badge" style="background:#fff0f0;color:#880808;font-weight:700;font-size:11px;">
+                ${tickets.length} ${tickets.length === 1 ? 'ticket' : 'tickets'}
+              </span>
+            </div>
+
+            <div class="queue-priority-note" style="display:flex;gap:8px;align-items:flex-start;margin:0 0 14px;padding:9px 12px;border-radius:8px;background:#fff8db;color:#765300;font-size:11.5px;line-height:1.4;">
+              <i class="fas fa-circle-info" style="margin-top:2px;"></i>
+              <span>Scheduled appointments are called first once their appointment time arrives. Walk-ins follow in arrival order.</span>
+            </div>
+
+            <div class="queue-list" style="margin-top:0;border:1px solid var(--border-light);border-radius:12px;overflow:hidden;">
+              ${tickets.map(t => {
+                const meta = queueStatus[t.status] || queueStatus.waiting;
+                const isScheduled = t.source === 'appointment';
+                const type = isScheduled ? 'Scheduled' : 'Walk-in';
+                return `
+                  <article class="queue-row queue-row--${escHtml(t.status)}" style="display:grid!important;grid-template-columns:130px minmax(130px,1fr) 95px auto!important;align-items:center!important;gap:14px!important;padding:14px 16px!important;">
+                    <div class="queue-ticket" style="display:flex!important;flex-direction:column!important;gap:3px!important;">
+                      <span style="display:inline-flex!important;align-items:center!important;gap:4px!important;font-size:10px!important;font-weight:800!important;text-transform:uppercase!important;letter-spacing:.06em!important;color:${isScheduled ? '#0284c7' : 'var(--text-light)'}!important;">
+                        <i class="fas ${isScheduled ? 'fa-calendar-check' : 'fa-person-walking'}"></i> ${type}
+                      </span>
+                      <strong style="display:block!important;font-size:15px!important;color:var(--primary)!important;white-space:nowrap!important;">${escHtml(t.ticket_number)}</strong>
+                    </div>
+                    <div class="queue-purpose" style="display:flex!important;flex-direction:column!important;gap:3px!important;min-width:0!important;">
+                      <strong style="display:block!important;font-size:13.5px!important;color:var(--text-primary)!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;">${escHtml(t.service_name || type)}</strong>
+                      <span style="display:block!important;font-size:11.5px!important;color:var(--text-light)!important;">${t.status === 'waiting' ? 'Ready to call' : t.status === 'called' ? 'Called · Awaiting arrival' : 'Transaction in progress'}</span>
+                    </div>
+                    <span class="queue-status queue-status--${t.status}" style="display:inline-flex!important;align-items:center!important;gap:5px!important;width:max-content!important;padding:6px 9px!important;border-radius:999px!important;">
+                      <i class="fas ${meta.icon}"></i>
+                      <span style="font-size:11px!important;font-weight:800!important;line-height:1!important;">${meta.label}</span>
+                    </span>
+                    <div class="queue-row-actions" style="display:flex!important;align-items:center!important;justify-content:flex-end!important;gap:6px!important;">
+                      ${t.status === 'called' ? `<button class="btn btn-secondary btn-sm queue-action" data-id="${t.id}" data-status="serving" style="padding:5px 9px;font-size:11px;"><i class="fas fa-user-check"></i> Start</button>` : ''}
+                      ${['called', 'serving'].includes(t.status) ? `<button class="btn btn-success btn-sm queue-action" data-id="${t.id}" data-status="completed" style="padding:5px 9px;font-size:11px;"><i class="fas fa-check"></i> Done</button>` : ''}
+                      <button class="btn btn-secondary btn-sm queue-action" data-id="${t.id}" data-status="skipped" style="padding:5px 8px;font-size:11px;">Skip</button>
+                    </div>
+                  </article>
+                `;
+              }).join('') || '<p class="queue-empty" style="margin:0;padding:28px 18px;color:var(--text-secondary);font-size:13px;text-align:center;">No tickets in queue right now.</p>'}
+            </div>
+          </div>
+        </div>
+
+        <!-- Office Availability & Unavailable Dates Card -->
+        <div style="margin-top:20px;padding:18px 20px;border:1.5px solid var(--border-light);border-radius:12px;background:var(--bg-card);">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;">
+            <div>
+              <strong style="display:block;font-size:14px;color:var(--text-primary);"><i class="fas fa-calendar-xmark" style="color:var(--primary);margin-right:6px;"></i> Office Availability & Unavailable Dates (Blackout Dates)</strong>
+              <span style="font-size:12px;color:var(--text-secondary);">Set dates when you or this office are unavailable (e.g. meetings, holidays, leave). Users will be blocked from booking appointments on these dates.</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <input id="queueScheduleClosureDate" class="form-input" type="date" min="${localDate}" value="${localDate}" style="padding:6px 10px;font-size:13px;width:auto;">
+              <div id="queueScheduleActionSlot" style="display:inline-flex;align-items:center;gap:8px;"></div>
+            </div>
+          </div>
+          <div id="queueClosedDatesSection" style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-light);display:none;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <span style="font-size:11px;font-weight:700;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.05em;"><i class="fas fa-ban" style="color:#ef4444;margin-right:4px;"></i> Currently Unavailable Dates:</span>
+              <div id="queueClosedDatesChips" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"></div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      function renderApptCard(item) {
+        const isToday = item.date === localDate;
+        const isPast = item.date < localDate;
+        const isCheckedIn = item.status === 'checked_in';
+        const visitorName = item.visitor_name || `${item.first_name || ''} ${item.last_name || ''}`.trim() || 'Visitor';
+        const isGuestAppt = item.role === 'guest' || !!item.visitor_name;
+        const timeFormatted = formatTime(item.time);
+        
+        let datePart = item.date;
+        const parts = item.date ? item.date.split('-') : [];
+        if (parts.length === 3) {
+          const d = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+          datePart = d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+        }
+
+        const dateChipClass = isToday 
+          ? 'queue-date-highlight--today' 
+          : isPast 
+          ? 'queue-date-highlight--past' 
+          : 'queue-date-highlight--upcoming';
+
+        const dateChipContent = isToday
+          ? `<i class="fas fa-star" style="color:#d97706;font-size:11px;"></i> <span class="highlight-label">TODAY</span> <span class="highlight-dot">·</span> <i class="fas fa-clock" style="font-size:10px;opacity:.75;"></i> <span>${timeFormatted}</span>`
+          : `<i class="fas fa-calendar-day" style="font-size:11px;"></i> <span class="highlight-label">${escHtml(datePart)}</span> <span class="highlight-dot">·</span> <i class="fas fa-clock" style="font-size:10px;opacity:.75;"></i> <span>${timeFormatted}</span>`;
+
+        return `
+          <div class="queue-appt-card ${isToday ? 'queue-appt-card--today' : ''}" data-id="${item.id}">
+            <!-- Top Row: Highlighted Date & Time + Status Badges -->
+            <div class="queue-appt-card-top">
+              <div class="queue-date-highlight ${dateChipClass}">
+                ${dateChipContent}
+              </div>
+              <div class="queue-appt-tags">
+                ${isGuestAppt ? `
+                  <span class="badge" style="background:rgba(100,116,139,0.12);color:#475569;font-weight:700;font-size:10px;padding:2px 6px;border-radius:4px;">
+                    <i class="fas fa-user-tag" style="font-size:9px;margin-right:3px;"></i>Guest
+                  </span>` : ''}
+                ${item.is_priority ? `
+                  <span class="queue-priority-badge" title="Priority Visitor">
+                    <i class="fas fa-bolt"></i> Priority${item.priority_type ? ' · ' + escHtml(item.priority_type) : ''}
+                  </span>` : ''}
+                ${isCheckedIn ? `
+                  <span class="queue-inqueue-badge">
+                    <i class="fas fa-check-circle"></i> In Queue · ${escHtml(item.ticket_number || 'Admitted')}
+                  </span>` : ''}
+              </div>
+            </div>
+
+            <!-- Bottom Row: Visitor Info on Left, Actions on Right -->
+            <div class="queue-appt-card-main">
+              <div class="queue-appt-visitor">
+                <div class="queue-appt-name">
+                  <i class="fas fa-user-circle" style="color:var(--text-light);font-size:13px;flex-shrink:0;"></i>
+                  <span class="name-text" title="${escHtml(visitorName)}">${escHtml(visitorName)}</span>
+                </div>
+                <div class="queue-service-badge" title="Service / Purpose">
+                  <i class="fas fa-tag" style="font-size:9.5px;opacity:.7;"></i>
+                  <span>${escHtml(item.service_name || 'Consultation')}</span>
+                </div>
+                ${item.contact_number ? `
+                <div class="queue-contact-badge" style="font-size:11px;color:var(--text-secondary);margin-top:2px;display:flex;align-items:center;gap:4px;" title="Contact Number">
+                  <i class="fas fa-phone-alt" style="font-size:9.5px;color:var(--text-light);"></i>
+                  <span>${escHtml(item.contact_number)}</span>
+                </div>` : ''}
+              </div>
+
+              <div class="queue-appt-actions">
+                ${isCheckedIn ? '' : `
+                  <button class="btn btn-sm ${isToday ? 'btn-primary queue-admit-btn' : 'queue-admit-btn queue-admit-early-btn'}" data-id="${item.id}" data-name="${escHtml(visitorName)}">
+                    <i class="fas fa-user-check"></i> ${isToday ? 'Admit / Check In' : 'Admit Early'}
+                  </button>
+                  <button class="queue-decline-btn" data-id="${item.id}" data-name="${escHtml(visitorName)}" title="Decline appointment">
+                    <i class="fas fa-ban"></i> Decline
+                  </button>
+                `}
+                <button class="queue-delete-appt-btn" data-id="${item.id}" data-name="${escHtml(visitorName)}" title="Permanently delete appointment record">
+                  <i class="fas fa-trash-alt"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      function bindApptEvents() {
+        // Wire Admit / Check In buttons
+        panel.querySelectorAll('.queue-admit-btn').forEach(btn => {
+          btn.onclick = async () => {
+            btn.disabled = true;
+            try {
+              const res = await api(`/api/queueing/manage/appointments/${btn.dataset.id}/check-in`, { method: 'POST' });
+              showToast(res.ticket ? `Checked in! Ticket ${res.ticket.ticket_number} placed in live queue.` : 'Admitted to queue.', 'success');
+              await loadQueueOffice(officeId, code);
+            } catch (err) {
+              showToast(err.message || 'Unable to admit appointment to queue.', 'error');
+              btn.disabled = false;
+            }
+          };
+        });
+
+        // Wire Decline buttons
+        panel.querySelectorAll('.queue-decline-btn').forEach(btn => {
+          btn.onclick = async () => {
+            const name = btn.dataset.name || 'this appointment';
+            if (!window.confirm(`Decline appointment for ${name}? The appointment will be cancelled and the student notified.`)) return;
+            btn.disabled = true;
+            try {
+              await api(`/api/queueing/manage/appointments/${btn.dataset.id}/decline`, { method: 'POST' });
+              showToast(`Appointment for ${name} declined.`, 'success');
+              await loadQueueOffice(officeId, code);
+            } catch (err) {
+              showToast(err.message || 'Unable to decline appointment.', 'error');
+              btn.disabled = false;
+            }
+          };
+        });
+
+        // Wire Delete buttons
+        panel.querySelectorAll('.queue-delete-appt-btn').forEach(btn => {
+          btn.onclick = async () => {
+            const name = btn.dataset.name || 'this appointment';
+            if (!window.confirm(`Permanently delete appointment record for ${name}? This action cannot be undone.`)) return;
+            btn.disabled = true;
+            try {
+              await api(`/api/queueing/manage/appointments/${btn.dataset.id}`, { method: 'DELETE' });
+              showToast(`Appointment for ${name} deleted.`, 'success');
+              await loadQueueOffice(officeId, code);
+            } catch (err) {
+              showToast(err.message || 'Unable to delete appointment.', 'error');
+              btn.disabled = false;
+            }
+          };
+        });
+      }
+
+      let currentApptFilter = todayAppts.length > 0 ? 'today' : 'all';
+      let currentApptSearch = '';
+
+      function renderApptList() {
+        const listEl = panel.querySelector('#queueAppointmentsList');
+        if (!listEl) return;
+        if (appointments.length === 0) {
+          listEl.innerHTML = `
+            <div class="empty-state" style="padding:28px 14px;text-align:center;border:1px dashed var(--border-light);border-radius:10px;">
+              <i class="fas fa-calendar-xmark" style="font-size:24px;opacity:.35;margin-bottom:6px;color:var(--text-secondary);"></i>
+              <p style="margin:0;font-size:13px;color:var(--text-secondary);">There are no appointments yet.</p>
+            </div>
+          `;
+          return;
+        }
+
+        let filtered = appointments;
+        if (currentApptFilter === 'today') {
+          filtered = todayAppts;
+        } else if (currentApptFilter === 'upcoming') {
+          filtered = upcomingAppts;
+        }
+
+        if (currentApptSearch) {
+          const q = currentApptSearch.toLowerCase();
+          filtered = filtered.filter(a => {
+            const name = `${a.first_name || ''} ${a.last_name || ''}`.toLowerCase();
+            const svc = (a.service_name || '').toLowerCase();
+            const date = (a.date || '').toLowerCase();
+            return name.includes(q) || svc.includes(q) || date.includes(q);
+          });
+        }
+
+        if (filtered.length === 0) {
+          let emptyMsg = 'No appointments found.';
+          if (currentApptSearch) {
+            emptyMsg = `No appointments matching "${escHtml(currentApptSearch)}".`;
+          } else if (currentApptFilter === 'today') {
+            emptyMsg = 'No appointments scheduled for today.';
+          } else if (currentApptFilter === 'upcoming') {
+            emptyMsg = 'No upcoming appointments scheduled.';
+          }
+          listEl.innerHTML = `
+            <div class="empty-state" style="padding:24px 14px;text-align:center;border:1px dashed var(--border-light);border-radius:10px;">
+              <i class="fas fa-search" style="font-size:20px;opacity:.35;margin-bottom:6px;color:var(--text-secondary);"></i>
+              <p style="margin:0;font-size:12.5px;color:var(--text-secondary);">${emptyMsg}</p>
+            </div>
+          `;
+          return;
+        }
+
+        let html = '';
+        if (currentApptFilter === 'all' && !currentApptSearch) {
+          const fToday = filtered.filter(a => a.date === localDate);
+          const fUpcoming = filtered.filter(a => a.date > localDate);
+          const fPast = filtered.filter(a => a.date < localDate);
+          if (fToday.length > 0) {
+            html += `<div class="queue-appt-section-divider"><i class="fas fa-calendar-day" style="color:#d97706;"></i> Today’s Schedule (${fToday.length})</div>`;
+            html += fToday.map(renderApptCard).join('');
+          }
+          if (fUpcoming.length > 0) {
+            html += `<div class="queue-appt-section-divider"><i class="fas fa-calendar-week" style="color:#0284c7;"></i> Upcoming Schedule (${fUpcoming.length})</div>`;
+            html += fUpcoming.map(renderApptCard).join('');
+          }
+          if (fPast.length > 0) {
+            html += `<div class="queue-appt-section-divider"><i class="fas fa-clock-rotate-left"></i> Past (${fPast.length})</div>`;
+            html += fPast.map(renderApptCard).join('');
+          }
+        } else {
+          html = filtered.map(renderApptCard).join('');
+        }
+        listEl.innerHTML = html;
+        bindApptEvents();
+      }
+
+      // Initial render of appointments
+      renderApptList();
+
+      // Wire Filter tabs
+      panel.querySelectorAll('.queue-appt-filter-btn').forEach(btn => {
+        btn.onclick = () => {
+          panel.querySelectorAll('.queue-appt-filter-btn').forEach(b => b.classList.remove('is-active'));
+          btn.classList.add('is-active');
+          currentApptFilter = btn.dataset.filter;
+          renderApptList();
+        };
+      });
+
+      // Wire Search box
+      const searchInput = panel.querySelector('#queueApptSearch');
+      if (searchInput) {
+        searchInput.oninput = (e) => {
+          currentApptSearch = e.target.value.trim();
+          renderApptList();
+        };
+      }
+
+      // Wire Schedule Closures / Reopen
+      function updateClosureUI() {
+        const input = panel.querySelector('#queueScheduleClosureDate');
+        if (!input) return;
+        const selectedDate = input.value || localDate;
+        const isClosed = closedDates.has(selectedDate);
+        const actionSlot = panel.querySelector('#queueScheduleActionSlot');
+        const closedDatesSection = panel.querySelector('#queueClosedDatesSection');
+        const closedDatesChips = panel.querySelector('#queueClosedDatesChips');
+
+        if (actionSlot) {
+          if (isClosed) {
+            actionSlot.innerHTML = `
+              <span class="badge" style="background:rgba(239,68,68,0.12);color:#dc2626;border:1px solid rgba(239,68,68,0.25);padding:6px 11px;font-size:11px;font-weight:700;border-radius:6px;display:inline-flex;align-items:center;gap:5px;">
+                <i class="fas fa-ban"></i> Unavailable / Blocked
+              </span>
+              <button id="queueToggleScheduleBtn" class="btn btn-primary" style="padding:7px 14px;font-size:12px;font-weight:600;background:#16a34a;border:none;display:inline-flex;align-items:center;gap:6px;">
+                <i class="fas fa-check-circle"></i> Make Available / Unblock Date
+              </button>
+            `;
+          } else {
+            actionSlot.innerHTML = `
+              <span class="badge" style="background:rgba(22,163,74,0.12);color:#16a34a;border:1px solid rgba(22,163,74,0.25);padding:6px 11px;font-size:11px;font-weight:700;border-radius:6px;display:inline-flex;align-items:center;gap:5px;">
+                <i class="fas fa-check-circle"></i> Available
+              </span>
+              <button id="queueToggleScheduleBtn" class="btn btn-secondary" style="padding:7px 14px;font-size:12px;font-weight:600;color:#dc2626;border-color:rgba(239,68,68,0.35);display:inline-flex;align-items:center;gap:6px;">
+                <i class="fas fa-ban"></i> Mark as Unavailable / Block Date
+              </button>
+            `;
+          }
+
+          const toggleBtn = panel.querySelector('#queueToggleScheduleBtn');
+          if (toggleBtn) {
+            toggleBtn.onclick = async () => {
+              const curDate = input.value;
+              if (!curDate) return;
+              if (isClosed) {
+                if (!window.confirm(`Mark ${curDate} as available for appointments again? Users will be able to book appointments.`)) return;
+                toggleBtn.disabled = true;
+                try {
+                  await api(`/api/queueing/manage/offices/${officeId}/schedule-closures/${curDate}`, { method: 'DELETE' });
+                  closedDates.delete(curDate);
+                  showToast(`Appointments are now available for ${curDate}.`, 'success');
+                  updateClosureUI();
+                } catch (err) {
+                  showToast(err.message || 'Unable to unblock date.', 'error');
+                  toggleBtn.disabled = false;
+                }
+              } else {
+                if (!window.confirm(`Mark ${curDate} as unavailable for appointments? Users will not be able to book on this date.`)) return;
+                toggleBtn.disabled = true;
+                try {
+                  await api(`/api/queueing/manage/offices/${officeId}/schedule-closures`, { method: 'POST', body: JSON.stringify({ date: curDate }) });
+                  closedDates.add(curDate);
+                  showToast(`${curDate} marked as unavailable for appointments.`, 'success');
+                  updateClosureUI();
+                } catch (err) {
+                  showToast(err.message || 'Unable to block date.', 'error');
+                  toggleBtn.disabled = false;
+                }
+              }
+            };
+          }
+        }
+
+        if (closedDatesSection && closedDatesChips) {
+          const sortedClosures = Array.from(closedDates).sort();
+          if (sortedClosures.length === 0) {
+            closedDatesSection.style.display = 'none';
+            closedDatesChips.innerHTML = '';
+          } else {
+            closedDatesSection.style.display = 'block';
+            closedDatesChips.innerHTML = sortedClosures.map(d => {
+              let dLabel = d;
+              const parts = d.split('-');
+              if (parts.length === 3) {
+                const dateObj = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+                dLabel = dateObj.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+              }
+              return `
+                <span style="display:inline-flex;align-items:center;gap:6px;background:rgba(239,68,68,0.08);color:#ef4444;border:1px solid rgba(239,68,68,0.22);padding:3px 8px 3px 10px;border-radius:16px;font-size:11px;font-weight:600;">
+                  <i class="fas fa-calendar-xmark" style="font-size:10px;"></i>
+                  <span>${dLabel}</span>
+                  <button class="queue-reopen-chip-btn" data-date="${d}" title="Unblock ${d}" style="display:inline-flex;align-items:center;justify-content:center;background:none;border:none;color:#ef4444;cursor:pointer;padding:2px 4px;border-radius:4px;font-size:11px;font-weight:700;margin-left:2px;">
+                    <i class="fas fa-rotate-left" style="margin-right:3px;"></i> Unblock
+                  </button>
+                </span>
+              `;
+            }).join('');
+
+            closedDatesChips.querySelectorAll('.queue-reopen-chip-btn').forEach(chipBtn => {
+              chipBtn.onclick = async () => {
+                const targetDate = chipBtn.dataset.date;
+                if (!window.confirm(`Unblock / mark ${targetDate} as available for appointments?`)) return;
+                chipBtn.disabled = true;
+                try {
+                  await api(`/api/queueing/manage/offices/${officeId}/schedule-closures/${targetDate}`, { method: 'DELETE' });
+                  closedDates.delete(targetDate);
+                  showToast(`Appointments are now available for ${targetDate}.`, 'success');
+                  updateClosureUI();
+                } catch (err) {
+                  showToast(err.message || 'Unable to unblock date.', 'error');
+                  chipBtn.disabled = false;
+                }
+              };
+            });
+          }
+        }
+      }
+
+      const closureDateInput = panel.querySelector('#queueScheduleClosureDate');
+      if (closureDateInput) {
+        closureDateInput.onchange = () => updateClosureUI();
+      }
+      updateClosureUI();
+
+      // Wire Monitor Link
+      const monitorLink = panel.querySelector('a[href^="/queue-display/"]');
+      if (monitorLink) {
+        monitorLink.href = `/queue-monitor/${encodeURIComponent(code)}`;
+        monitorLink.onclick = event => {
+          event.preventDefault();
+          const monitorWindow = window.open('about:blank', '_blank');
+          if (!monitorWindow) {
+            showToast('Allow pop-ups to open the monitor controls.', 'error');
+            return;
+          }
+          monitorWindow.sessionStorage.setItem('pupsj_token', getToken());
+          monitorWindow.location.replace(monitorLink.href);
+        };
+      }
+
+      // Wire Call Next
+      document.getElementById('queueCallNext').onclick = async () => {
+        const button = document.getElementById('queueCallNext');
+        button.disabled = true;
+        try {
+          const result = await api(`/api/queueing/manage/offices/${officeId}/next`, { method: 'POST' });
+          showToast(result.ticket_number ? `${result.ticket_number} has been called.` : result.completed_ticket ? `${result.completed_ticket.ticket_number} completed. No other tickets in queue.` : 'No eligible tickets in queue.', 'success');
+          await loadQueueOffice(officeId, code);
+        } catch (err) {
+          showToast(err.message || 'No eligible tickets in queue.', 'info');
+          button.disabled = false;
+        }
+      };
+
+      // Wire Queue Actions (serving, completed, skipped)
+      panel.querySelectorAll('.queue-action').forEach(b => {
+        b.onclick = async () => {
+          b.disabled = true;
+          try {
+            await api(`/api/queueing/manage/tickets/${b.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ status: b.dataset.status }) });
+            showToast(b.dataset.status === 'called' ? 'Ticket called and student notified.' : 'Queue updated.', 'success');
+            await loadQueueOffice(officeId, code);
+          } catch (err) {
+            showToast(err.message || 'Unable to update this ticket.', 'error');
+            b.disabled = false;
+          }
+        };
+      });
+    } catch (err) {
+      panel.innerHTML = `<p>${escHtml(err.message)}</p>`;
+    }
+  }
+
   init();
 
+})();
+
+/* ══════════════════════════════════════════════
+   CUSTOM SELECT DROPDOWN ENGINE  (portal mode)
+   ══════════════════════════════════════════════ */
+(function () {
+  let _openState = null; // { wrapper, dropdown, trigger }
+
+  function _positionDropdown(trigger, dropdown) {
+    const r = trigger.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - r.bottom;
+    const spaceAbove = r.top;
+    const dropH = Math.min(230, dropdown.scrollHeight);
+    const goUp = spaceBelow < dropH + 8 && spaceAbove > spaceBelow;
+    dropdown.style.width  = r.width + 'px';
+    dropdown.style.left   = (r.left + window.scrollX) + 'px';
+    if (goUp) {
+      dropdown.style.top    = '';
+      dropdown.style.bottom = (window.innerHeight - r.top + window.scrollY + 5) + 'px';
+    } else {
+      dropdown.style.bottom = '';
+      dropdown.style.top    = (r.bottom + window.scrollY + 5) + 'px';
+    }
+  }
+
+  function _close() {
+    if (!_openState) return;
+    const { wrapper, dropdown } = _openState;
+    wrapper.classList.remove('cs-open');
+    dropdown.classList.remove('cs-open');
+    _openState = null;
+  }
+
+  function _open(wrapper, trigger, dropdown, sel, valueSpan) {
+    if (_openState) _close();
+    _positionDropdown(trigger, dropdown);
+    wrapper.classList.add('cs-open');
+    dropdown.classList.add('cs-open');
+    // scroll selected option into view
+    const sel_opt = dropdown.querySelector('.cs-selected');
+    if (sel_opt) sel_opt.scrollIntoView({ block: 'nearest' });
+    _openState = { wrapper, dropdown, trigger };
+  }
+
+  document.addEventListener('click', function (e) {
+    if (!_openState) return;
+    if (!_openState.wrapper.contains(e.target) && !_openState.dropdown.contains(e.target)) _close();
+  });
+  window.addEventListener('scroll', function () { if (_openState) _positionDropdown(_openState.trigger, _openState.dropdown); }, true);
+  window.addEventListener('resize', function () { if (_openState) _positionDropdown(_openState.trigger, _openState.dropdown); });
+
+  function _syncOptions(sel, dropdown) {
+    dropdown.innerHTML = '';
+    Array.from(sel.options).forEach(function (opt) {
+      const div = document.createElement('div');
+      div.className = 'cs-option' +
+        (opt.value === '' ? ' cs-placeholder-opt' : '') +
+        (opt.selected ? ' cs-selected' : '');
+      div.textContent = opt.textContent.trim();
+      div.dataset.value = opt.value;
+      dropdown.appendChild(div);
+    });
+  }
+
+  function _syncValue(sel, valueSpan, dropdown) {
+    const opt = sel.options[sel.selectedIndex];
+    if (opt) {
+      valueSpan.textContent = opt.textContent.trim();
+      valueSpan.className = 'cs-value' + (opt.value === '' ? ' cs-placeholder' : '');
+    }
+    dropdown.querySelectorAll('.cs-option').forEach(function (div) {
+      div.classList.toggle('cs-selected', div.dataset.value === sel.value);
+    });
+  }
+
+  function _syncDisabled(sel, wrapper) {
+    wrapper.classList.toggle('cs-disabled', !!sel.disabled);
+  }
+
+  function _build(sel) {
+    if (sel.dataset.csInit) return;
+    sel.dataset.csInit = '1';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'cs-wrapper';
+
+    const trigger = document.createElement('div');
+    trigger.className = 'cs-trigger';
+    trigger.setAttribute('tabindex', '0');
+    trigger.setAttribute('role', 'combobox');
+    trigger.setAttribute('aria-haspopup', 'listbox');
+
+    const valueSpan = document.createElement('span');
+    valueSpan.className = 'cs-value';
+
+    const arrowSpan = document.createElement('span');
+    arrowSpan.className = 'cs-arrow';
+
+    trigger.appendChild(valueSpan);
+    trigger.appendChild(arrowSpan);
+
+    // Dropdown is portalled to body so it is never clipped
+    const dropdown = document.createElement('div');
+    dropdown.className = 'cs-dropdown cs-portal';
+    dropdown.setAttribute('role', 'listbox');
+    document.body.appendChild(dropdown);
+
+    wrapper.appendChild(trigger);
+
+    sel.parentNode.insertBefore(wrapper, sel);
+    sel.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
+    wrapper.appendChild(sel);
+
+    _syncOptions(sel, dropdown);
+    _syncValue(sel, valueSpan, dropdown);
+    _syncDisabled(sel, wrapper);
+
+    trigger.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (wrapper.classList.contains('cs-disabled')) return;
+      if (_openState && _openState.wrapper === wrapper) _close();
+      else _open(wrapper, trigger, dropdown, sel, valueSpan);
+    });
+
+    trigger.addEventListener('keydown', function (e) {
+      const isOpen = _openState && _openState.wrapper === wrapper;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        isOpen ? _close() : _open(wrapper, trigger, dropdown, sel, valueSpan);
+      } else if (e.key === 'Escape') {
+        _close();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const idx = Math.min(sel.selectedIndex + 1, sel.options.length - 1);
+        sel.selectedIndex = idx; sel.dispatchEvent(new Event('change', { bubbles: true }));
+        _syncValue(sel, valueSpan, dropdown);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const idx = Math.max(sel.selectedIndex - 1, 0);
+        sel.selectedIndex = idx; sel.dispatchEvent(new Event('change', { bubbles: true }));
+        _syncValue(sel, valueSpan, dropdown);
+      }
+    });
+
+    dropdown.addEventListener('click', function (e) {
+      const opt = e.target.closest('.cs-option');
+      if (!opt) return;
+      sel.value = opt.dataset.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      _syncValue(sel, valueSpan, dropdown);
+      _close();
+      trigger.focus();
+    });
+
+    const mo = new MutationObserver(function () {
+      _syncOptions(sel, dropdown);
+      _syncValue(sel, valueSpan, dropdown);
+      _syncDisabled(sel, wrapper);
+      if (_openState && _openState.wrapper === wrapper) _positionDropdown(trigger, dropdown);
+    });
+    mo.observe(sel, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+
+    // Sync UI when value is changed programmatically via dispatchEvent('change')
+    sel.addEventListener('change', function () { _syncValue(sel, valueSpan, dropdown); });
+  }
+
+  function _initAll(root) {
+    (root || document).querySelectorAll('select.form-select:not([data-cs-init])').forEach(_build);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { _initAll(); });
+  else _initAll();
+
+  const _bodyMO = new MutationObserver(function (mutations) {
+    mutations.forEach(function (m) {
+      m.addedNodes.forEach(function (node) {
+        if (node.nodeType !== 1) return;
+        if (node.matches && node.matches('select.form-select:not([data-cs-init])')) _build(node);
+        if (node.querySelectorAll) node.querySelectorAll('select.form-select:not([data-cs-init])').forEach(_build);
+      });
+    });
+  });
+  _bodyMO.observe(document.body, { childList: true, subtree: true });
 })();

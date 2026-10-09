@@ -178,3 +178,10 @@ patch_*.js
 fix_css.py
 {public/
 restore.py
+scratch/
+
+# IDE & AI Assistant metadata
+.claude/
+.cursor/
+.codex-runlogs/
+

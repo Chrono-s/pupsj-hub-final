@@ -1,190 +1,133 @@
 const express = require('express');
 const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { uploadDocument } = require('../middleware/upload');
 const { notifyAudience, notifyUsers, safeNotify } = require('../services/notifications');
-const fs = require('fs');
-const path = require('path');
+const { safeJsonParse } = require('../utils/helpers');
+
 const DOCUMENT_GLOBAL_SCOPES = ['General', 'Campus'];
 const DOCUMENT_SPECIFIC_SCOPE = 'Specific Students';
 
-// ── Auto-provision: create category_access table and category department column if they don't exist ──────
+// ── Auto-provisioning tables and columns if not present ─────────────────────
 pool.query(`
   ALTER TABLE document_categories ADD COLUMN IF NOT EXISTS department VARCHAR(100) DEFAULT 'General'
 `).catch(err => console.error('[documents] Auto-provision warning (department):', err.message));
 
 pool.query(`
   CREATE TABLE IF NOT EXISTS category_access (
-    category_id UUID REFERENCES document_categories(id) ON DELETE CASCADE,
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    PRIMARY KEY (category_id, user_id)
+    category_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    PRIMARY KEY (category_id, user_id),
+    CONSTRAINT fk_ca_category FOREIGN KEY (category_id) REFERENCES document_categories(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ca_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )
 `).catch(err => console.error('[documents] Auto-provision warning (category_access):', err.message));
 
 function parseWhitelist(raw) {
-  if (!raw) return [];
+  const parsed = safeJsonParse(raw, null);
+  if (Array.isArray(parsed)) return parsed.filter(Boolean);
   if (Array.isArray(raw)) return raw.filter(Boolean);
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
-  } catch (_) {
-    return [];
-  }
+  return [];
 }
 
-async function replaceDocumentAccess(client, documentId, userIds) {
-  await client.query('DELETE FROM document_access WHERE document_id = $1', [documentId]);
+async function syncAccessList(client, tableName, idColumnName, entityId, userIds) {
+  await client.query(`DELETE FROM ${tableName} WHERE ${idColumnName} = ?`, [entityId]);
   if (!userIds.length) return [];
 
-  const validUsers = await client.query(
-    `SELECT id
-     FROM users
-     WHERE role IN ('student', 'faculty')
-       AND id = ANY($1::uuid[])`,
+  const [validUsers] = await client.query(
+    `SELECT id FROM users WHERE role IN ('student', 'faculty') AND id IN (?)`,
     [userIds]
   );
 
-  for (const row of validUsers.rows) {
+  const validIds = (validUsers || []).map(u => u.id);
+  for (const uid of validIds) {
+    const userCol = tableName === 'document_access' ? 'student_id' : 'user_id';
     await client.query(
-      'INSERT INTO document_access (document_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [documentId, row.id]
+      `INSERT IGNORE INTO ${tableName} (${idColumnName}, ${userCol}) VALUES (?, ?)`,
+      [entityId, uid]
     );
   }
-
-  return validUsers.rows.map((row) => row.id);
+  return validIds;
 }
 
-async function fetchDocumentAccess(client, documentId) {
-  const result = await client.query(
+async function fetchAccessUsers(db, tableName, idColumnName, entityId) {
+  const userCol = tableName === 'document_access' ? 'student_id' : 'user_id';
+  const [rows] = await db.query(
     `SELECT u.id, u.student_number, u.first_name, u.last_name, u.email, u.role, u.department
-     FROM document_access da
-     INNER JOIN users u ON u.id = da.student_id
-     WHERE da.document_id = $1
+     FROM ${tableName} a
+     INNER JOIN users u ON u.id = a.${userCol}
+     WHERE a.${idColumnName} = ?
        AND u.role IN ('student', 'faculty')
      ORDER BY u.role ASC, u.last_name ASC, u.first_name ASC`,
-    [documentId]
+    [entityId]
   );
-  return result.rows;
+  return rows || [];
 }
 
-async function replaceCategoryAccess(client, categoryId, userIds) {
-  await client.query('DELETE FROM category_access WHERE category_id = $1', [categoryId]);
-  if (!userIds.length) return [];
+// ──────────────────────────────────────────────
+//  CATEGORIES
+// ──────────────────────────────────────────────
 
-  const validUsers = await client.query(
-    `SELECT id
-     FROM users
-     WHERE role IN ('student', 'faculty')
-       AND id = ANY($1::uuid[])`,
-    [userIds]
-  );
-
-  for (const row of validUsers.rows) {
-    await client.query(
-      'INSERT INTO category_access (category_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-      [categoryId, row.id]
-    );
-  }
-
-  return validUsers.rows.map((row) => row.id);
-}
-
-async function fetchCategoryAccess(client, categoryId) {
-  const result = await client.query(
-    `SELECT u.id, u.student_number, u.first_name, u.last_name, u.email, u.role, u.department
-     FROM category_access ca
-     INNER JOIN users u ON u.id = ca.user_id
-     WHERE ca.category_id = $1
-       AND u.role IN ('student', 'faculty')
-     ORDER BY u.role ASC, u.last_name ASC, u.first_name ASC`,
-    [categoryId]
-  );
-  return result.rows;
-}
-
-function actorName(user) {
-  return [user?.first_name, user?.last_name].filter(Boolean).join(' ').trim() || 'A user';
-}
-
-// ── CATEGORIES ──
-
-// Get all categories
+// Get all categories with access-filtered file counts
 router.get('/categories', authenticateToken, async (req, res) => {
   try {
     const { department: filterDept } = req.query;
     const isAdmin = req.user.role === 'admin';
-    const params = [];
     let visibilityClause = `dt.status = 'active'`;
     let catVisibilityClause = `dc.status = 'active'`;
 
+    const visParams = [];
+    const catParams = [];
+
     if (!isAdmin) {
-      if (req.user.role === 'student') {
-        params.push(req.user.department || '');
-        const deptParam = `$${params.length}`;
-        params.push(req.user.id);
-        const studentParam = `$${params.length}`;
+      if (req.user.role === 'student' || req.user.role === 'faculty') {
+        const userDept = req.user.department || '';
+        const userId = req.user.id;
+
         visibilityClause += ` AND (
           dt.department IN ('General', 'Campus')
-          OR dt.department = ${deptParam}
+          OR dt.department = ?
           OR (dt.department = '${DOCUMENT_SPECIFIC_SCOPE}' AND EXISTS (
-            SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = ${studentParam}
+            SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = ?
           ))
         )`;
+        visParams.push(userDept, userId);
+
         catVisibilityClause += ` AND (
           dc.department IS NULL
           OR dc.department IN ('General', 'Campus')
-          OR dc.department = ${deptParam}
+          OR dc.department = ?
           OR (dc.department = '${DOCUMENT_SPECIFIC_SCOPE}' AND EXISTS (
-            SELECT 1 FROM category_access ca WHERE ca.category_id = dc.id AND ca.user_id = ${studentParam}
+            SELECT 1 FROM category_access ca WHERE ca.category_id = dc.id AND ca.user_id = ?
           ))
         )`;
+        catParams.push(userDept, userId);
       } else if (req.user.role === 'guest') {
         visibilityClause += ` AND dt.department = 'General'`;
         catVisibilityClause += ` AND (dc.department IS NULL OR dc.department = 'General')`;
-      } else {
-        params.push(req.user.department || '');
-        const deptParam = `$${params.length}`;
-        params.push(req.user.id);
-        const facultyParam = `$${params.length}`;
-        
-        visibilityClause += ` AND (
-          dt.department IN ('General', 'Campus')
-          OR dt.department = ${deptParam}
-          OR (dt.department = '${DOCUMENT_SPECIFIC_SCOPE}' AND EXISTS (
-            SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = ${facultyParam}
-          ))
-        )`;
-        catVisibilityClause += ` AND (
-          dc.department IS NULL
-          OR dc.department IN ('General', 'Campus')
-          OR dc.department = ${deptParam}
-          OR (dc.department = '${DOCUMENT_SPECIFIC_SCOPE}' AND EXISTS (
-            SELECT 1 FROM category_access ca WHERE ca.category_id = dc.id AND ca.user_id = ${facultyParam}
-          ))
-        )`;
       }
-      if (filterDept && filterDept !== 'All') {
-        params.push(filterDept);
-        visibilityClause += ` AND dt.department = $${params.length}`;
-        catVisibilityClause += ` AND dc.department = $${params.length}`;
-      }
-    } else if (filterDept && filterDept !== 'All') {
-      params.push(filterDept);
-      visibilityClause += ` AND dt.department = $${params.length}`;
-      catVisibilityClause += ` AND dc.department = $${params.length}`;
     }
 
-    const result = await pool.query(
-      `SELECT dc.*, u.first_name || ' ' || u.last_name as created_by_name,
+    if (filterDept && filterDept !== 'All') {
+      visibilityClause += ` AND dt.department = ?`;
+      catVisibilityClause += ` AND dc.department = ?`;
+      visParams.push(filterDept);
+      catParams.push(filterDept);
+    }
+
+    const finalParams = [...visParams, ...catParams];
+    const [rows] = await pool.query(
+      `SELECT dc.*, CONCAT(u.first_name, ' ', u.last_name) as created_by_name,
         (SELECT COUNT(*) FROM document_templates dt WHERE dt.category_id = dc.id AND ${visibilityClause}) as file_count
        FROM document_categories dc
        LEFT JOIN users u ON dc.created_by = u.id
        WHERE ${catVisibilityClause}
        ORDER BY dc.name ASC`,
-      params
+      finalParams
     );
-    res.json(result.rows);
+    res.json(rows || []);
   } catch (err) {
     console.error('Get categories error:', err);
     res.status(500).json({ error: 'Failed to fetch categories' });
@@ -193,7 +136,7 @@ router.get('/categories', authenticateToken, async (req, res) => {
 
 // Create category (admin/faculty only)
 router.post('/categories', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const { name, description, department } = req.body;
     const whitelistUserIds = parseWhitelist(req.body.whitelist_student_ids);
@@ -204,28 +147,32 @@ router.post('/categories', authenticateToken, requireRole('admin', 'faculty'), a
       return res.status(400).json({ error: 'Please select at least one user for Specific Users visibility.' });
     }
 
-    await client.query('BEGIN');
-    const result = await client.query(
-      `INSERT INTO document_categories (name, description, department, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [name.trim(), description?.trim() || null, dept, req.user.id]
+    await client.beginTransaction();
+    const newCategoryId = uuidv4();
+    await client.query(
+      `INSERT INTO document_categories (id, name, description, department, created_by)
+       VALUES (?, ?, ?, ?, ?)`,
+      [newCategoryId, name.trim(), description?.trim() || null, dept, req.user.id]
     );
-    const category = result.rows[0];
+    const [categoryRows] = await client.query('SELECT * FROM document_categories WHERE id = ?', [newCategoryId]);
 
     if (dept === DOCUMENT_SPECIFIC_SCOPE) {
-      await replaceCategoryAccess(client, category.id, whitelistUserIds);
+      await syncAccessList(client, 'category_access', 'category_id', newCategoryId, whitelistUserIds);
     }
-    await client.query('COMMIT');
-    res.status(201).json(category);
+    await client.commit();
+    res.status(201).json(categoryRows[0]);
   } catch (err) {
+    try { await client.rollback(); } catch (_) {}
     console.error('Create category error:', err);
     res.status(500).json({ error: 'Failed to create category' });
+  } finally {
+    client.release();
   }
 });
 
 // Update category (admin/faculty only)
 router.patch('/categories/:id', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const { id } = req.params;
     const { name, description, department } = req.body;
@@ -237,28 +184,34 @@ router.patch('/categories/:id', authenticateToken, requireRole('admin', 'faculty
       return res.status(400).json({ error: 'Please select at least one user for Specific Users visibility.' });
     }
 
-    await client.query('BEGIN');
-    const result = await client.query(
-      `UPDATE document_categories SET name = $1, description = $2, department = $3, updated_at = NOW()
-       WHERE id = $4 AND status = 'active' RETURNING *`,
+    await client.beginTransaction();
+    await client.query(
+      `UPDATE document_categories SET name = ?, description = ?, department = ?, updated_at = NOW()
+       WHERE id = ? AND status = 'active'`,
       [name.trim(), description?.trim() || null, dept, id]
     );
-    if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
+    const [updatedRows] = await client.query(
+      `SELECT * FROM document_categories WHERE id = ? AND status = 'active'`,
+      [id]
+    );
+    if (updatedRows.length === 0) {
+      await client.rollback();
       return res.status(404).json({ error: 'Category not found' });
     }
-    const category = result.rows[0];
 
     if (dept === DOCUMENT_SPECIFIC_SCOPE) {
-      await replaceCategoryAccess(client, id, whitelistUserIds);
+      await syncAccessList(client, 'category_access', 'category_id', id, whitelistUserIds);
     } else {
-      await client.query('DELETE FROM category_access WHERE category_id = $1', [id]);
+      await client.query('DELETE FROM category_access WHERE category_id = ?', [id]);
     }
-    await client.query('COMMIT');
-    res.json(category);
+    await client.commit();
+    res.json(updatedRows[0]);
   } catch (err) {
+    try { await client.rollback(); } catch (_) {}
     console.error('Update category error:', err);
     res.status(500).json({ error: 'Failed to update category' });
+  } finally {
+    client.release();
   }
 });
 
@@ -266,9 +219,8 @@ router.patch('/categories/:id', authenticateToken, requireRole('admin', 'faculty
 router.delete('/categories/:id', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query("UPDATE document_categories SET status = 'deleted', updated_at = NOW() WHERE id = $1", [id]);
-    // Also soft-delete all documents in this category
-    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE category_id = $1", [id]);
+    await pool.query("UPDATE document_categories SET status = 'deleted', updated_at = NOW() WHERE id = ?", [id]);
+    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE category_id = ?", [id]);
     res.json({ message: 'Category deleted' });
   } catch (err) {
     console.error('Delete category error:', err);
@@ -276,26 +228,25 @@ router.delete('/categories/:id', authenticateToken, requireRole('admin', 'facult
   }
 });
 
-// ── DOCUMENTS ──
+// ──────────────────────────────────────────────
+//  DOCUMENTS
+// ──────────────────────────────────────────────
 
-// Get documents
-// - Admin sees all.
-// - Faculty and students see files whose department matches their own plus General/Campus.
+// Get documents list
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    // Run auto-delete for soft-deleted documents: 6 months
+    // Purge documents soft-deleted over 6 months ago
     await pool.query(
-      `DELETE FROM document_templates 
-       WHERE status = 'deleted' 
-         AND updated_at < NOW() - INTERVAL '6 months'`
+      `DELETE FROM document_templates
+       WHERE status = 'deleted' AND updated_at < NOW() - INTERVAL 6 MONTH`
     ).catch(err => console.error('Auto-delete soft-deleted documents error:', err));
 
     const { category_id, search, department: filterDept, page = 1, limit = 50 } = req.query;
-    const offset = (page - 1) * limit;
+    const offset = (Math.max(1, parseInt(page, 10)) - 1) * parseInt(limit, 10);
     const params = [];
     let query = `
       SELECT dt.*, dc.name as category_name,
-        u.first_name || ' ' || u.last_name as uploaded_by_name
+        CONCAT(u.first_name, ' ', u.last_name) as uploaded_by_name
       FROM document_templates dt
       LEFT JOIN document_categories dc ON dt.category_id = dc.id
       LEFT JOIN users u ON dt.uploaded_by = u.id
@@ -305,141 +256,138 @@ router.get('/', authenticateToken, async (req, res) => {
     const isAdmin = req.user.role === 'admin';
     if (!isAdmin) {
       if (req.user.role === 'student' || req.user.role === 'faculty') {
-        params.push(req.user.department || '');
-        const deptParam = `$${params.length}`;
-        params.push(req.user.id);
-        const userParam = `$${params.length}`;
+        params.push(req.user.department || '', req.user.id);
         query += ` AND (
           dt.department IN ('General', 'Campus')
-          OR dt.department = ${deptParam}
+          OR dt.department = ?
           OR (dt.department = '${DOCUMENT_SPECIFIC_SCOPE}' AND EXISTS (
-            SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = ${userParam}
+            SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = ?
           ))
         )`;
       } else if (req.user.role === 'guest') {
-        // Guest: ONLY 'General'
         query += ` AND dt.department = 'General'`;
       }
-      if (filterDept && filterDept !== 'All') {
-        params.push(filterDept);
-        query += ` AND dt.department = $${params.length}`;
-      }
-    } else if (filterDept && filterDept !== 'All') {
+    }
+
+    if (filterDept && filterDept !== 'All') {
       params.push(filterDept);
-      query += ` AND dt.department = $${params.length}`;
+      query += ` AND dt.department = ?`;
     }
 
     if (category_id) {
       params.push(category_id);
-      query += ` AND dt.category_id = $${params.length}`;
+      query += ` AND dt.category_id = ?`;
     }
 
     if (search) {
-      params.push(`%${search}%`);
-      query += ` AND (dt.title ILIKE $${params.length} OR dt.description ILIKE $${params.length} OR dt.file_name ILIKE $${params.length})`;
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+      query += ` AND (dt.title LIKE ? OR dt.description LIKE ? OR dt.file_name LIKE ?)`;
     }
 
-    query += ` ORDER BY dt.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(parseInt(limit), parseInt(offset));
+    query += ` ORDER BY dt.created_at DESC LIMIT ? OFFSET ?`;
+    params.push(parseInt(limit, 10), parseInt(offset, 10));
 
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows || []);
   } catch (err) {
     console.error('Get documents error:', err);
     res.status(500).json({ error: 'Failed to fetch documents' });
   }
 });
 
+// Search students for permissions assignment
 router.get('/students-search', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
-    const q = String(req.query.q || '').trim();
+    const q = String(req.query.q || '').trim().toLowerCase();
     const params = [];
     let query = `
       SELECT id, student_number, first_name, last_name, role, department
       FROM users
-      WHERE role = 'student'
-        AND is_active = true
+      WHERE role = 'student' AND is_active = 1
     `;
 
     if (q) {
-      params.push(`%${q.toLowerCase()}%`);
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`);
       query += ` AND (
-        LOWER(first_name || ' ' || last_name) LIKE ${params.length}
-        OR LOWER(last_name || ' ' || first_name) LIKE ${params.length}
-        OR LOWER(student_number) LIKE ${params.length}
+        LOWER(CONCAT(first_name, ' ', last_name)) LIKE ?
+        OR LOWER(CONCAT(last_name, ' ', first_name)) LIKE ?
+        OR LOWER(student_number) LIKE ?
       )`;
     }
 
     query += ` ORDER BY last_name ASC, first_name ASC LIMIT 20`;
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows || []);
   } catch (err) {
     console.error('Student search error:', err);
     res.status(500).json({ error: 'Failed to search students' });
   }
 });
 
+// Search users (students + faculty) for category/document permissions
 router.get('/users-search', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
-    const q = String(req.query.q || '').trim();
+    const q = String(req.query.q || '').trim().toLowerCase();
     const params = [req.user.id];
     let query = `
       SELECT id, student_number, first_name, last_name, email, role, department
       FROM users
-      WHERE id <> $1
-        AND is_active = true
+      WHERE id <> ?
+        AND is_active = 1
         AND role IN ('student', 'faculty')
     `;
 
     if (q) {
-      params.push(`%${q.toLowerCase()}%`);
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
       query += ` AND (
-        LOWER(first_name || ' ' || last_name) LIKE ${params.length}
-        OR LOWER(last_name || ' ' || first_name) LIKE ${params.length}
-        OR LOWER(student_number) LIKE ${params.length}
-        OR LOWER(email) LIKE ${params.length}
+        LOWER(CONCAT(first_name, ' ', last_name)) LIKE ?
+        OR LOWER(CONCAT(last_name, ' ', first_name)) LIKE ?
+        OR LOWER(student_number) LIKE ?
+        OR LOWER(email) LIKE ?
       )`;
     }
 
     query += ` ORDER BY role ASC, last_name ASC, first_name ASC LIMIT 20`;
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows || []);
   } catch (err) {
     console.error('User search error:', err);
     res.status(500).json({ error: 'Failed to search users' });
   }
 });
 
+// Get category access whitelist
 router.get('/categories/:id/access', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
-    const check = await pool.query(
-      'SELECT id, department FROM document_categories WHERE id = $1 AND status = $2',
+    const [checkRows] = await pool.query(
+      'SELECT id, department FROM document_categories WHERE id = ? AND status = ?',
       [req.params.id, 'active']
     );
-    if (!check.rows.length) return res.status(404).json({ error: 'Category not found' });
+    if (!checkRows.length) return res.status(404).json({ error: 'Category not found' });
 
-    const users = await fetchCategoryAccess(pool, req.params.id);
-    res.json({ users, visibility: check.rows[0].department || 'General' });
+    const users = await fetchAccessUsers(pool, 'category_access', 'category_id', req.params.id);
+    res.json({ users, visibility: checkRows[0].department || 'General' });
   } catch (err) {
     console.error('Category access fetch error:', err);
     res.status(500).json({ error: 'Failed to fetch category access list' });
   }
 });
 
+// Get document access whitelist
 router.get('/:id/access', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
-    const check = await pool.query(
-      'SELECT id, department, uploaded_by FROM document_templates WHERE id = $1 AND status = $2',
+    const [checkRows] = await pool.query(
+      'SELECT id, department, uploaded_by FROM document_templates WHERE id = ? AND status = ?',
       [req.params.id, 'active']
     );
-    if (!check.rows.length) return res.status(404).json({ error: 'Document not found' });
+    if (!checkRows.length) return res.status(404).json({ error: 'Document not found' });
 
-    if (req.user.role === 'faculty' && check.rows[0].uploaded_by !== req.user.id) {
+    if (req.user.role === 'faculty' && checkRows[0].uploaded_by !== req.user.id) {
       return res.status(403).json({ error: 'Not authorized to view access list for this document' });
     }
 
-    const students = await fetchDocumentAccess(pool, req.params.id);
-    res.json({ students, visibility: check.rows[0].department || 'General' });
+    const students = await fetchAccessUsers(pool, 'document_access', 'document_id', req.params.id);
+    res.json({ students, visibility: checkRows[0].department || 'General' });
   } catch (err) {
     console.error('Document access fetch error:', err);
     res.status(500).json({ error: 'Failed to fetch document access list' });
@@ -448,45 +396,47 @@ router.get('/:id/access', authenticateToken, requireRole('admin', 'faculty'), as
 
 // Upload document (admin/faculty only)
 router.post('/', authenticateToken, requireRole('admin', 'faculty'), uploadDocument.single('file'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   let documentRow = null;
   let grantedStudentIds = [];
   let scope = 'General';
+
   try {
     const { title, description, category_id } = req.body;
     let { department } = req.body;
     const whitelistStudentIds = parseWhitelist(req.body.whitelist_student_ids);
+
     if (!title || !title.trim()) return res.status(400).json({ error: 'Title is required' });
     if (!req.file) return res.status(400).json({ error: 'File is required' });
     if (!category_id) return res.status(400).json({ error: 'Category is required' });
-    if (department === 'Campus') {
-      return res.status(400).json({ error: 'Campus visibility is not allowed for document templates' });
-    }
-    if (department === DOCUMENT_SPECIFIC_SCOPE && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Only admins can assign specific student access.' });
+    if (department === DOCUMENT_SPECIFIC_SCOPE && !['admin', 'superadmin', 'faculty'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Only admins and faculty can assign specific student access.' });
     }
     if (department === DOCUMENT_SPECIFIC_SCOPE && whitelistStudentIds.length === 0) {
       return res.status(400).json({ error: 'Please select at least one student for Specific Students visibility.' });
     }
 
-    const catCheck = await client.query("SELECT id FROM document_categories WHERE id = $1 AND status = 'active'", [category_id]);
-    if (catCheck.rows.length === 0) return res.status(400).json({ error: 'Category not found' });
+    const [catCheck] = await client.query("SELECT id FROM document_categories WHERE id = ? AND status = 'active'", [category_id]);
+    if (catCheck.length === 0) return res.status(400).json({ error: 'Category not found' });
 
     department = department || 'General';
     scope = department;
 
     const fileUrl = `/uploads/documents/${req.file.filename}`;
-    await client.query('BEGIN');
-    const result = await client.query(
-      `INSERT INTO document_templates (category_id, uploaded_by, title, description, department, file_url, file_name, file_size, file_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [category_id, req.user.id, title.trim(), description?.trim() || null, department, fileUrl, req.file.originalname, req.file.size, req.file.mimetype]
+    await client.beginTransaction();
+    const newDocumentId = uuidv4();
+    await client.query(
+      `INSERT INTO document_templates (id, category_id, uploaded_by, title, description, department, file_url, file_name, file_size, file_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newDocumentId, category_id, req.user.id, title.trim(), description?.trim() || null, department, fileUrl, req.file.originalname, req.file.size, req.file.mimetype]
     );
-    documentRow = result.rows[0];
+    const [documentRows] = await client.query('SELECT * FROM document_templates WHERE id = ?', [newDocumentId]);
+    documentRow = documentRows[0];
+
     if (department === DOCUMENT_SPECIFIC_SCOPE) {
-      grantedStudentIds = await replaceDocumentAccess(client, documentRow.id, whitelistStudentIds);
+      grantedStudentIds = await syncAccessList(client, 'document_access', 'document_id', documentRow.id, whitelistStudentIds);
     }
-    await client.query('COMMIT');
+    await client.commit();
 
     await safeNotify('document upload', async () => {
       const payload = {
@@ -498,19 +448,14 @@ router.post('/', authenticateToken, requireRole('admin', 'faculty'), uploadDocum
 
       if (scope === DOCUMENT_SPECIFIC_SCOPE) {
         await notifyUsers(pool, grantedStudentIds, payload, [req.user.id]);
-        return;
+      } else {
+        await notifyAudience(pool, { department: scope, excludeUserIds: [req.user.id] }, payload);
       }
-
-      await notifyAudience(
-        pool,
-        { department: scope, excludeUserIds: [req.user.id] },
-        payload
-      );
     });
 
     res.status(201).json(documentRow);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Upload document error:', err);
     res.status(500).json({ error: 'Failed to upload document' });
   } finally {
@@ -520,63 +465,66 @@ router.post('/', authenticateToken, requireRole('admin', 'faculty'), uploadDocum
 
 // Update document metadata (admin/faculty only)
 router.patch('/:id', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   let grantedStudentIds = [];
   let previousDepartment = null;
   let previousAccessIds = [];
   let updatedDocument = null;
+
   try {
     const { id } = req.params;
     const { title, description, category_id, department } = req.body;
     const whitelistStudentIds = parseWhitelist(req.body.whitelist_student_ids);
+
     if (!title || !title.trim()) return res.status(400).json({ error: 'Title is required' });
-    if (department === 'Campus') {
-      return res.status(400).json({ error: 'Campus visibility is not allowed for document templates' });
-    }
-    if (department === DOCUMENT_SPECIFIC_SCOPE && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Only admins can assign specific student access.' });
+    if (department === DOCUMENT_SPECIFIC_SCOPE && !['admin', 'superadmin', 'faculty'].includes(req.user.role)) {
+      return res.status(403).json({ error: 'Only admins and faculty can assign specific student access.' });
     }
     if (department === DOCUMENT_SPECIFIC_SCOPE && whitelistStudentIds.length === 0) {
       return res.status(400).json({ error: 'Please select at least one student for Specific Students visibility.' });
     }
 
-    const check = await client.query(
-      "SELECT uploaded_by, department FROM document_templates WHERE id = $1 AND status = 'active'", [id]
+    const [checkRows] = await client.query(
+      "SELECT uploaded_by, department FROM document_templates WHERE id = ? AND status = 'active'", [id]
     );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Document not found' });
-    previousDepartment = check.rows[0].department || 'General';
-    if (req.user.role === 'faculty' && check.rows[0].uploaded_by !== req.user.id) {
+    if (checkRows.length === 0) return res.status(404).json({ error: 'Document not found' });
+    previousDepartment = checkRows[0].department || 'General';
+    if (req.user.role === 'faculty' && checkRows[0].uploaded_by !== req.user.id) {
       return res.status(403).json({ error: 'Not authorized to edit this document' });
     }
 
-    let deptToSet = department || null;
+    const deptToSet = department || null;
 
-    await client.query('BEGIN');
+    await client.beginTransaction();
     if (previousDepartment === DOCUMENT_SPECIFIC_SCOPE) {
-      previousAccessIds = (await fetchDocumentAccess(client, id)).map((student) => student.id);
+      previousAccessIds = (await fetchAccessUsers(client, 'document_access', 'document_id', id)).map(s => s.id);
     }
-    const result = await client.query(
+    await client.query(
       `UPDATE document_templates
-         SET title = $1,
-         description = $2,
-             category_id = $3,
-             department = COALESCE($4, department),
+         SET title = ?,
+             description = ?,
+             category_id = ?,
+             department = COALESCE(?, department),
              updated_at = NOW()
-       WHERE id = $5 AND status = 'active' RETURNING *`,
+       WHERE id = ? AND status = 'active'`,
       [title.trim(), description?.trim() || null, category_id, deptToSet, id]
     );
-    updatedDocument = result.rows[0];
+    const [updatedRows] = await client.query(
+      `SELECT * FROM document_templates WHERE id = ? AND status = 'active'`,
+      [id]
+    );
+    updatedDocument = updatedRows[0];
+
     if (deptToSet === DOCUMENT_SPECIFIC_SCOPE) {
-      grantedStudentIds = await replaceDocumentAccess(client, id, whitelistStudentIds);
+      grantedStudentIds = await syncAccessList(client, 'document_access', 'document_id', id, whitelistStudentIds);
     } else {
-      await client.query('DELETE FROM document_access WHERE document_id = $1', [id]);
+      await client.query('DELETE FROM document_access WHERE document_id = ?', [id]);
     }
-    await client.query('COMMIT');
+    await client.commit();
 
     await safeNotify('document access update', async () => {
       if ((deptToSet || previousDepartment) !== DOCUMENT_SPECIFIC_SCOPE) return;
-
-      const newlyAddedIds = grantedStudentIds.filter((studentId) => !previousAccessIds.includes(studentId));
+      const newlyAddedIds = grantedStudentIds.filter(uid => !previousAccessIds.includes(uid));
       if (!newlyAddedIds.length) return;
 
       await notifyUsers(
@@ -594,7 +542,7 @@ router.patch('/:id', authenticateToken, requireRole('admin', 'faculty'), async (
 
     res.json(updatedDocument);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Update document error:', err);
     res.status(500).json({ error: 'Failed to update document' });
   } finally {
@@ -606,14 +554,14 @@ router.patch('/:id', authenticateToken, requireRole('admin', 'faculty'), async (
 router.delete('/:id', authenticateToken, requireRole('admin', 'faculty'), async (req, res) => {
   try {
     const { id } = req.params;
-    const check = await pool.query(
-      "SELECT uploaded_by FROM document_templates WHERE id = $1 AND status = 'active'", [id]
+    const [checkRows] = await pool.query(
+      "SELECT uploaded_by FROM document_templates WHERE id = ? AND status = 'active'", [id]
     );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Document not found' });
-    if (req.user.role === 'faculty' && check.rows[0].uploaded_by !== req.user.id) {
+    if (checkRows.length === 0) return res.status(404).json({ error: 'Document not found' });
+    if (req.user.role === 'faculty' && checkRows[0].uploaded_by !== req.user.id) {
       return res.status(403).json({ error: 'Not authorized to delete this document' });
     }
-    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE id = $1", [id]);
+    await pool.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE id = ?", [id]);
     res.json({ message: 'Document deleted' });
   } catch (err) {
     console.error('Delete document error:', err);
@@ -625,7 +573,7 @@ router.delete('/:id', authenticateToken, requireRole('admin', 'faculty'), async 
 router.post('/:id/download', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query('UPDATE document_templates SET download_count = download_count + 1 WHERE id = $1', [id]);
+    await pool.query('UPDATE document_templates SET download_count = download_count + 1 WHERE id = ?', [id]);
     res.json({ message: 'Download tracked' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to track download' });

@@ -1,38 +1,25 @@
 const express = require('express');
 const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/database');
-const { authenticateToken, requireRole } = require('../middleware/auth');
+const { authenticateToken, requireRole, requirePermission } = require('../middleware/auth');
 const { uploadAnnouncement } = require('../middleware/upload');
 const { notifyAdmins, notifyAudience, notifyUser, safeNotify } = require('../services/notifications');
+const { safeJsonParse, getActorName, getPagination } = require('../utils/helpers');
 
-// Valid post scopes that every user can see regardless of department.
-const GLOBAL_SCOPES = ['General', 'Campus'];
+const requireAnnouncements = requirePermission('announcements');
 
-// Get all announcements
-// - Admin sees every announcement (all statuses optionally via ?status=pending|active|all).
-// - Faculty/Student sees only 'active' posts in their own department + General + Campus,
-//   PLUS their own posts (any status) so they can track pending/rejected submissions.
+// ── GET /api/announcements ──────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const { department: filterDept, status: filterStatus, page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+    const { department: filterDept, status: filterStatus } = req.query;
+    const { page, limit, offset } = getPagination(req.query, 20);
 
-    // Run auto-archiving query: 3 months
-    await pool.query(
-      `UPDATE announcements 
-       SET status = 'archived' 
-       WHERE created_at < NOW() - INTERVAL '3 months' 
-         AND status = 'active'`
-    ).catch(err => console.error('Auto-archive announcements error:', err));
+    // Auto-maintenance queries
+    await pool.query("UPDATE announcements SET status = 'archived' WHERE created_at < NOW() - INTERVAL 3 MONTH AND status = 'active'").catch(() => {});
+    await pool.query("DELETE FROM announcements WHERE status = 'deleted' AND updated_at < NOW() - INTERVAL 6 MONTH").catch(() => {});
 
-    // Run auto-delete for soft-deleted announcements: 6 months
-    await pool.query(
-      `DELETE FROM announcements 
-       WHERE status = 'deleted' 
-         AND updated_at < NOW() - INTERVAL '6 months'`
-    ).catch(err => console.error('Auto-delete soft-deleted announcements error:', err));
-
-    const isStaff = req.user.role === 'faculty' || req.user.role === 'admin' || req.user.role === 'superadmin';
+    const isStaff = ['faculty', 'admin', 'superadmin'].includes(req.user.role);
     const isAdmin = req.user.role === 'admin';
     const params = [];
 
@@ -42,22 +29,21 @@ router.get('/', authenticateToken, async (req, res) => {
         statusClause = `(a.status = 'archived' OR a.status = 'deleted')`;
       } else if (filterStatus && ['pending', 'active', 'rejected'].includes(filterStatus)) {
         params.push(filterStatus);
-        statusClause = `a.status = $${params.length}`;
+        statusClause = `a.status = ?`;
       } else {
         statusClause = `a.status != 'deleted' AND a.status != 'archived'`;
       }
     } else {
-      // Students / Guests: active posts visible per dept rules, OR own posts any status (except deleted).
       params.push(req.user.id);
-      const ownIdParam = params.length;
-      statusClause = `((a.status = 'active') OR (a.author_id = $${ownIdParam} AND a.status != 'deleted'))`;
+      statusClause = `((a.status = 'active') OR (a.author_id = ? AND a.status != 'deleted'))`;
     }
 
-    // Restrict department queries by student/guest to General/Campus (or their own department)
     if ((req.user.role === 'student' || req.user.role === 'guest') && filterDept && filterDept !== 'All') {
-      const allowedScopes = req.user.role === 'guest' ? new Set(['General', 'Campus']) : new Set(['General', 'Campus', req.user.department].filter(Boolean));
+      const allowedScopes = req.user.role === 'guest'
+        ? new Set(['General', 'Campus'])
+        : new Set(['General', 'Campus', req.user.department].filter(Boolean));
       if (!allowedScopes.has(filterDept)) {
-        return res.json({ announcements: [], total: 0, page: parseInt(page), totalPages: 0 });
+        return res.json({ announcements: [], total: 0, page, totalPages: 0 });
       }
     }
 
@@ -66,16 +52,12 @@ router.get('/', authenticateToken, async (req, res) => {
       if (req.user.role === 'faculty') {
         if (filterDept && filterDept !== 'All') {
           params.push(filterDept);
-          deptClause = ` AND a.department = $${params.length}`;
-        } else {
-          deptClause = '';
+          deptClause = ` AND a.department = ?`;
         }
       } else if (req.user.role === 'guest') {
         if (filterDept && filterDept !== 'All') {
-          const allowed = ['General', 'Campus'];
-          const actualDept = allowed.includes(filterDept) ? filterDept : 'General';
-          params.push(actualDept);
-          deptClause = ` AND a.department = $${params.length}`;
+          params.push(['General', 'Campus'].includes(filterDept) ? filterDept : 'General');
+          deptClause = ` AND a.department = ?`;
         } else {
           deptClause = ` AND a.department IN ('General', 'Campus')`;
         }
@@ -83,31 +65,30 @@ router.get('/', authenticateToken, async (req, res) => {
         const userDept = req.user.department || '';
         if (filterDept && filterDept !== 'All') {
           const allowed = ['General', 'Campus', userDept];
-          const actualDept = allowed.includes(filterDept) ? filterDept : userDept;
-          params.push(actualDept);
-          deptClause = ` AND a.department = $${params.length}`;
+          params.push(allowed.includes(filterDept) ? filterDept : userDept);
+          deptClause = ` AND a.department = ?`;
         } else {
-          params.push(userDept);
-          const deptParam = params.length;
-          deptClause = ` AND (a.department IN ('General','Campus') OR a.department = $${deptParam} OR a.author_id = $${ownIdParamOrSelf(params, req.user.id)})`;
+          params.push(userDept, req.user.id);
+          deptClause = ` AND (a.department IN ('General','Campus') OR a.department = ? OR a.author_id = ?)`;
         }
       }
     } else if (filterDept && filterDept !== 'All') {
       params.push(filterDept);
-      deptClause = ` AND a.department = $${params.length}`;
+      deptClause = ` AND a.department = ?`;
     }
 
-    let query = `
+    params.push(limit, offset);
+
+    const query = `
       SELECT a.*,
-        u.first_name || ' ' || u.last_name as author_name,
+        CONCAT(u.first_name, ' ', u.last_name) as author_name,
         u.profile_image as author_image,
         u.role as author_role,
         pg.name as page_name,
         pg.logo_image as page_logo,
         COALESCE(
-          json_agg(
-            json_build_object('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order)
-          ) FILTER (WHERE ai.id IS NOT NULL), '[]'
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
@@ -116,94 +97,23 @@ router.get('/', authenticateToken, async (req, res) => {
       WHERE ${statusClause}${deptClause}
       GROUP BY a.id, u.first_name, u.last_name, u.profile_image, u.role, pg.name, pg.logo_image
       ORDER BY a.is_pinned DESC, a.created_at DESC
-      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+      LIMIT ? OFFSET ?
     `;
-    params.push(parseInt(limit), parseInt(offset));
 
-    const result = await pool.query(query, params);
+    const [rows] = await pool.query(query, params);
+    const announcements = (rows || []).map(r => ({
+      ...r,
+      images: safeJsonParse(r.images, []),
+    }));
 
-    // Count
-    const countParams = [];
-    let countStatusClause;
-    if (isStaff) {
-      if (filterStatus === 'archived') {
-        countStatusClause = `(status = 'archived' OR status = 'deleted')`;
-      } else if (filterStatus && ['pending', 'active', 'rejected'].includes(filterStatus)) {
-        countParams.push(filterStatus);
-        countStatusClause = `status = $${countParams.length}`;
-      } else {
-        countStatusClause = `status != 'deleted' AND status != 'archived'`;
-      }
-    } else {
-      countParams.push(req.user.id);
-      countStatusClause = `((status = 'active') OR (author_id = $${countParams.length} AND status != 'deleted'))`;
-    }
-    let countDeptClause = '';
-    if (!isAdmin) {
-      if (req.user.role === 'faculty') {
-        if (filterDept && filterDept !== 'All') {
-          countParams.push(filterDept);
-          countDeptClause = ` AND department = $${countParams.length}`;
-        } else {
-          countDeptClause = '';
-        }
-      } else if (req.user.role === 'guest') {
-        if (filterDept && filterDept !== 'All') {
-          const allowed = ['General', 'Campus'];
-          const actualDept = allowed.includes(filterDept) ? filterDept : 'General';
-          countParams.push(actualDept);
-          countDeptClause = ` AND department = $${countParams.length}`;
-        } else {
-          countDeptClause = ` AND department IN ('General', 'Campus')`;
-        }
-      } else {
-        const userDept = req.user.department || '';
-        if (filterDept && filterDept !== 'All') {
-          const allowed = ['General', 'Campus', userDept];
-          const actualDept = allowed.includes(filterDept) ? filterDept : userDept;
-          countParams.push(actualDept);
-          countDeptClause = ` AND department = $${countParams.length}`;
-        } else {
-          countParams.push(userDept);
-          countDeptClause = ` AND (department IN ('General','Campus') OR department = $${countParams.length} OR author_id = $1)`;
-        }
-      }
-    } else if (filterDept && filterDept !== 'All') {
-      countParams.push(filterDept);
-      countDeptClause = ` AND department = $${countParams.length}`;
-    }
-
-    const countResult = await pool.query(
-      `SELECT COUNT(*) FROM announcements WHERE ${countStatusClause}${countDeptClause}`,
-      countParams
-    );
-
-    res.json({
-      announcements: result.rows,
-      total: parseInt(countResult.rows[0].count),
-      page: parseInt(page),
-      totalPages: Math.ceil(countResult.rows[0].count / limit)
-    });
+    res.json({ announcements, total: announcements.length, page, totalPages: 1 });
   } catch (err) {
     console.error('Get announcements error:', err);
     res.status(500).json({ error: 'Failed to fetch announcements' });
   }
 });
 
-// Helper: returns the param index for req.user.id, reusing an existing slot if already pushed.
-function ownIdParamOrSelf(params, userId) {
-  const idx = params.indexOf(userId);
-  if (idx !== -1) return idx + 1;
-  params.push(userId);
-  return params.length;
-}
-
-function actorName(user) {
-  return [user?.first_name, user?.last_name].filter(Boolean).join(' ').trim() || 'A user';
-}
-
-// Create announcement (with image upload)
-// Admin-authored posts auto-approve; faculty/student posts enter the pending queue.
+// ── POST /api/announcements ─────────────────────────────────────────────────
 router.post('/', authenticateToken, uploadAnnouncement.array('images', 5), async (req, res) => {
   try {
     const { title, content, department } = req.body;
@@ -212,61 +122,51 @@ router.post('/', authenticateToken, uploadAnnouncement.array('images', 5), async
     const isAdmin = req.user.role === 'admin';
     const scope = (department || 'General').trim();
 
-    // Only admin and faculty can broadcast to the "Campus" scope.
     if (scope === 'Campus' && !['admin', 'faculty'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Only faculty and admins can post campus-wide announcements.' });
     }
 
-    // Faculty announcements now require admin approval before they appear publicly.
     const autoApprove = isAdmin;
     const status = autoApprove ? 'active' : 'pending';
     const approvedBy = autoApprove ? req.user.id : null;
     const approvedAt = autoApprove ? new Date() : null;
+    const newId = uuidv4();
 
-    const result = await pool.query(
-      `INSERT INTO announcements (author_id, title, content, department, status, approved_by, approved_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [req.user.id, title, content, scope, status, approvedBy, approvedAt]
+    await pool.query(
+      `INSERT INTO announcements (id, author_id, title, content, department, status, approved_by, approved_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newId, req.user.id, title, content, scope, status, approvedBy, approvedAt]
     );
 
-    const announcement = result.rows[0];
+    const [createdRows] = await pool.query('SELECT * FROM announcements WHERE id = ?', [newId]);
+    const announcement = createdRows[0];
 
     if (req.files && req.files.length > 0) {
       for (let i = 0; i < req.files.length; i++) {
         const imageUrl = `/uploads/announcements/${req.files[i].filename}`;
         await pool.query(
-          `INSERT INTO announcement_images (announcement_id, image_url, display_order)
-           VALUES ($1, $2, $3)`,
-          [announcement.id, imageUrl, i]
+          'INSERT INTO announcement_images (id, announcement_id, image_url, display_order) VALUES (?, ?, ?, ?)',
+          [uuidv4(), announcement.id, imageUrl, i]
         );
       }
     }
 
     await safeNotify('announcement create', async () => {
       if (status === 'pending') {
-        await notifyAdmins(
-          pool,
-          {
-            title: 'Announcement awaiting review',
-            message: `${actorName(req.user)} submitted "${title}" for approval.`,
-            type: 'announcement',
-            link: 'page:admin-dashboard',
-          },
-          [req.user.id]
-        );
-        return;
-      }
-
-      await notifyAudience(
-        pool,
-        { department: scope, excludeUserIds: [req.user.id] },
-        {
+        await notifyAdmins(pool, {
+          title: 'Announcement awaiting review',
+          message: `${getActorName(req.user)} submitted "${title}" for approval.`,
+          type: 'announcement',
+          link: 'page:admin-dashboard',
+        }, [req.user.id]);
+      } else {
+        await notifyAudience(pool, { department: scope, excludeUserIds: [req.user.id] }, {
           title: 'New announcement',
           message: `"${title}" is now available in Announcements.`,
           type: 'announcement',
           link: 'page:announcements',
-        }
-      );
+        });
+      }
     });
 
     res.status(201).json({
@@ -279,81 +179,126 @@ router.post('/', authenticateToken, uploadAnnouncement.array('images', 5), async
   }
 });
 
-// Update announcement (author or admin). Edits by non-admin authors return the post to pending.
-router.patch('/:id', authenticateToken, async (req, res) => {
+// ── PATCH / PUT /api/announcements/:id ──────────────────────────────────────
+const handleUpdateAnnouncement = async (req, res) => {
   try {
     const { id } = req.params;
     const { title, content, department, is_pinned } = req.body;
     if (!title || !content) return res.status(400).json({ error: 'Title and content are required' });
 
-    const check = await pool.query(
-      "SELECT author_id, status FROM announcements WHERE id = $1 AND status != 'deleted'",
-      [id]
-    );
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Announcement not found' });
-    const isAdmin = req.user.role === 'admin';
-    if (check.rows[0].author_id !== req.user.id && !isAdmin) {
+    const [checkRows] = await pool.query("SELECT author_id, status, page_id FROM announcements WHERE id = ? AND status != 'deleted'", [id]);
+    if (!checkRows.length) return res.status(404).json({ error: 'Announcement not found' });
+
+    const isAdmin = ['admin', 'superadmin'].includes(req.user.role);
+    const isAuthor = checkRows[0].author_id === req.user.id;
+    let isPageManager = false;
+    if (checkRows[0].page_id) {
+      const [pageRows] = await pool.query('SELECT owner_id FROM pages WHERE id = ?', [checkRows[0].page_id]);
+      if (pageRows.length && pageRows[0].owner_id === req.user.id) {
+        isPageManager = true;
+      } else {
+        const [memRows] = await pool.query('SELECT id FROM page_members WHERE page_id = ? AND user_id = ?', [checkRows[0].page_id, req.user.id]);
+        if (memRows.length) isPageManager = true;
+      }
+    }
+
+    if (!isAuthor && !isAdmin && !isPageManager) {
       return res.status(403).json({ error: 'Not authorized to edit this announcement' });
     }
 
-    // Admin edits auto-approve (e.g. if the post was pending, admin editing it means they approve it).
-    // Non-admin edits revert the post to pending for re-review.
-    const nextStatus = isAdmin ? 'active' : 'pending';
-
-    const result = await pool.query(
+    const currentStatus = checkRows[0].status;
+    const nextStatus = isAdmin ? 'active' : (currentStatus === 'rejected' ? 'pending' : (currentStatus || 'pending'));
+    await pool.query(
       `UPDATE announcements
-         SET title = $1, content = $2,
-             department = COALESCE($3, department),
-             is_pinned = COALESCE($4, is_pinned),
-             status = $5,
-             approved_by = CASE WHEN $5 = 'active' THEN $7 ELSE approved_by END,
-             approved_at = CASE WHEN $5 = 'active' THEN NOW() ELSE approved_at END,
+         SET title = ?, content = ?,
+             department = COALESCE(?, department),
+             is_pinned = COALESCE(?, is_pinned),
+             status = ?,
+             approved_by = CASE WHEN ? = 'active' THEN ? ELSE approved_by END,
+             approved_at = CASE WHEN ? = 'active' THEN NOW() ELSE approved_at END,
              updated_at = NOW()
-       WHERE id = $6 RETURNING *`,
-      [title, content, department || null, typeof is_pinned === 'boolean' ? is_pinned : null, nextStatus, id, req.user.id]
+       WHERE id = ?`,
+      [title.trim(), content.trim(), department || null, typeof is_pinned === 'boolean' ? is_pinned : null, nextStatus, nextStatus, req.user.id, nextStatus, id]
     );
-    res.json(result.rows[0]);
+
+    if (req.files && req.files.length > 0) {
+      const keepImages = req.body.keep_images ? (Array.isArray(req.body.keep_images) ? req.body.keep_images : [req.body.keep_images]) : [];
+      if (keepImages.length > 0) {
+        await pool.query('DELETE FROM announcement_images WHERE announcement_id = ? AND id NOT IN (?) AND image_url NOT IN (?)', [id, keepImages, keepImages]).catch(() => {});
+      } else if (req.body.replace_images === 'true' || req.body.replace_images === true) {
+        await pool.query('DELETE FROM announcement_images WHERE announcement_id = ?', [id]);
+      }
+      for (let i = 0; i < req.files.length; i++) {
+        const imageUrl = `/uploads/announcements/${req.files[i].filename}`;
+        await pool.query(
+          'INSERT INTO announcement_images (id, announcement_id, image_url, display_order) VALUES (?, ?, ?, ?)',
+          [uuidv4(), id, imageUrl, i]
+        );
+      }
+    }
+
+    const [fetchRows] = await pool.query(`
+      SELECT a.*,
+        CONCAT(u.first_name, ' ', u.last_name) as author_name,
+        u.profile_image as author_image,
+        u.role as author_role,
+        pg.name as page_name,
+        pg.logo_image as page_logo,
+        COALESCE(
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
+        ) as images
+      FROM announcements a
+      LEFT JOIN users u ON a.author_id = u.id
+      LEFT JOIN pages pg ON a.page_id = pg.id
+      LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
+      WHERE a.id = ?
+      GROUP BY a.id, u.first_name, u.last_name, u.profile_image, u.role, pg.name, pg.logo_image
+    `, [id]);
+
+    const announcement = fetchRows[0] || {};
+    announcement.images = safeJsonParse(announcement.images, []);
+    res.json(announcement);
   } catch (err) {
     console.error('Update announcement error:', err);
     res.status(500).json({ error: 'Failed to update announcement' });
   }
-});
+};
 
-// Delete announcement (soft delete)
+router.patch('/:id', authenticateToken, uploadAnnouncement.array('images', 5), handleUpdateAnnouncement);
+router.put('/:id', authenticateToken, uploadAnnouncement.array('images', 5), handleUpdateAnnouncement);
+
+// ── DELETE /api/announcements/:id ──────────────────────────────────────────
 router.delete('/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const [checkRows] = await pool.query('SELECT author_id FROM announcements WHERE id = ?', [id]);
+    if (!checkRows.length) return res.status(404).json({ error: 'Not found' });
 
-    const check = await pool.query('SELECT author_id FROM announcements WHERE id = $1', [id]);
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-
-    if (check.rows[0].author_id !== req.user.id && req.user.role !== 'admin') {
+    if (checkRows[0].author_id !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    await pool.query("UPDATE announcements SET status = 'deleted' WHERE id = $1", [id]);
+    await pool.query("UPDATE announcements SET status = 'deleted' WHERE id = ?", [id]);
     res.json({ message: 'Announcement deleted' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete' });
   }
 });
 
-// ── ADMIN APPROVAL ENDPOINTS ──
-
-// List pending announcements (admin only)
-router.get('/pending/list', authenticateToken, requireRole('admin'), async (req, res) => {
+// ── ADMIN APPROVAL ENDPOINTS ────────────────────────────────────────────────
+router.get('/pending/list', authenticateToken, requireRole('admin'), requireAnnouncements, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const [rows] = await pool.query(`
       SELECT a.*,
-        u.first_name || ' ' || u.last_name as author_name,
+        CONCAT(u.first_name, ' ', u.last_name) as author_name,
         u.role as author_role,
         u.department as author_department,
         pg.name as page_name,
         pg.logo_image as page_logo,
         COALESCE(
-          json_agg(
-            json_build_object('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order)
-          ) FILTER (WHERE ai.id IS NOT NULL), '[]'
+          CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('id', ai.id, 'image_url', ai.image_url, 'display_order', ai.display_order), NULL) SEPARATOR ','), ']'),
+          '[]'
         ) as images
       FROM announcements a
       LEFT JOIN users u ON a.author_id = u.id
@@ -363,25 +308,31 @@ router.get('/pending/list', authenticateToken, requireRole('admin'), async (req,
       GROUP BY a.id, u.first_name, u.last_name, u.role, u.department, pg.name, pg.logo_image
       ORDER BY a.created_at ASC
     `);
-    res.json(result.rows);
+
+    const result = (rows || []).map(r => ({
+      ...r,
+      images: safeJsonParse(r.images, []),
+    }));
+    res.json(result);
   } catch (err) {
     console.error('Pending announcements error:', err);
     res.status(500).json({ error: 'Failed to fetch pending announcements' });
   }
 });
 
-// Approve a pending announcement
-router.post('/:id/approve', authenticateToken, requireRole('admin'), async (req, res) => {
+router.post('/:id/approve', authenticateToken, requireRole('admin'), requireAnnouncements, async (req, res) => {
   try {
-    const result = await pool.query(
+    const [updateResult] = await pool.query(
       `UPDATE announcements
-         SET status = 'active', approved_by = $1, approved_at = NOW(), rejection_reason = NULL, updated_at = NOW()
-       WHERE id = $2 AND status = 'pending' RETURNING *`,
+         SET status = 'active', approved_by = ?, approved_at = NOW(), rejection_reason = NULL, updated_at = NOW()
+       WHERE id = ? AND status = 'pending'`,
       [req.user.id, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Pending announcement not found' });
+    if (updateResult.affectedRows === 0) return res.status(404).json({ error: 'Pending announcement not found' });
 
-    const announcement = result.rows[0];
+    const [fetchRows] = await pool.query('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
+    const announcement = fetchRows[0];
+
     await safeNotify('announcement approve', async () => {
       await notifyUser(pool, announcement.author_id, {
         title: 'Announcement approved',
@@ -389,51 +340,45 @@ router.post('/:id/approve', authenticateToken, requireRole('admin'), async (req,
         type: 'announcement',
         link: 'page:announcements',
       });
-
-      await notifyAudience(
-        pool,
-        { department: announcement.department, excludeUserIds: [announcement.author_id] },
-        {
-          title: 'New announcement',
-          message: `"${announcement.title}" is now available in Announcements.`,
-          type: 'announcement',
-          link: 'page:announcements',
-        }
-      );
+      await notifyAudience(pool, { department: announcement.department, excludeUserIds: [announcement.author_id] }, {
+        title: 'New announcement',
+        message: `"${announcement.title}" is now available in Announcements.`,
+        type: 'announcement',
+        link: 'page:announcements',
+      });
     });
 
-    res.json({ message: 'Announcement approved', announcement: result.rows[0] });
+    res.json({ message: 'Announcement approved', announcement });
   } catch (err) {
     console.error('Approve announcement error:', err);
     res.status(500).json({ error: 'Failed to approve announcement' });
   }
 });
 
-// Reject a pending announcement (optionally with reason)
-router.post('/:id/reject', authenticateToken, requireRole('admin'), async (req, res) => {
+router.post('/:id/reject', authenticateToken, requireRole('admin'), requireAnnouncements, async (req, res) => {
   try {
     const { reason } = req.body || {};
-    const result = await pool.query(
+    const [updateResult] = await pool.query(
       `UPDATE announcements
-         SET status = 'rejected', approved_by = $1, approved_at = NOW(), rejection_reason = $2, updated_at = NOW()
-       WHERE id = $3 AND status = 'pending' RETURNING *`,
+         SET status = 'rejected', approved_by = ?, approved_at = NOW(), rejection_reason = ?, updated_at = NOW()
+       WHERE id = ? AND status = 'pending'`,
       [req.user.id, reason || null, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Pending announcement not found' });
+    if (updateResult.affectedRows === 0) return res.status(404).json({ error: 'Pending announcement not found' });
 
-    const announcement = result.rows[0];
+    const [fetchRows] = await pool.query('SELECT * FROM announcements WHERE id = ?', [req.params.id]);
+    const announcement = fetchRows[0];
+
     await safeNotify('announcement reject', async () => {
       await notifyUser(pool, announcement.author_id, {
         title: 'Announcement rejected',
-        message: reason
-          ? `"${announcement.title}" was rejected: ${reason}`
-          : `"${announcement.title}" was rejected by an administrator.`,
+        message: reason ? `"${announcement.title}" was rejected: ${reason}` : `"${announcement.title}" was rejected by an administrator.`,
         type: 'announcement',
         link: 'page:announcements',
       });
     });
 
-    res.json({ message: 'Announcement rejected', announcement: result.rows[0] });
+    res.json({ message: 'Announcement rejected', announcement });
   } catch (err) {
     console.error('Reject announcement error:', err);
     res.status(500).json({ error: 'Failed to reject announcement' });

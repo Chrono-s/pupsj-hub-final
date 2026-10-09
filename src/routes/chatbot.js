@@ -1,7 +1,31 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/database');
+const dbPool = require('../config/database');
+const { v4: uuidv4 } = require('uuid');
 const { authenticateToken } = require('../middleware/auth');
+const { safeJsonParse } = require('../utils/helpers');
+
+// ── Postgres to MySQL query conversion helper ────────────────────────────────
+function pgToMysql(sql, params = []) {
+  if (typeof sql !== 'string' || !sql.includes('$')) {
+    return { sql, params };
+  }
+  const newParams = [];
+  const newSql = sql.replace(/\$(\d+)/g, (_, num) => {
+    const idx = parseInt(num, 10) - 1;
+    newParams.push(params[idx]);
+    return '?';
+  });
+  return { sql: newSql, params: newParams };
+}
+
+const pool = {
+  async query(sql, params = []) {
+    const converted = pgToMysql(sql, params);
+    const [rows, fields] = await dbPool.query(converted.sql, converted.params);
+    return { rows, fields };
+  }
+};
 
 const AI_SIDECAR_URL = process.env.AI_SIDECAR_URL || 'http://localhost:8001';
 
@@ -25,10 +49,17 @@ const MODULE_RE = {
   documents:     /\b(file|template|form|document|download|proposal|docx?|pdf|find.*file|find.*form|find.*template|dokumento|porma|i-download)\b/i,
   events:        /\b(event|calendar|activity|activities|seminar|workshop|symposium|competition|orientation|when is|upcoming|it week|intramurals|kaganapan|magaganap|aktibidad)\b/i,
   announcements: /\b(announcement|news|update|notice|bulletin|latest|recent|what('s| is) (new|happening)|any news|memo|anunsyo|balita|ulat|abiso)\b/i,
-  lostfound:     /\b(lost (and|&) found|lost item|found item|missing item|report.*lost|search.*item|lost.*belong|looking for.*item|someone found|i found a|report a found|nawawala|nakita|nawala|susi|gamit|pitaka|nahanap)\b/i,
+  lostfound:     /\b(lost (and|&) found|lost.*items?|found.*items?|missing.*items?|report.*lost|search.*item|lost.*belong|looking for.*item|someone found|i found a|report a found|nawawala|nakita|nawala|na-?lost|susi|gamit|pitaka|nahanap|ano.*nawala|ano.*lost)\b/i,
   faculty:       /\b(professor|prof\b|faculty|teacher|instructor|sir\b|ma'?am|where is.*prof|is.*available|in class|in office|locator|availability|guro)\b/i,
+  loading:       /\b(loading|load request|teaching load|subject request|request.*subject|subject.*request|submit.*load|loading request|loading form|class offering|offering|approve.*load|reject.*load|loading schedule|schedule request|how.*request.*subject|request.*schedule|my requests?|pending request|loading system|teaching schedule request|paano.*mag-request|mag-request.*subject)\b/i,
+  queueing:      /\b(queue|queuing|ticket|tickets|appointment|appointments|slots?|available.*(time|slot|appointment)|how many.*(in queue|waiting|slots?)|now serving|pila|appointment.*slot)\b/i,
 };
 const FOLLOW_UP_RE = /\b(it|that|this|they|them|those|these|there|here|what about|how about|and for|and what|what else|how so|why|when|where|who|which one|same one)\b/i;
+const NEGATION_OR_CORRECTION_RE = /\b(not\s+(asking|looking|talking|saying|referring|inquiring|mean)|was\s+not|wasn'?t|did\s+not|didn'?t|do\s+not|don'?t|am\s+not|'?m\s+not|never\s+asked|not\s+what\s+i|that'?s\s+not|that\s+is\s+not|wrong\s+(answer|response|topic|information|module|feature)|you\s+misunderstood|hindi\s+(ko\s+)?(tinatanong|hinihingi|ibig\s+sabihin|sinasabi|hanap|iyon|ito)|di\s+(ko\s+)?(tinatanong|hinihingi|ibig\s+sabihin|sinasabi|hanap)|mali\s+(ang\s+)?(sagot|tinutukoy|mo)|wag\s+mo|huwag\s+mo)\b/i;
+
+function isCorrectionOrNegation(message) {
+  return NEGATION_OR_CORRECTION_RE.test(String(message || ''));
+}
 
 // ── Security visibility helpers ───────────────────────────────────────────────
 function getDocumentVisibilitySql(user, params) {
@@ -43,10 +74,11 @@ function getDocumentVisibilitySql(user, params) {
   params.push(user.id);
   const userIdx = params.length;
   return `dt.status = 'active' AND (
-    dt.department IN ('General', 'Campus')
-    OR dt.department = $${deptIdx}
-    OR (dt.department = 'Specific Students' AND EXISTS (
-      SELECT 1 FROM document_access da WHERE da.document_id = dt.id AND da.student_id = $${userIdx}
+    dt.department = 'General' OR 
+    (dt.department = $${deptIdx} AND (
+      dt.target_scope = 'public' OR 
+      dt.target_scope = 'department' OR 
+      (dt.target_scope = 'creator_only' AND dt.created_by = $${userIdx})
     ))
   )`;
 }
@@ -88,8 +120,8 @@ function extractKeywords(message, stopWords) {
 function formatTime(t) {
   if (!t) return '';
   const [h, m] = t.split(':');
-  const hour = parseInt(h);
-  return `${hour % 12 || 12}:${m} ${hour >= 12 ? 'PM' : 'AM'}`;
+  const hour = parseInt(h, 10);
+  return `${String(hour).padStart(2, '0')}:${m}`;
 }
 
 function formatFileSize(bytes) {
@@ -169,6 +201,7 @@ function pickBestTokenMatch(message, items, toText, minScore = 0.55) {
 function isLikelyFollowUp(message) {
   const text = String(message || '').trim();
   if (!text) return false;
+  if (isCorrectionOrNegation(text)) return false;
   const tokenCount = text.split(/\s+/).filter(Boolean).length;
   // It's a follow-up if it explicitly uses follow-up pronouns/phrases, OR if it's ultra-short (1-2 words) which requires context
   return FOLLOW_UP_RE.test(text) || (tokenCount <= 2);
@@ -176,7 +209,7 @@ function isLikelyFollowUp(message) {
 
 function buildContextualQuery(message, history = []) {
   const current = String(message || '').trim();
-  if (!current || !Array.isArray(history) || !history.length || !isLikelyFollowUp(current)) {
+  if (!current || isCorrectionOrNegation(current) || !Array.isArray(history) || !history.length || !isLikelyFollowUp(current)) {
     return current;
   }
 
@@ -208,7 +241,7 @@ async function fetchDocuments(message, user) {
     let rows = [];
     if (kw.length > 0) {
       const params = kw.map(w => `%${w}%`);
-      const cond = kw.map((_, i) => `(dt.title ILIKE $${i+1} OR dt.file_name ILIKE $${i+1})`).join(' OR ');
+      const cond = kw.map((_, i) => `(dt.title LIKE $${i+1} OR dt.file_name LIKE $${i+1})`).join(' OR ');
       const visibilitySql = getDocumentVisibilitySql(user, params);
       const r = await pool.query(
         `SELECT dt.title, dt.file_name, dc.name as category
@@ -242,12 +275,12 @@ async function fetchEvents(message, user) {
     let rows = [];
     if (kw.length > 0) {
       const params = kw.map(w => `%${w}%`);
-      const cond = kw.map((_, i) => `(e.title ILIKE $${i+1} OR e.description ILIKE $${i+1} OR e.location ILIKE $${i+1})`).join(' OR ');
+      const cond = kw.map((_, i) => `(e.title LIKE $${i+1} OR e.description LIKE $${i+1} OR e.location LIKE $${i+1})`).join(' OR ');
       const visibilitySql = getEventVisibilitySql(user, params, 'e');
       const r = await pool.query(
         `SELECT e.title, e.description, e.location, e.event_date, e.start_time, e.end_time, e.department
          FROM events e WHERE ${visibilitySql} AND (${cond})
-         ORDER BY ABS(EXTRACT(EPOCH FROM (e.event_date - CURRENT_DATE))) ASC LIMIT 5`,
+         ORDER BY ABS(DATEDIFF(e.event_date, CURRENT_DATE)) ASC LIMIT 5`,
         params
       );
       rows = r.rows;
@@ -275,14 +308,14 @@ async function fetchAnnouncements(message, user) {
     if (kw.length > 0) {
       const params = kw.map(w => `%${w}%`);
       const cond = kw
-        .map((_, i) => `(a.title ILIKE $${i + 1} OR a.content ILIKE $${i + 1} OR a.department ILIKE $${i + 1})`)
+        .map((_, i) => `(a.title LIKE $${i + 1} OR a.content LIKE $${i + 1} OR a.department LIKE $${i + 1})`)
         .join(' OR ');
       const score = kw
         .map((_, i) => `
           CASE
-            WHEN a.title ILIKE $${i + 1} THEN 4
-            WHEN a.department ILIKE $${i + 1} THEN 3
-            WHEN a.content ILIKE $${i + 1} THEN 1
+            WHEN a.title LIKE $${i + 1} THEN 4
+            WHEN a.department LIKE $${i + 1} THEN 3
+            WHEN a.content LIKE $${i + 1} THEN 1
             ELSE 0
           END
         `)
@@ -319,18 +352,22 @@ async function fetchAnnouncements(message, user) {
 }
 
 async function fetchLostFound(message, user) {
-  const sw = new Set(['lost','found','missing','item','where','what','about','report','any','the','was','been','someone','looking','for']);
+  const sw = new Set([
+    'lost','found','missing','item','items','where','what','about','report','reports','any','the','was','been','someone','looking','for',
+    'ano','anong','ano-ano','anu-ano','ang','mga','yung','na','sa','ba','may','meron','mayroon','nawala','nawawala','nalost','na-lost',
+    'nahanap','nakita','gamit','patingin','tingin','list','show','view','lahat'
+  ]);
   const kw = extractKeywords(message, sw);
   const isRestricted = user && (user.role === 'student' || user.role === 'faculty' || user.role === 'guest');
   const typeFilter = isRestricted ? " AND lf.type = 'lost'" : "";
   try {
     let rows = [];
     if (kw.length > 0) {
-      const cond = kw.map((_, i) => `(lf.item_name ILIKE $${i+1} OR lf.description ILIKE $${i+1} OR lf.category ILIKE $${i+1})`).join(' OR ');
+      const cond = kw.map((_, i) => `(lf.item_name LIKE $${i+1} OR lf.description LIKE $${i+1} OR lf.category LIKE $${i+1})`).join(' OR ');
       const r = await pool.query(
         `SELECT lf.type, lf.item_name, lf.description, lf.category, lf.location_found, lf.date_reported, lf.contact_info
-         FROM lost_found lf WHERE lf.status = 'open'${typeFilter} AND (${cond})
-         ORDER BY lf.date_reported DESC LIMIT 5`,
+         FROM lost_found lf WHERE lf.status = 'open' AND lf.approved = true AND (lf.is_archived = false OR lf.is_archived IS NULL)${typeFilter} AND (${cond})
+         ORDER BY lf.date_reported DESC, lf.created_at DESC LIMIT 5`,
         kw.map(w => `%${w}%`)
       );
       rows = r.rows;
@@ -338,7 +375,7 @@ async function fetchLostFound(message, user) {
     if (rows.length === 0) {
       const r = await pool.query(
         `SELECT type, item_name, description, category, location_found, date_reported
-         FROM lost_found WHERE status = 'open'${isRestricted ? " AND type = 'lost'" : ""} ORDER BY date_reported DESC LIMIT 5`
+         FROM lost_found WHERE status = 'open' AND approved = true AND (is_archived = false OR is_archived IS NULL)${isRestricted ? " AND type = 'lost'" : ""} ORDER BY date_reported DESC, created_at DESC LIMIT 5`
       );
       rows = r.rows;
     }
@@ -362,19 +399,19 @@ async function fetchFaculty(message) {
         params.push(pattern);
         const p = `$${params.length}`;
         keywordConds.push(
-          `(u.first_name ILIKE ${p}
-            OR u.last_name ILIKE ${p}
-            OR COALESCE(u.department, '') ILIKE ${p}
-            OR COALESCE(u.position, '') ILIKE ${p}
-            OR COALESCE(u.faculty_status_note, '') ILIKE ${p}
-            OR COALESCE(u.faculty_status_room::text, '') ILIKE ${p})`
+          `(u.first_name LIKE ${p}
+            OR u.last_name LIKE ${p}
+            OR COALESCE(u.department, '') LIKE ${p}
+            OR COALESCE(u.position, '') LIKE ${p}
+            OR COALESCE(u.faculty_status_note, '') LIKE ${p}
+            OR COALESCE(u.faculty_status_room, '') LIKE ${p})`
         );
-        scoreParts.push(`CASE WHEN u.last_name ILIKE ${p} THEN 4 ELSE 0 END`);
-        scoreParts.push(`CASE WHEN u.first_name ILIKE ${p} THEN 4 ELSE 0 END`);
-        scoreParts.push(`CASE WHEN COALESCE(u.department, '') ILIKE ${p} THEN 3 ELSE 0 END`);
-        scoreParts.push(`CASE WHEN COALESCE(u.position, '') ILIKE ${p} THEN 2 ELSE 0 END`);
-        scoreParts.push(`CASE WHEN COALESCE(u.faculty_status_room::text, '') ILIKE ${p} THEN 2 ELSE 0 END`);
-        scoreParts.push(`CASE WHEN COALESCE(u.faculty_status_note, '') ILIKE ${p} THEN 1 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN u.last_name LIKE ${p} THEN 4 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN u.first_name LIKE ${p} THEN 4 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN COALESCE(u.department, '') LIKE ${p} THEN 3 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN COALESCE(u.position, '') LIKE ${p} THEN 2 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN COALESCE(u.faculty_status_room, '') LIKE ${p} THEN 2 ELSE 0 END`);
+        scoreParts.push(`CASE WHEN COALESCE(u.faculty_status_note, '') LIKE ${p} THEN 1 ELSE 0 END`);
       }
 
       let statusClause = '';
@@ -502,6 +539,68 @@ function parseDateFromMessage(message) {
   return null;
 }
 
+// ── Queueing context fetcher ──────────────────────────────────────────────────
+async function fetchQueueing(message) {
+  try {
+    const officesRes = await pool.query(`
+      SELECT o.id, o.name, o.code, o.operating_hours,
+        COUNT(CASE WHEN t.status = 'waiting' THEN 1 END) AS waiting_count,
+        COUNT(CASE WHEN t.status IN ('called', 'serving') THEN 1 END) AS serving_count,
+        (
+          SELECT ticket_number FROM queue_tickets
+          WHERE office_id = o.id AND status IN ('called', 'serving') AND queue_date = CURRENT_DATE
+          ORDER BY called_at DESC LIMIT 1
+        ) AS now_serving
+      FROM queue_offices o
+      LEFT JOIN queue_tickets t ON t.office_id = o.id AND t.queue_date = CURRENT_DATE
+      WHERE o.is_active = true
+      GROUP BY o.id, o.name, o.code, o.operating_hours
+      ORDER BY o.name ASC
+    `);
+
+    // Target tomorrow or specific date
+    const targetDate = parseDateFromMessage(message) || (() => {
+      const tmrw = new Date();
+      tmrw.setDate(tmrw.getDate() + 1);
+      if (tmrw.getDay() === 0) tmrw.setDate(tmrw.getDate() + 1);
+      return tmrw.toISOString().split('T')[0];
+    })();
+
+    const officesWithSlots = [];
+    for (const off of officesRes.rows) {
+      const bookedRes = await pool.query(
+        `SELECT DATE_FORMAT(appointment_at, '%H:%i') as time FROM queue_appointments WHERE office_id = ? AND DATE(appointment_at) = DATE(?) AND status IN ('booked', 'checked_in')`,
+        [off.id, targetDate]
+      ).catch(() => ({ rows: [] }));
+      const usedTimes = new Set(bookedRes.rows.map(r => r.time));
+
+      const slots = [];
+      for (let m = 8 * 60; m < 17 * 60; m += 15) {
+        if (m >= 12 * 60 && m < 13 * 60) continue;
+        const slot = `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+        if (!usedTimes.has(slot)) slots.push(slot);
+      }
+
+      officesWithSlots.push({
+        id: off.id,
+        name: off.name,
+        code: off.code,
+        waiting_count: parseInt(off.waiting_count || 0, 10),
+        serving_count: parseInt(off.serving_count || 0, 10),
+        now_serving: off.now_serving || null,
+        target_date: targetDate,
+        available_slots: slots.slice(0, 8),
+        total_slots_available: slots.length,
+      });
+    }
+
+    return officesWithSlots;
+  } catch (e) {
+    console.error('[ctx:queueing]', e.message);
+    return [];
+  }
+}
+
 // ── Unified context fetcher ───────────────────────────────────────────────────
 async function getAllModuleContexts(message, user) {
   const tasks = [];
@@ -513,6 +612,8 @@ async function getAllModuleContexts(message, user) {
   }
   if (MODULE_RE.lostfound.test(message))     tasks.push(['lostfound',     fetchLostFound(message, user)]);
   if (MODULE_RE.faculty.test(message))       tasks.push(['faculty',       fetchFaculty(message)]);
+  if (MODULE_RE.loading.test(message))       tasks.push(['loading',       Promise.resolve([{ role: user.role }])]);
+  if (MODULE_RE.queueing.test(message))      tasks.push(['queueing',      fetchQueueing(message)]);
 
   const settled = await Promise.all(tasks.map(([k, p]) => p.then(r => [k, r])));
   const doc_context = [], live_data = {};
@@ -524,8 +625,55 @@ async function getAllModuleContexts(message, user) {
   return { doc_context, live_data };
 }
 
+// ── Loading request instructions (role-aware) ─────────────────────────────────
+const LOADING_ANSWER_FACULTY = `**How to Submit a Teaching Load Request**
+
+1. Go to **Teaching Schedule** in the sidebar.
+2. Select the **Term** (Summer / 1st Semester / 2nd Semester).
+3. Filter by **Subject Type** and **Program** to narrow down available subjects.
+4. Pick your **Subject Offering** — only unassigned, available slots appear.
+5. Add optional **Remarks** for the admin reviewer, then click **Submit Request**.
+
+Your request is saved as **Pending** and appears under **My Requests** below the form.
+
+**Request status guide:**
+- 🟡 **Pending** — waiting for admin review
+- 🟢 **Approved** — assigned to you; visible on the shared timetable
+- 🔴 **Rejected** — not granted; check admin remarks
+- 🔵 **Returned for revision** — admin needs changes before re-submitting
+
+You can **Withdraw** any pending request using the button beside it.
+
+The **Approved Schedules** timetable (TIME × MON–SAT grid) at the bottom of the page shows all taken slots so you can plan your request accordingly.`;
+
+const LOADING_ANSWER_ADMIN = `**How to Manage Faculty Loading Requests**
+
+**Step 1 — Set Up Offerings** *(do this first, before faculty can request)*
+1. Go to **Loading Requests** (Administration section in the sidebar).
+2. Click the **Offerings** tab and select the Term.
+3. Fill in Subject Type, Program, Subject, Section, Day, Start Time, End Time, and Room.
+4. Click **Add Offering**. The system blocks double-booking the same room or section at overlapping times.
+
+**Step 2 — Review Requests**
+1. Click the **Requests** tab.
+2. Requests are grouped by offering. Contested offerings (multiple faculty want the same slot) are highlighted.
+3. Expand each faculty entry to see their name, department, position, and credentials ("View credentials").
+4. Use the action buttons:
+   - **Approve** — assigns the load; auto-rejects all other pending requests for that offering; updates the timetable instantly.
+   - **Return** — sends back to faculty for revision (a note is required).
+   - **Reject** — rejects with optional remarks.
+
+Note: The system runs hard conflict checks on approval (faculty overlap, room clash, section clash). If a conflict exists, the approval is blocked with a specific message.
+
+**Step 3 — Timetable**
+Click the **Timetable** tab to see all approved loads in a weekly TIME × MON–SAT grid for the selected term.
+
+**Export**
+Click **Export approved** to download a CSV of all approved faculty loads.`;
+
 // ── Direct answer builder (bypasses AI for well-known lookups) ────────────────
 function buildDirectAnswer(message, doc_context, live_data) {
+  if (isCorrectionOrNegation(message)) return null;
   const msgUp = message.toUpperCase();
   const msgLo = message.toLowerCase();
   const queryTokens = tokenizeForMatch(message);
@@ -533,6 +681,19 @@ function buildDirectAnswer(message, doc_context, live_data) {
   const isLatestEventQuery = /\b(upcoming|next|latest|recent|event|events|calendar|activity|activities)\b/i.test(message);
   const isDocumentListQuery = /\b(list|show|find|available|what|which)\b.*\b(file|files|form|forms|template|templates|document|documents)\b/i.test(message);
   const isFacultyStatusQuery = /\b(available|availability|in office|in class|unavailable|professor locator|faculty status)\b/i.test(message);
+
+  // Loading request instructions — answered directly, role-aware
+  if (live_data.loading?.length) {
+    const role = live_data.loading[0]?.role;
+    const isAdminLike = role === 'admin' || role === 'superadmin';
+    const isFacultyRole = role === 'faculty';
+    const isLoadingQuery = MODULE_RE.loading.test(message);
+
+    if (isLoadingQuery) {
+      if (isAdminLike) return LOADING_ANSWER_ADMIN;
+      if (isFacultyRole) return LOADING_ANSWER_FACULTY;
+    }
+  }
 
   if (doc_context.length) {
     const hits = doc_context.filter(d =>
@@ -705,11 +866,39 @@ function buildDirectAnswer(message, doc_context, live_data) {
     }
   }
 
+  if (live_data.queueing?.length) {
+    const isSlotsQuery = /\b(slot|slots|available time|time slot|available appointment|when can I book|anong oras|schedule an appointment)\b/i.test(message);
+    const isCountQuery = /\b(how many|ilan|waiting|in queue|now serving|current queue|status|pila|line)\b/i.test(message);
+
+    if (isSlotsQuery || isCountQuery || MODULE_RE.queueing.test(message)) {
+      const parts = [];
+      parts.push(`**Real-time Office Queue & Appointment Status**:\n`);
+
+      live_data.queueing.forEach(o => {
+        parts.push(`- **${o.name}** (${o.code}):`);
+        parts.push(`  • **Now Calling**: ${o.now_serving ? `\`${o.now_serving}\`` : 'Counter Ready'}`);
+        parts.push(`  • **Waiting in Queue**: ${o.waiting_count} ticket(s)`);
+        if (o.total_slots_available > 0) {
+          parts.push(`  • **Available Appointment Slots (${o.target_date})**: ${o.total_slots_available} slots open (e.g., ${o.available_slots.slice(0, 5).join(', ')}...)`);
+        } else {
+          parts.push(`  • **Available Appointment Slots (${o.target_date})**: Fully booked or closed`);
+        }
+      });
+
+      parts.push(`\n*To get a queue ticket or book an appointment, go to **Queueing** in the sidebar.*`);
+      return parts.join('\n');
+    }
+  }
+
   return null; // No direct answer - let AI handle it
 }
 
 // ── Keyword fallback (used when AI sidecar is unavailable) ───────────────────
 const knowledgeBase = [
+  {
+    keywords: ['queue', 'queuing', 'ticket', 'appointment', 'slots', 'now serving', 'walk in', 'pila'],
+    response: 'You can get a queue ticket or schedule an appointment using the **Queueing** module in the sidebar. Choose the office (e.g. Registrar, OSAS), and select **Walk-in Queue** for same-day tickets or **Book Appointment** to reserve an upcoming 15-minute slot. You can also monitor live ticket calling in real time.'
+  },
   {
     keywords: ['enroll', 'enrollment', 'register', 'registration', 'how to enroll'],
     response: 'To enroll at PUP San Juan, you need to: 1) Secure an admission slot through PUPCET or equivalent. 2) Complete your enrollment form online. 3) Submit required documents to the Registrar. 4) Pay tuition fees at the cashier. Visit the Registrar\'s office for specific requirements per program.'
@@ -776,6 +965,14 @@ const knowledgeBase = [
   {
     keywords: ['help', 'assist', 'what can you do'],
     response: 'I can help you with: Announcements info, Event details & feedback, Lost & Found guidance, Class schedule tips, Enrollment & academic info, Campus policies, and more! Just type your question.'
+  },
+  {
+    keywords: ['loading request', 'teaching load', 'load request', 'request subject', 'loading form', 'loading schedule', 'how to request', 'paano mag-request'],
+    response: `**Faculty — How to Submit a Loading Request**\n\n1. Go to **Teaching Schedule** in the sidebar.\n2. Select the **Term** (Summer / 1st Semester / 2nd Semester).\n3. Filter by **Subject Type** and **Program** to narrow down the list.\n4. Choose your **Subject Offering** from the dropdown (only available, unassigned slots appear).\n5. Add optional **Remarks** for the admin reviewing your request.\n6. Click **Submit Request**.\n\nYour request will be saved as **Pending**. You can track all your requests under **My Requests** on the same page.\n\n**Status meanings:**\n- 🟡 Pending — waiting for admin review\n- 🟢 Approved — assigned to you; appears on the master timetable\n- 🔴 Rejected — not granted (check admin remarks)\n- 🔵 Returned for revision — admin needs changes; resubmit after updating\n\nYou can withdraw a **Pending** request anytime using the Withdraw button.`
+  },
+  {
+    keywords: ['approve load', 'reject load', 'review loading', 'manage offerings', 'loading requests admin', 'admin loading', 'how to approve', 'how to manage loading'],
+    response: `**Admin / Super Admin — How to Manage Loading Requests**\n\n**Step 1 — Set Up Offerings (before faculty can request)**\n1. Go to **Loading Requests** in the Administration section of the sidebar.\n2. Click the **Offerings** tab.\n3. Select the **Term**, then fill in Subject Type, Program, Subject, Section, Day, Start/End Time, and Room.\n4. Click **Add Offering**. The system prevents double-booking the same room or section at the same time.\n\n**Step 2 — Review Faculty Requests**\n1. Click the **Requests** tab.\n2. Requests are grouped by offering — contested offerings (multiple faculty requesting the same slot) are highlighted.\n3. Review each faculty member's name, department, position, and credentials (click "View credentials").\n4. Choose an action:\n   - **Approve** — assigns the load; auto-rejects other pending requests for that offering; mirrors the load to the master timetable.\n   - **Return** — sends it back to the faculty for revision (requires a note).\n   - **Reject** — rejects with optional remarks.\n\n**Step 3 — View the Master Timetable**\nClick the **Timetable** tab to see all approved loads in a weekly TIME × MON–SAT grid.\n\n**Export**\nClick **Export approved** to download a CSV of all approved loads for the selected term.`
   }
 ];
 
@@ -798,32 +995,50 @@ async function getDynamicContent(type) {
     if (type === 'announcements') {
       const result = await pool.query(`
         SELECT a.title, a.content, a.department, a.created_at,
-          COALESCE(json_agg(json_build_object('image_url', ai.image_url)) FILTER (WHERE ai.id IS NOT NULL), '[]') as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(ai.id IS NOT NULL, JSON_OBJECT('image_url', ai.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM announcements a
         LEFT JOIN announcement_images ai ON ai.announcement_id = a.id
         WHERE a.status = 'active'
         GROUP BY a.id ORDER BY a.created_at DESC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        r.images = safeJsonParse(r.images, []);
+      });
       return result.rows;
     } else if (type === 'events') {
       const result = await pool.query(`
         SELECT e.title, e.description, e.event_date, e.location,
-          COALESCE(json_agg(json_build_object('image_url', ei.image_url)) FILTER (WHERE ei.id IS NOT NULL), '[]') as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(ei.id IS NOT NULL, JSON_OBJECT('image_url', ei.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM events e
         LEFT JOIN event_images ei ON ei.event_id = e.id
         WHERE e.status != 'deleted' AND e.event_date >= CURRENT_DATE
         GROUP BY e.id ORDER BY e.event_date ASC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        r.images = safeJsonParse(r.images, []);
+      });
       return result.rows;
     } else if (type === 'lostfound') {
       const result = await pool.query(`
         SELECT lf.item_name, lf.type, lf.description, lf.location_found,
-          COALESCE(json_agg(json_build_object('image_url', lfi.image_url)) FILTER (WHERE lfi.id IS NOT NULL), '[]') as images
+          COALESCE(
+            CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+            '[]'
+          ) as images
         FROM lost_found lf
         LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
         WHERE lf.status = 'open'
         GROUP BY lf.id ORDER BY lf.created_at DESC LIMIT 2
       `);
+      (result.rows || []).forEach(r => {
+        r.images = safeJsonParse(r.images, []);
+      });
       return result.rows;
     }
   } catch (err) {
@@ -864,6 +1079,12 @@ function _officeRedirect(message) {
 }
 
 async function keywordFallback(message) {
+  if (isCorrectionOrNegation(message)) {
+    return {
+      text: "I apologize for the misunderstanding! What specific topic or information about PUP San Juan campus, the student handbook, or the PUPSJ HUB would you like help with?",
+      images: []
+    };
+  }
   const match = findBestMatch(message);
   let text = match
     ? match.response
@@ -951,54 +1172,103 @@ router.post('/message', authenticateToken, async (req, res) => {
     // ── Layer 1 gate: refuse jailbreak / off-topic before any AI work ──────
     if (_isJailbreak(message)) {
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, _JAILBREAK_REPLY]
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, _JAILBREAK_REPLY]
       );
       return res.json({ response: _JAILBREAK_REPLY, images: [] });
     }
     if (_isOffTopic(message)) {
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, _OFF_TOPIC_REPLY]
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, _OFF_TOPIC_REPLY]
       );
       return res.json({ response: _OFF_TOPIC_REPLY, images: [] });
     }
 
     // ── Live system query interception ──
+    const isCorrection = isCorrectionOrNegation(message);
     const effectiveMessage = buildContextualQuery(message, history);
     const lowerMessage = message.toLowerCase().trim();
 
     // Check guest restrictions on modules before executing anything
-    if (req.user.role === 'guest') {
+    if (req.user.role === 'guest' && !isCorrection) {
       const asksAboutEvents = MODULE_RE.events.test(effectiveMessage);
       
       if (asksAboutEvents) {
         const responseText = `As a guest user, I can only help you with public announcements and document templates. Details regarding the Event Calendar feature are restricted. Please register or log in to access this information!`;
         
         await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
         );
         return res.json({ response: responseText, images: [] });
       }
     }
     
-    // 1. DOCUMENT TEMPLATES
-    const isDocQuery = /\b(clearance\s*form|accreditation\s*(document|template|form|files|documents)|accreditation|clearance|document|template|form|download)\b/i.test(effectiveMessage) && !/\b(schedule|announcement|event|lost|found)\b/i.test(effectiveMessage);
+    // 0. LOADING REQUEST INSTRUCTIONS — handled before AI, role-aware
+    const isLoadingQuery = !isCorrection && MODULE_RE.loading.test(effectiveMessage);
+    if (isLoadingQuery) {
+      const role = req.user.role;
+      const isAdminLike = role === 'admin' || role === 'superadmin';
+      const isFacultyRole = role === 'faculty';
+      if (isAdminLike || isFacultyRole) {
+        const responseText = isAdminLike ? LOADING_ANSWER_ADMIN : LOADING_ANSWER_FACULTY;
+        await pool.query(
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, images: [] });
+      }
+    }
+
+    // 1. FACULTY STATUS / PROFESSOR LOCATOR
+    const isFacultyStatusQuery = !isCorrection && (
+      /\b(faculty\s*status|professor\s*locator|prof\s*locator|faculty\s*locator|professor\s*status|faculty\s*availability|where\s*is\s*(prof|professor|teacher|faculty))\b/i.test(effectiveMessage) ||
+      (/\b(professor|prof|faculty)\b/i.test(effectiveMessage) && /\b(status|locator|where|available|availability|office|room|check|in class|in office)\b/i.test(effectiveMessage)) ||
+      /^(\s*faculty(\s*status)?\s*)$/i.test(effectiveMessage)
+    );
+
+    // 2. ENROLLMENT STEPS / GUIDE
+    const isEnrollQuery = !isCorrection && (
+      /\b(enrollment\s*steps|enrollment\s*guide|enrollment\s*process|enrollment\s*procedure|how\s*to\s*enroll|enrollment\s*requirements)\b/i.test(effectiveMessage) ||
+      (/\b(enroll|enrollment|admission)\b/i.test(effectiveMessage) && /\b(step|steps|guide|process|procedure|how|requirements|inquire)\b/i.test(effectiveMessage)) ||
+      /^(\s*enrollment(\s*steps)?\s*)$/i.test(effectiveMessage)
+    );
+
+    // 3. DOCUMENT TEMPLATES
+    const isDocQuery = !isCorrection && (
+      (/\b(clearance\s*form|accreditation\s*(document|template|form|files|documents)|accreditation|clearance|document|template|form|download)\b/i.test(effectiveMessage) || /^(\s*document(\s*templates?)?\s*)$/i.test(effectiveMessage)) &&
+      !/\b(schedule|announcement|event|lost|found|faculty|enroll)\b/i.test(effectiveMessage)
+    );
     
-    // 2. CLASS SCHEDULE
-    const isScheduleQuery = /\b(schedule|schedules|class\s*schedule|my\s*schedule)\b/i.test(effectiveMessage);
+    // 4. CLASS SCHEDULE
+    const isScheduleQuery = !isCorrection && (
+      (/\b(schedule|schedules|class\s*schedule|my\s*schedule|timetable)\b/i.test(effectiveMessage) || /^(\s*class\s*schedules?\s*)$/i.test(effectiveMessage)) &&
+      !/\b(lost|found|faculty\s*status|enroll|enrollment)\b/i.test(effectiveMessage)
+    );
     
-    // 3. ANNOUNCEMENTS
-    const isAnnQuery = /\b(latest\s*announcement|new\s*announcement|recent\s*announcement|announcements|news|update|updates)\b/i.test(effectiveMessage) && /\b(latest|new|recent|any|what)\b/i.test(effectiveMessage);
+    // 5. ANNOUNCEMENTS
+    const isAnnQuery = !isCorrection && (
+      (/\b(latest\s*announcement|new\s*announcement|recent\s*announcement|announcements|news|update|updates)\b/i.test(effectiveMessage) && /\b(latest|new|recent|any|what|check|show)\b/i.test(effectiveMessage)) ||
+      /^(\s*(latest\s*)?announcements?\s*)$/i.test(effectiveMessage)
+    );
     
-    // 4. EVENTS
-    const isEventQuery = /\b(upcoming\s*event|events\s*coming\s*up|upcoming\s*activities|activities\s*coming\s*up|next\s*event|events|calendar|activity|activities)\b/i.test(effectiveMessage) && /\b(upcoming|coming|next|any|what)\b/i.test(effectiveMessage);
+    // 6. EVENTS
+    const isEventQuery = !isCorrection && (
+      (/\b(upcoming\s*event|events\s*coming\s*up|upcoming\s*activities|activities\s*coming\s*up|next\s*event|events|calendar|activity|activities)\b/i.test(effectiveMessage) && /\b(upcoming|coming|next|any|what|check|show)\b/i.test(effectiveMessage)) ||
+      /^(\s*(upcoming\s*)?events?\s*)$/i.test(effectiveMessage)
+    );
     
-    // 5. LOST & FOUND
-    const isLFQuery = /\b(find|found|lost|missing|seen|keys|phone|wallet|bag|card|item|belonging)\b/i.test(effectiveMessage) && 
-                      /\b(did|anyone|someone|lost|found|looking\s*for|missing)\b/i.test(effectiveMessage) &&
-                      !/\b(how\s+to|where\s+can\s+i|how\s+do\s+i|where\s+to|where\s+do\s+i|steps\s+to|instructions\s+to)\s+(post|report|submit|create|add|claim|register)\b/i.test(effectiveMessage);
+    // 7. LOST & FOUND
+    const isLFQuery = !isCorrection && (
+      /\b(lost\s*(&|and)?\s*found|lost\s*found)\b/i.test(effectiveMessage) ||
+      /\b(lost\s*items?|found\s*items?|missing\s*items?)\b/i.test(effectiveMessage) ||
+      /\b(ano|anong|ano-ano|anu-ano|what|list|show|view|tingin|patingin)\b.*\b(lost|nawala|nawawala|nahanap|found|gamit)\b/i.test(effectiveMessage) ||
+      /\b(nawala|nawawala|na-?lost|nalost|nahanap)\b/i.test(effectiveMessage) ||
+      ((/\b(find|found|lost|missing|seen|keys|phone|wallet|bag|card|item|belonging|gamit|pitaka|susi)\b/i.test(effectiveMessage) && 
+        /\b(did|anyone|someone|lost|found|looking\s*for|missing|check|ano|meron|may|nasaan|where)\b/i.test(effectiveMessage))) ||
+      /^(\s*(lost|found|nawala|nawawala)\s*(&|and)?\s*(items?|found)?\s*)$/i.test(effectiveMessage)
+    ) && !/\b(how\s+to|where\s+can\s+i|how\s+do\s+i|where\s+to|where\s+do\s+i|steps\s+to|instructions\s+to|paano)\s+(post|report|submit|create|add|claim|register|mag-report|ireport)\b/i.test(effectiveMessage);
 
     if (isDocQuery) {
       // Check if it's a category/folder follow-up query
@@ -1018,13 +1288,10 @@ router.post('/message', authenticateToken, async (req, res) => {
              FROM document_templates dt
              JOIN document_categories dc ON dt.category_id = dc.id
              WHERE dt.status = 'active' AND (
-               $1 ILIKE '%' || dt.title || '%' 
-               OR $2 ILIKE '%' || dt.title || '%'
-               OR $1 ILIKE '%' || dt.file_name || '%'
-               OR $2 ILIKE '%' || dt.file_name || '%'
+               ? LIKE CONCAT('%', dt.title, '%') OR ? LIKE CONCAT('%', dt.title, '%') OR ? LIKE CONCAT('%', dt.file_name, '%') OR ? LIKE CONCAT('%', dt.file_name, '%')
              )
              LIMIT 1`,
-            [lastUserText, lastBotText]
+            [lastUserText, lastBotText, lastUserText, lastBotText]
           );
           
           if (docLookupResult.rows.length > 0) {
@@ -1055,7 +1322,7 @@ router.post('/message', authenticateToken, async (req, res) => {
         
         if (words.length > 0) {
           const params = words.map(w => `%${w}%`);
-          const conds = words.map((_, i) => `(dt.title ILIKE $${i+1} OR dt.description ILIKE $${i+1} OR dt.file_name ILIKE $${i+1})`).join(' OR ');
+          const conds = words.map((_, i) => `(dt.title LIKE $${i+1} OR dt.description LIKE $${i+1} OR dt.file_name LIKE $${i+1})`).join(' OR ');
           const visibilitySql = getDocumentVisibilitySql(req.user, params);
           
           const r = await pool.query(
@@ -1084,12 +1351,34 @@ router.post('/message', authenticateToken, async (req, res) => {
       }
 
       if (docRows.length === 0) {
-        const responseText = "No results found for your query.";
-        await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+        const params = [];
+        const visibilitySql = getDocumentVisibilitySql(req.user, params);
+        const rFallback = await pool.query(
+          `SELECT dt.*, dc.name as category_name
+           FROM document_templates dt
+           LEFT JOIN document_categories dc ON dt.category_id = dc.id
+           WHERE ${visibilitySql}
+           ORDER BY dt.created_at DESC LIMIT 5`,
+          params
         );
-        return res.json({ response: responseText, images: [] });
+        docRows = rFallback.rows;
+      }
+
+      if (docRows.length === 0) {
+        const responseText = "There are currently no document templates available for download.";
+        let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-file-alt" style="color: var(--maroon); margin-right: 6px;"></i> Document Templates</div>
+<div class="doc-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 10px 0;">No downloadable templates or forms are currently published.</p>
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('documents')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-folder-open"></i> Go to Documents Page
+  </button>
+</div>`;
+        await pool.query(
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, '[Rich System Content: Document Templates - Empty]']
+        );
+        return res.json({ response: responseText, richHtml, images: [] });
       }
 
       let richHtml = '';
@@ -1102,10 +1391,10 @@ router.post('/message', authenticateToken, async (req, res) => {
         responseText = `Here are the files in the **${lastCategoryName}** category:`;
       } else {
         richHtml = `
-<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-file-alt" style="color: var(--maroon); margin-right: 6px;"></i> Matching Documents</div>
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-file-alt" style="color: var(--maroon); margin-right: 6px;"></i> Document Templates</div>
 <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
         `;
-        responseText = "Here are the matching templates:";
+        responseText = "Here are the available document templates:";
       }
 
       docRows.forEach(doc => {
@@ -1125,11 +1414,16 @@ router.post('/message', authenticateToken, async (req, res) => {
   </div>
         `;
       });
-      richHtml += `</div>`;
+      richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('documents')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-folder-open"></i> View All Document Templates
+  </button>
+</div>`;
 
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, isCategoryFollowUp && lastCategoryName ? `[Rich System Content: Category - ${lastCategoryName}]` : '[Rich System Content: Document Templates]']
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, isCategoryFollowUp && lastCategoryName ? `[Rich System Content: Category - ${lastCategoryName}]` : '[Rich System Content: Document Templates]']
       );
       return res.json({ response: responseText, richHtml, images: [] });
     }
@@ -1138,8 +1432,8 @@ router.post('/message', authenticateToken, async (req, res) => {
       if (req.user.role === 'guest') {
         const responseText = "Guest users do not have class schedules. Please log in to your account to view your schedule.";
         await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
         );
         return res.json({ response: responseText, images: [] });
       }
@@ -1148,7 +1442,7 @@ router.post('/message', authenticateToken, async (req, res) => {
       let schedRows = [];
       if (isFaculty) {
         const r = await pool.query(
-          `SELECT * FROM faculty_schedules WHERE faculty_id = $1 ORDER BY CASE
+          `SELECT * FROM faculty_schedules WHERE faculty_id = ? ORDER BY CASE
             WHEN day_of_week = 'Monday' THEN 1
             WHEN day_of_week = 'Tuesday' THEN 2
             WHEN day_of_week = 'Wednesday' THEN 3
@@ -1163,7 +1457,7 @@ router.post('/message', authenticateToken, async (req, res) => {
         schedRows = r.rows;
       } else {
         const r = await pool.query(
-          `SELECT * FROM class_schedules WHERE user_id = $1 ORDER BY CASE
+          `SELECT * FROM class_schedules WHERE user_id = ? ORDER BY CASE
             WHEN day_of_week = 'Monday' THEN 1
             WHEN day_of_week = 'Tuesday' THEN 2
             WHEN day_of_week = 'Wednesday' THEN 3
@@ -1179,12 +1473,65 @@ router.post('/message', authenticateToken, async (req, res) => {
       }
 
       if (schedRows.length === 0) {
-        const responseText = "No results found for your query. It looks like you don't have any classes in your schedule yet.";
-        await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
-        );
-        return res.json({ response: responseText, images: [] });
+        let embedRows = [];
+        try {
+          const embRes = await pool.query(
+            `SELECT * FROM section_schedule_embeds WHERE is_active = true ORDER BY section ASC LIMIT 5`
+          );
+          embedRows = embRes.rows;
+        } catch (e) {
+          console.error('[chatbot:schedules] embed query error:', e.message);
+        }
+
+        if (embedRows.length > 0) {
+          let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-calendar-alt" style="color: var(--maroon); margin-right: 6px;"></i> Campus Section Schedules</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+          `;
+          embedRows.forEach(emb => {
+            const secTitle = emb.title || `${emb.department || 'Section'} ${emb.section || ''}`;
+            const subInfo = `${emb.department || ''} ${emb.section ? '· Section ' + emb.section : ''} ${emb.year_level ? '· ' + emb.year_level : ''}`;
+            richHtml += `
+  <div class="sched-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; box-shadow: var(--shadow-sm);">
+    <div>
+      <div style="font-size: 13px; font-weight: 700; color: var(--text-primary);">${secTitle}</div>
+      <div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">${subInfo}</div>
+    </div>
+    ${emb.embed_url ? `
+    <a href="${emb.embed_url}" target="_blank" rel="noopener noreferrer" style="display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border-radius: 6px; background: var(--maroon); color: #fff; font-size: 11px; font-weight: 600; text-decoration: none; white-space: nowrap;">
+      <i class="fas fa-external-link-alt"></i> View
+    </a>` : ''}
+  </div>
+            `;
+          });
+          richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('schedules')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-calendar-alt"></i> View All Class Schedules
+  </button>
+</div>`;
+          const responseText = "You don't have individual classes assigned yet, but here are the published campus section timetables:";
+          await pool.query(
+            'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+            [uuidv4(), req.user.id, message, '[Rich System Content: Section Schedules]']
+          );
+          return res.json({ response: responseText, richHtml, images: [] });
+        } else {
+          const responseText = "No personal classes or section schedules are currently registered.";
+          let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-calendar-alt" style="color: var(--maroon); margin-right: 6px;"></i> Class Schedules</div>
+<div class="sched-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 10px 0;">You don't have classes in your personal timetable yet, and no section schedules are currently active.</p>
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('schedules')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-calendar-alt"></i> Go to Schedules Page
+  </button>
+</div>`;
+          await pool.query(
+            'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+            [uuidv4(), req.user.id, message, '[Rich System Content: Schedules - Empty]']
+          );
+          return res.json({ response: responseText, richHtml, images: [] });
+        }
       }
 
       let richHtml = `
@@ -1218,11 +1565,16 @@ router.post('/message', authenticateToken, async (req, res) => {
     </tbody>
   </table>
 </div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('schedules')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-calendar-alt"></i> Open Full Schedules Page
+  </button>
+</div>
       `;
 
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, '[Rich System Content: Class Schedule]']
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Class Schedule]']
       );
       return res.json({ response: "Here is your class schedule:", richHtml, images: [] });
     }
@@ -1242,12 +1594,20 @@ router.post('/message', authenticateToken, async (req, res) => {
       const annRows = r.rows;
 
       if (annRows.length === 0) {
-        const responseText = "No results found for your query. There are no recent announcements.";
+        const responseText = "There are currently no recent announcements posted.";
+        let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-bullhorn" style="color: var(--maroon); margin-right: 6px;"></i> Announcements</div>
+<div class="ann-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 10px 0;">There are no new announcements at this time.</p>
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('announcements')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-bullhorn"></i> Go to Announcements Page
+  </button>
+</div>`;
         await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
         );
-        return res.json({ response: responseText, images: [] });
+        return res.json({ response: responseText, richHtml, images: [] });
       }
 
       let richHtml = `
@@ -1267,11 +1627,16 @@ router.post('/message', authenticateToken, async (req, res) => {
   </div>
         `;
       });
-      richHtml += `</div>`;
+      richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('announcements')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-bullhorn"></i> View All Announcements
+  </button>
+</div>`;
 
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, '[Rich System Content: Recent Announcements]']
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Recent Announcements]']
       );
       return res.json({ response: "Here are the latest announcements:", richHtml, images: [] });
     }
@@ -1289,12 +1654,20 @@ router.post('/message', authenticateToken, async (req, res) => {
       const eventRows = r.rows;
 
       if (eventRows.length === 0) {
-        const responseText = "No results found for your query. There are no upcoming events.";
+        const responseText = "There are currently no upcoming events scheduled.";
+        let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-calendar-day" style="color: var(--maroon); margin-right: 6px;"></i> Upcoming Events</div>
+<div class="event-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 10px 0;">No upcoming campus events or activities are listed right now.</p>
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('events')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-calendar-day"></i> Go to Events Page
+  </button>
+</div>`;
         await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
         );
-        return res.json({ response: responseText, images: [] });
+        return res.json({ response: responseText, richHtml, images: [] });
       }
 
       let richHtml = `
@@ -1314,19 +1687,34 @@ router.post('/message', authenticateToken, async (req, res) => {
   </div>
         `;
       });
-      richHtml += `</div>`;
+      richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('events')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-calendar-day"></i> View All Events
+  </button>
+</div>`;
 
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, '[Rich System Content: Upcoming Events]']
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Upcoming Events]']
       );
       return res.json({ response: "Here are the upcoming events:", richHtml, images: [] });
     }
 
     else if (isLFQuery) {
       const isRestricted = req.user.role === 'student' || req.user.role === 'faculty' || req.user.role === 'guest';
-      const lfTypeFilter = isRestricted ? " AND lf.type = 'lost'" : '';
-      const words = message.toLowerCase().replace(/[?.,!]/g, '').split(/\s+/).filter(w => w.length > 2 && !['did', 'anyone', 'find', 'found', 'lost', 'my', 'the', 'looking', 'for', 'have', 'seen', 'belonging', 'item', 'items', 'and', 'report', 'reports', 'what', 'are', 'who', 'how', 'why', 'when', 'where', 'was', 'were', 'you', 'not', 'but', 'has', 'had', 'with', 'from', 'out', 'all', 'any', 'about', 'context', 'previous', 'answer'].includes(w));
+      const asksFound = /\b(found|nahanap|nakita)\b/i.test(message) && !/\b(lost|nawala|nawawala|na-?lost)\b/i.test(message);
+      const lfTypeFilter = isRestricted ? (asksFound ? " AND lf.type = 'found'" : " AND lf.type = 'lost'") : (asksFound ? " AND lf.type = 'found'" : "");
+
+      const lfStopWords = [
+        'did', 'anyone', 'find', 'found', 'lost', 'my', 'the', 'looking', 'for', 'have', 'seen', 'belonging',
+        'item', 'items', 'and', 'report', 'reports', 'what', 'are', 'who', 'how', 'why', 'when', 'where',
+        'was', 'were', 'you', 'not', 'but', 'has', 'had', 'with', 'from', 'out', 'all', 'any', 'about',
+        'context', 'previous', 'answer', 'ano', 'anong', 'ano-ano', 'anu-ano', 'ang', 'mga', 'yung', 'na',
+        'sa', 'ba', 'may', 'meron', 'mayroon', 'nawala', 'nawawala', 'nalost', 'na-lost', 'gamit', 'list',
+        'show', 'view', 'tingin', 'patingin', 'lahat', 'ibigay', 'paki', 'pakisabi', 'nahanap', 'nakita', 'pupsj', 'campus'
+      ];
+      const words = message.toLowerCase().replace(/[?.,!]/g, '').split(/\s+/).filter(w => w.length > 2 && !lfStopWords.includes(w));
       let lfRows = [];
       if (words.length > 0) {
         let lfQuery = `
@@ -1337,17 +1725,18 @@ router.post('/message', authenticateToken, async (req, res) => {
             FROM lost_found_images
             GROUP BY lost_found_id
           ) lfi ON lf.id = lfi.lost_found_id
-          WHERE lf.status = 'open' AND lf.approved = true${lfTypeFilter}
+          WHERE lf.status = 'open' AND lf.approved = true AND (lf.is_archived = false OR lf.is_archived IS NULL)${lfTypeFilter}
         `;
         const conds = words.map((w, idx) => {
-          return `(lf.item_name ILIKE $${idx + 1} OR lf.description ILIKE $${idx + 1} OR lf.category ILIKE $${idx + 1})`;
+          return `(lf.item_name LIKE $${idx + 1} OR lf.description LIKE $${idx + 1} OR lf.category LIKE $${idx + 1})`;
         });
         lfQuery += ` AND (${conds.join(' OR ')})`;
         lfQuery += ` ORDER BY lf.date_reported DESC, lf.created_at DESC LIMIT 5`;
 
         const r = await pool.query(lfQuery, words.map(w => `%${w}%`));
         lfRows = r.rows;
-      } else {
+      }
+      if (lfRows.length === 0) {
         const r = await pool.query(
           `SELECT lf.*, lfi.image_url
            FROM lost_found lf
@@ -1356,19 +1745,40 @@ router.post('/message', authenticateToken, async (req, res) => {
              FROM lost_found_images
              GROUP BY lost_found_id
            ) lfi ON lf.id = lfi.lost_found_id
-           WHERE lf.status = 'open' AND lf.approved = true${lfTypeFilter}
+           WHERE lf.status = 'open' AND lf.approved = true AND (lf.is_archived = false OR lf.is_archived IS NULL)${lfTypeFilter}
            ORDER BY lf.date_reported DESC, lf.created_at DESC LIMIT 5`
         );
         lfRows = r.rows;
       }
 
       if (lfRows.length === 0) {
-        const responseText = "No results found for your query.";
+        const responseText = "There are currently no active open lost item reports on campus. If you lost or found something, you can view the hub or submit a new report:";
+        let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-search-location" style="color: var(--maroon); margin-right: 6px;"></i> Lost & Found Status</div>
+<div class="lf-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+    <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(34, 197, 94, 0.12); color: #16a34a; display: flex; align-items: center; justify-content: center; font-size: 16px;">
+      <i class="fas fa-check-circle"></i>
+    </div>
+    <div>
+      <div style="font-size: 13px; font-weight: 700; color: var(--text-primary);">All Clear — No Open Reports</div>
+      <div style="font-size: 11px; color: var(--text-secondary);">There are currently no unclaimed or missing items reported on campus.</div>
+    </div>
+  </div>
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 12px 0; line-height: 1.4;">
+    Did you lose a belonging or find an unattended item? You can visit the Lost & Found section to submit a report or review recent activity.
+  </p>
+  <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+    <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('lostfound')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+      <i class="fas fa-search-location"></i> Go to Lost & Found
+    </button>
+  </div>
+</div>`;
         await pool.query(
-          'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-          [req.user.id, message, responseText]
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, '[Rich System Content: Lost & Found - Empty]']
         );
-        return res.json({ response: responseText, images: [] });
+        return res.json({ response: responseText, richHtml, images: [] });
       }
 
       let richHtml = `
@@ -1393,13 +1803,139 @@ router.post('/message', authenticateToken, async (req, res) => {
   </div>
         `;
       });
-      richHtml += `</div>`;
+      richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('lostfound')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-search-location"></i> View All in Lost & Found
+  </button>
+</div>`;
 
       await pool.query(
-        'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-        [req.user.id, message, '[Rich System Content: Lost & Found]']
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Lost & Found]']
       );
       return res.json({ response: "Here are the matching items:", richHtml, images: [] });
+    }
+
+    else if (isFacultyStatusQuery) {
+      let facRows = [];
+      try {
+        const facRes = await pool.query(
+          `SELECT first_name, last_name, department, position, faculty_status, faculty_status_room, faculty_status_note, faculty_status_updated_at
+           FROM users
+           WHERE role = 'faculty' AND is_active = true
+           ORDER BY last_name ASC LIMIT 8`
+        );
+        facRows = facRes.rows;
+      } catch (e) {
+        console.error('[chatbot:faculty] query error:', e.message);
+      }
+
+      if (facRows.length === 0) {
+        const responseText = "No faculty status records are currently available.";
+        let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-user-tie" style="color: var(--maroon); margin-right: 6px;"></i> Faculty Status &amp; Locator</div>
+<div class="faculty-chat-empty-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px;">
+  <p style="font-size: 12px; color: var(--text-secondary); margin: 0 0 10px 0;">No faculty locator entries found. You can check the announcements and department notices for updates.</p>
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('announcements')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-bullhorn"></i> View Announcements
+  </button>
+</div>`;
+        await pool.query(
+          'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+          [uuidv4(), req.user.id, message, responseText]
+        );
+        return res.json({ response: responseText, richHtml, images: [] });
+      }
+
+      const getStatusBadge = (s) => {
+        if (s === 'available') return '<span style="background: rgba(34,197,94,0.12); color: #16a34a; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase;">Available</span>';
+        if (s === 'in_class') return '<span style="background: rgba(245,158,11,0.12); color: #d97706; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase;">In Class</span>';
+        if (s === 'in_office') return '<span style="background: rgba(14,165,233,0.12); color: #0284c7; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase;">In Office</span>';
+        return '<span style="background: rgba(239,68,68,0.12); color: #dc2626; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase;">Unavailable</span>';
+      };
+
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-user-tie" style="color: var(--maroon); margin-right: 6px;"></i> Faculty Status &amp; Locator</div>
+<div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+      `;
+      facRows.forEach(f => {
+        const facName = `Prof. ${f.first_name} ${f.last_name}`;
+        const facDept = f.department || 'PUPSJ Faculty';
+        const roomStr = f.faculty_status_room ? `Room ${f.faculty_status_room}` : '';
+        richHtml += `
+  <div class="faculty-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; box-shadow: var(--shadow-sm);">
+    <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+      <span style="font-size: 13px; font-weight: 700; color: var(--text-primary);">${facName}</span>
+      ${getStatusBadge(f.faculty_status)}
+    </div>
+    <div style="font-size: 11px; color: var(--text-secondary);">${facDept} ${roomStr ? '· ' + roomStr : ''}</div>
+    ${f.faculty_status_note ? `<div style="font-size: 11px; color: var(--text-light); margin-top: 2px;"><i class="far fa-sticky-note"></i> ${f.faculty_status_note}</div>` : ''}
+  </div>
+        `;
+      });
+      richHtml += `</div>
+<div style="margin-top: 10px;">
+  <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('announcements')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+    <i class="fas fa-user-tie"></i> Open Professor Locator
+  </button>
+</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Faculty Status]']
+      );
+      return res.json({ response: "Here is the current faculty availability status:", richHtml, images: [] });
+    }
+
+    else if (isEnrollQuery) {
+      const responseText = "Here is the standard enrollment guide for PUP San Juan:";
+      let richHtml = `
+<div style="font-weight: 700; margin-bottom: 8px;"><i class="fas fa-clipboard-list" style="color: var(--maroon); margin-right: 6px;"></i> PUP San Juan Enrollment Procedure</div>
+<div class="enrollment-chat-card" style="background: var(--bg-card); border: 1.5px solid var(--border); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: var(--shadow-sm);">
+  <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <span style="background: var(--maroon); color: #fff; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">1</span>
+    <div>
+      <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Admission &amp; Qualification</div>
+      <div style="font-size: 11px; color: var(--text-secondary);">Confirm PUPCET results or obtain admission evaluation approval from the campus admissions committee.</div>
+    </div>
+  </div>
+  <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <span style="background: var(--maroon); color: #fff; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">2</span>
+    <div>
+      <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Online Profile &amp; Registration</div>
+      <div style="font-size: 11px; color: var(--text-secondary);">Log in to the PUPSJ HUB / SIS to complete your student profile and submit the required registration forms.</div>
+    </div>
+  </div>
+  <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <span style="background: var(--maroon); color: #fff; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">3</span>
+    <div>
+      <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Document Verification</div>
+      <div style="font-size: 11px; color: var(--text-secondary);">Submit physical credentials (Form 137/138, PSA Birth Certificate, Certificate of Good Moral Character) to the Registrar's Office.</div>
+    </div>
+  </div>
+  <div style="display: flex; gap: 10px; align-items: flex-start;">
+    <span style="background: var(--maroon); color: #fff; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">4</span>
+    <div>
+      <div style="font-size: 12px; font-weight: 700; color: var(--text-primary);">Section Assignment &amp; Confirmation</div>
+      <div style="font-size: 11px; color: var(--text-secondary);">Receive your Certificate of Registration (COR) with assigned subjects, section timetable, and class schedule.</div>
+    </div>
+  </div>
+  <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border);">
+    <button type="button" class="btn btn-sm btn-primary" onclick="window.navigateTo('queueing')" style="background: var(--maroon); color: #fff; border: none; border-radius: 6px; padding: 6px 12px; font-size: 11px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+      <i class="fas fa-ticket-alt"></i> Registrar Appointments / Queue
+    </button>
+    <button type="button" class="btn btn-sm btn-secondary" onclick="window.navigateTo('documents')" style="background: transparent; border: 1.5px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 6px 12px; font-size: 11px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 5px;">
+      <i class="fas fa-file-alt"></i> Download Forms
+    </button>
+  </div>
+</div>`;
+
+      await pool.query(
+        'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+        [uuidv4(), req.user.id, message, '[Rich System Content: Enrollment Steps]']
+      );
+      return res.json({ response: responseText, richHtml, images: [] });
     }
 
     let botResponse, images = [];
@@ -1424,8 +1960,8 @@ router.post('/message', authenticateToken, async (req, res) => {
     }
 
     await pool.query(
-      'INSERT INTO chatbot_logs (user_id, user_message, bot_response) VALUES ($1, $2, $3)',
-      [req.user.id, message, botResponse]
+      'INSERT INTO chatbot_logs (id, user_id, user_message, bot_response) VALUES (?, ?, ?, ?)',
+      [uuidv4(), req.user.id, message, botResponse]
     );
 
     res.json({ response: botResponse, images });
@@ -1439,7 +1975,7 @@ router.post('/message', authenticateToken, async (req, res) => {
 router.get('/history', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM chatbot_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      'SELECT * FROM chatbot_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 50',
       [req.user.id]
     );
     res.json(result.rows.reverse());
@@ -1449,4 +1985,3 @@ router.get('/history', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-

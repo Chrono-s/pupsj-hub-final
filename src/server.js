@@ -233,12 +233,26 @@ app.use((req, res, next) => {
 // ─────────────────────────────────────────────────────────────
 //  RATE LIMITING
 // ─────────────────────────────────────────────────────────────
+// Skip rate limiting for localhost and whitelisted QA tester IPs so testing is never throttled
+const skipLocalhost = (req) => {
+  const ip = req.ip || req.connection?.remoteAddress || '';
+  return (
+    ip === '127.0.0.1' ||
+    ip === '::1' ||
+    ip === '::ffff:127.0.0.1' ||
+    ip.startsWith('127.') ||
+    ip.startsWith('::ffff:127.') ||
+    (process.env.ALLOWED_IPS && process.env.ALLOWED_IPS.split(',').map(s => s.trim()).includes(ip))
+  );
+};
+
 // Global API limiter — applies to every /api/* route
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 min
   max: 300,                  // 300 requests / IP / 15 min
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipLocalhost,
   message: { error: 'Too many requests — please slow down.' },
 });
 app.use('/api/', apiLimiter);
@@ -250,6 +264,7 @@ const authLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   skipSuccessfulRequests: true,
+  skip: skipLocalhost,
   message: { error: 'Too many login attempts — try again in 15 minutes.' },
 });
 app.use('/api/auth/login', authLimiter);
@@ -261,6 +276,7 @@ const uploadLimiter = rateLimit({
   max: 15,                   // 15 uploads / IP / 10 min
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  skip: skipLocalhost,
   message: { error: 'Upload limit reached. Please wait a few minutes before uploading again.' },
 });
 // Attach upload limiter only to known upload paths
@@ -308,12 +324,26 @@ app.use(
 // ─────────────────────────────────────────────────────────────
 //  API ROUTES
 // ─────────────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
+  const pool = require('./config/database');
+  const dbStatus = typeof pool.checkDbHealth === 'function'
+    ? await pool.checkDbHealth()
+    : { healthy: true };
+  const isHealthy = Boolean(dbStatus.healthy);
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'healthy' : 'degraded',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    database: dbStatus,
+  });
+});
+
 app.get('/api/system-settings', async (req, res) => {
   const pool = require('./config/database');
   try {
-    const result = await pool.query('SELECT key, value FROM system_settings');
+    const [rows] = await pool.query('SELECT `key`, `value` FROM system_settings');
     const settings = {};
-    result.rows.forEach(row => {
+    rows.forEach(row => {
       settings[row.key] = row.value;
     });
     res.json(settings);
@@ -372,6 +402,17 @@ app.use('/api/faculty-schedules', require('./routes/facultySchedules'));
 app.use('/api/faculty', require('./routes/faculty'));
 app.use('/api/section-schedules', require('./routes/sectionSchedules'));
 app.use('/api/pages', require('./routes/pages'));
+app.use('/api/queueing', require('./routes/queueing'));
+
+app.get('/queue-display/:officeCode', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'queue-display.html'));
+});
+app.get('/queue-monitor/:officeCode', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'queue-monitor.html'));
+});
+app.get('/queue-walk-in', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'queue-walk-in.html'));
+});
 
 // API 404 — any /api/* route that wasn't matched returns JSON (never HTML)
 app.use('/api', (req, res) => {
@@ -384,9 +425,11 @@ app.use((req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-//  ERROR HANDLER (production-safe logging)
+//  ERROR HANDLER (production-safe logging & resilience)
 // ─────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
+  const pool = require('./config/database');
+
   if (err.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({ error: 'File too large. Maximum size is 5MB.' });
   }
@@ -405,6 +448,16 @@ app.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ error: 'CORS policy blocked this request.' });
   }
+
+  // Database connectivity & network failures
+  if (pool.isDbConnectionError && pool.isDbConnectionError(err)) {
+    console.error(`[DATABASE UNAVAILABLE] ${req.method} ${req.path} — ${err.message}`);
+    return res.status(503).json({
+      error: 'Database service is temporarily unavailable. Please verify the MySQL database server is running.',
+      code: 'DATABASE_UNAVAILABLE',
+    });
+  }
+
   // In production: log minimal info. In dev: log full stack.
   if (IS_PROD) {
     console.error(`[ERROR] ${req.method} ${req.path} — ${err.message}`);
@@ -412,22 +465,6 @@ app.use((err, req, res, next) => {
     console.error(err.stack);
   }
   res.status(500).json({ error: 'Something went wrong!' });
-});
-
-// ─────────────────────────────────────────────────────────────
-//  STARTUP & MIGRATIONS
-// ─────────────────────────────────────────────────────────────
-const pool = require('./config/database');
-Promise.all([
-  pool.query('ALTER TABLE lost_found ADD COLUMN IF NOT EXISTS date_lost_found DATE DEFAULT CURRENT_DATE;'),
-  pool.query('ALTER TABLE lost_found ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;'),
-  pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;'),
-  pool.query('ALTER TABLE lost_found DROP CONSTRAINT IF EXISTS lost_found_status_check;'),
-  pool.query("ALTER TABLE lost_found ADD CONSTRAINT lost_found_status_check CHECK (status IN ('open', 'matched', 'claimed', 'resolved', 'closed', 'deleted'));")
-]).then(() => {
-  console.log('Database auto-migrations successfully completed.');
-}).catch(err => {
-  console.error('Database auto-migration warning:', err.message);
 });
 
 app.listen(PORT, () => {

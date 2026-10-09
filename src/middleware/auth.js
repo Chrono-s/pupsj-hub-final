@@ -5,7 +5,7 @@ const pool = require('../config/database');
 const ALL_MODULES = [
   'announcements', 'events', 'lost_found', 'feedback',
   'documents', 'schedules', 'loading_requests', 'faculty',
-  'notifications', 'accounts', 'chatbot', 'pages',
+  'notifications', 'accounts', 'chatbot', 'pages', 'queueing',
 ];
 
 async function authenticateToken(req, res, next) {
@@ -21,25 +21,25 @@ async function authenticateToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const result = await pool.query(
-      'SELECT id, email, role, first_name, last_name, department, section, year_level, student_type, is_active, student_number FROM users WHERE id = $1',
+    const [rows] = await pool.query(
+      'SELECT id, email, role, first_name, last_name, department, section, year_level, student_type, is_active, student_number FROM users WHERE id = ?',
       [decoded.id]
     );
-    if (result.rows.length === 0) {
+    if (!rows || rows.length === 0) {
       throw new Error('USER_NOT_FOUND');
     }
 
-    const user = result.rows[0];
+    const user = rows[0];
     if (!user.is_active) {
       throw new Error('USER_INACTIVE');
     }
 
     if (user.role !== 'admin' && user.role !== 'superadmin' && user.role !== 'guest') {
-      const allowed = await pool.query(
-        'SELECT 1 FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($1))',
+      const [allowed] = await pool.query(
+        'SELECT 1 FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM(?))',
         [user.student_number]
       );
-      if (allowed.rows.length === 0) {
+      if (!allowed || allowed.length === 0) {
         throw new Error('ALLOWED_ID_REMOVED');
       }
     }
@@ -60,8 +60,8 @@ async function authenticateToken(req, res, next) {
     if (user.actualRole === 'superadmin') {
       user.modules = ALL_MODULES;
     } else if (user.actualRole === 'admin') {
-      const perms = await pool.query('SELECT module FROM admin_permissions WHERE user_id = $1', [user.id]);
-      user.modules = perms.rows.map(r => r.module);
+      const [perms] = await pool.query('SELECT module FROM admin_permissions WHERE user_id = ?', [user.id]);
+      user.modules = (perms || []).map(r => r.module);
     } else {
       user.modules = [];
     }
@@ -69,6 +69,15 @@ async function authenticateToken(req, res, next) {
     req.user = user;
     next();
   } catch (err) {
+    if (pool.isDbConnectionError && pool.isDbConnectionError(err)) {
+      if (expectsJson) {
+        return res.status(503).json({
+          error: 'Database service is temporarily unavailable. Please try again in a moment.',
+          code: 'DATABASE_UNAVAILABLE'
+        });
+      }
+      return res.status(503).send('Database service unavailable');
+    }
     if (expectsJson) {
       if (err.message === 'ALLOWED_ID_REMOVED') {
         return res.status(403).json({ error: 'Your ID is no longer authorized. Please contact your admin.' });
@@ -124,15 +133,21 @@ function requirePermission(module) {
       return res.status(403).json({ error: 'You do not have access to this module' });
     }
     try {
-      const r = await pool.query(
-        'SELECT 1 FROM admin_permissions WHERE user_id = $1 AND module = $2',
+      const [r] = await pool.query(
+        'SELECT 1 FROM admin_permissions WHERE user_id = ? AND module = ?',
         [req.user.id, module]
       );
-      if (r.rows.length === 0) {
+      if (!r || r.length === 0) {
         return res.status(403).json({ error: 'You do not have access to this module' });
       }
       next();
     } catch (err) {
+      if (pool.isDbConnectionError && pool.isDbConnectionError(err)) {
+        return res.status(503).json({
+          error: 'Database service is temporarily unavailable.',
+          code: 'DATABASE_UNAVAILABLE'
+        });
+      }
       console.error('[Auth] requirePermission error:', err);
       res.status(500).json({ error: 'Permission check failed' });
     }

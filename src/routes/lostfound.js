@@ -1,24 +1,21 @@
 const express = require('express');
 const router = express.Router();
+const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/database');
 const { authenticateToken, requireRole, requirePermission } = require('../middleware/auth');
-const requireLostFound = requirePermission('lost_found');
 const { uploadLostFound } = require('../middleware/upload');
-const { rankLostFoundCandidates } = require('../services/lostFoundMatcher');
+const { rankLostFoundCandidates, computeHeuristicMatchScore } = require('../services/lostFoundMatcher');
 const { notifyAdmins, notifyUsers, notifyUser, safeNotify } = require('../services/notifications');
+const { isValidUuid, safeJsonParse, getPagination } = require('../utils/helpers');
 
+const requireLostFound = requirePermission('lost_found');
 const AUTO_MATCH_THRESHOLD = 0.35;
 const VALID_STATUSES = ['open', 'matched', 'claimed', 'resolved', 'closed'];
 
 function parseImageFingerprints(raw) {
   if (!raw) return [];
   if (Array.isArray(raw)) return raw.filter(Boolean);
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
-  } catch (_) {
-    return [];
-  }
+  return safeJsonParse(raw, []);
 }
 
 function itemLabel(item) {
@@ -26,48 +23,57 @@ function itemLabel(item) {
 }
 
 function isStrongAutoMatch(best) {
-  if (!best || typeof best.match_score_raw !== 'number') return false;
-  return best.match_score_raw >= AUTO_MATCH_THRESHOLD;
+  return best && typeof best.match_score_raw === 'number' && best.match_score_raw >= AUTO_MATCH_THRESHOLD;
+}
+
+function normalizeLfImages(item) {
+  if (!item) return item;
+  let imgs = safeJsonParse(item.images, []);
+  if (!Array.isArray(imgs)) imgs = [];
+  item.images = imgs
+    .filter(img => img && (img.image_url || typeof img === 'string'))
+    .map(img => (typeof img === 'string' ? { id: img, image_url: img } : { id: img.id || img.image_url, image_url: img.image_url }));
+  return item;
 }
 
 async function fetchLostFoundItemWithImages(client, id) {
-  const result = await client.query(
-    `SELECT lf.*, u.first_name || ' ' || u.last_name as reporter_name,
+  const [rows] = await client.query(
+    `SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
       COALESCE(
-        json_agg(json_build_object('id', lfi.id, 'image_url', lfi.image_url) ORDER BY lfi.display_order) FILTER (WHERE lfi.id IS NOT NULL),
-        '[]'::json
+        CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+        '[]'
       ) as images
      FROM lost_found lf
      LEFT JOIN users u ON lf.reporter_id = u.id
      LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
-     WHERE lf.id = $1
+     WHERE lf.id = ?
      GROUP BY lf.id, u.first_name, u.last_name`,
     [id]
   );
-  return result.rows[0] || null;
+  return normalizeLfImages((rows && rows[0]) || null);
 }
 
 async function fetchLostFoundCandidates(client, target) {
   const oppositeType = target.type === 'lost' ? 'found' : 'lost';
-  const result = await client.query(
-    `SELECT lf.*, u.first_name || ' ' || u.last_name as reporter_name,
+  const [rows] = await client.query(
+    `SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
       COALESCE(
-        json_agg(json_build_object('id', lfi.id, 'image_url', lfi.image_url) ORDER BY lfi.display_order) FILTER (WHERE lfi.id IS NOT NULL),
-        '[]'::json
+        CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+        '[]'
       ) as images
      FROM lost_found lf
      LEFT JOIN users u ON lf.reporter_id = u.id
      LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
-     WHERE lf.type = $1
+     WHERE lf.type = ?
        AND lf.status = 'open'
        AND COALESCE(lf.match_review_status, 'none') NOT IN ('pending', 'approved')
-       AND lf.id != $2
+       AND lf.id != ?
      GROUP BY lf.id, u.first_name, u.last_name
      ORDER BY lf.created_at DESC
      LIMIT 60`,
     [oppositeType, target.id]
   );
-  return result.rows;
+  return (rows || []).map(normalizeLfImages);
 }
 
 async function maybeQueueAutoMatch(client, target) {
@@ -81,15 +87,15 @@ async function maybeQueueAutoMatch(client, target) {
   await client.query(
     `UPDATE lost_found
      SET matched_with = CASE
-           WHEN id = $1 THEN $2
-           WHEN id = $2 THEN $1
+           WHEN id = ? THEN ?
+           WHEN id = ? THEN ?
            ELSE matched_with
          END,
          match_review_status = 'pending',
-         match_score = $3,
+         match_score = ?,
          updated_at = NOW()
-     WHERE id IN ($1, $2)`,
-    [target.id, best.id, best.match_score_raw]
+     WHERE id IN (?, ?)`,
+    [target.id, best.id, best.id, target.id, best.match_score_raw, target.id, best.id]
   );
 
   return {
@@ -99,219 +105,191 @@ async function maybeQueueAutoMatch(client, target) {
     review_item_id: target.type === 'found' ? target.id : best.id,
   };
 }
+
+// ── GET /api/lost-found ─────────────────────────────────────────────────────
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    // 1. Run auto-archiving query for items older than 4 years
-    await pool.query(
-      `UPDATE lost_found SET is_archived = true WHERE created_at < NOW() - INTERVAL '4 years' AND is_archived = false`
-    ).catch(err => console.error('Lost & found auto-archive warning:', err.message));
+    await pool.query('UPDATE lost_found SET is_archived = true WHERE created_at < NOW() - INTERVAL 4 YEAR AND is_archived = false').catch(() => {});
+    await pool.query("DELETE FROM lost_found WHERE status = 'deleted' AND updated_at < NOW() - INTERVAL 6 MONTH").catch(() => {});
 
-    // Run auto-delete for soft-deleted lost/found items: 6 months
-    await pool.query(
-      `DELETE FROM lost_found 
-       WHERE status = 'deleted' 
-         AND updated_at < NOW() - INTERVAL '6 months'`
-    ).catch(err => console.error('Auto-delete soft-deleted lost/found error:', err.message));
-
-    const { type, status, page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
-
-    const isRestricted = req.user.role === 'student' || req.user.role === 'guest';
-    const isFaculty = req.user.role === 'faculty';
-    const isAdmin = req.user.role === 'admin' || req.user.role === 'superadmin';
+    const { type, status } = req.query;
+    const { page, limit, offset } = getPagination(req.query, 20);
+    const isAdmin = ['admin', 'superadmin'].includes(req.user.role);
     const params = [];
 
     let query = `
-      SELECT lf.*, u.first_name || ' ' || u.last_name as reporter_name,
+      SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
         COALESCE(
-          json_agg(
-            json_build_object('id', lfi.id, 'image_url', lfi.image_url)
-            ORDER BY lfi.display_order
-          ) FILTER (WHERE lfi.id IS NOT NULL), '[]'::json
-        ) as images
+          CONCAT('[', GROUP_CONCAT(IF(lfi.id IS NOT NULL, JSON_OBJECT('id', lfi.id, 'image_url', lfi.image_url), NULL) SEPARATOR ','), ']'),
+          '[]'
+        ) as images,
+        (
+          SELECT JSON_OBJECT(
+            'id', p.id,
+            'item_name', p.item_name,
+            'description', p.description,
+            'type', p.type,
+            'category', p.category,
+            'location_found', p.location_found,
+            'date_lost_found', p.date_lost_found,
+            'contact_info', p.contact_info,
+            'status', p.status,
+            'reporter_name', COALESCE(CONCAT(pu.first_name, ' ', pu.last_name), 'Unknown'),
+            'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+              SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
+              FROM lost_found_images pi WHERE pi.lost_found_id = p.id
+            ), ''), ']'), '$')
+          )
+          FROM lost_found p
+          LEFT JOIN users pu ON pu.id = p.reporter_id
+          WHERE p.id = lf.matched_with
+        ) as matched_item
       FROM lost_found lf
       LEFT JOIN users u ON lf.reporter_id = u.id
       LEFT JOIN lost_found_images lfi ON lfi.lost_found_id = lf.id
       WHERE 1=1
     `;
 
-    if (type === 'pending-guest') {
-      if (isAdmin || isFaculty) {
-        query += ` AND lf.approved = false`;
+    if (!isAdmin) {
+      if (req.user.role === 'faculty') {
+        query += " AND lf.status != 'deleted' AND lf.approved = true";
       } else {
-        query += ` AND lf.approved = true`;
+        params.push(req.user.id);
+        query += " AND (lf.status != 'deleted' AND (lf.approved = true OR lf.reporter_id = ?))";
       }
-    } else {
-      query += ` AND lf.approved = true`;
+    } else if (type === 'pending-guest') {
+      query += " AND lf.approved = false AND lf.status != 'deleted'";
     }
 
-    if (isRestricted) {
-      // Students and guests can ONLY see open/unresolved LOST items that are NOT archived and NOT deleted
-      query += ` AND lf.status NOT IN ('resolved', 'closed', 'deleted') AND lf.type = 'lost' AND lf.is_archived = false`;
-    } else {
-      // Faculty and Admins can see all item categories (lost, found, resolved, matched, claimed)
-      if (status === 'archived') {
-        if (isAdmin) {
-          // Only Admin/Superadmin can see archived/deleted items
-          query += ` AND (lf.is_archived = true OR lf.status = 'deleted')`;
-        } else {
-          // Faculty cannot see archived items
-          query += ` AND 1=0`;
-        }
-      } else {
-        // Normal list view: exclude archived and deleted items
-        query += ` AND lf.is_archived = false AND lf.status != 'deleted'`;
-        if (status) {
-          if (status === 'resolved') {
-            query += ` AND lf.status IN ('resolved', 'claimed') AND lf.type = 'found'`;
-          } else {
-            params.push(status);
-            query += ` AND lf.status = $${params.length}`;
-          }
-        } else {
-          query += ` AND lf.status != 'closed'`;
-        }
-      }
-      if (type && type !== 'pending-guest') {
-        params.push(type);
-        query += ` AND lf.type = $${params.length}`;
-      }
+    if (type && type !== 'pending-guest' && ['lost', 'found'].includes(type)) {
+      params.push(type);
+      query += ' AND lf.type = ?';
     }
 
-    query += ` GROUP BY lf.id, u.first_name, u.last_name
-               ORDER BY lf.created_at DESC
-               LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(parseInt(limit, 10), parseInt(offset, 10));
+    if (status && VALID_STATUSES.includes(status)) {
+      params.push(status);
+      query += ' AND lf.status = ?';
+    }
 
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    query += ' GROUP BY lf.id, u.first_name, u.last_name ORDER BY lf.created_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const [rows] = await pool.query(query, params);
+    const items = (rows || []).map((row) => {
+      normalizeLfImages(row);
+      if (row.matched_item) {
+        if (typeof row.matched_item === 'string') {
+          row.matched_item = safeJsonParse(row.matched_item, null);
+        }
+        if (row.matched_item) normalizeLfImages(row.matched_item);
+      }
+      return row;
+    });
+
+    res.json(items);
   } catch (err) {
-    console.error('Get lost/found error:', err);
-    res.status(500).json({ error: 'Failed to fetch items' });
+    console.error('Get lost & found error:', err);
+    res.status(500).json({ error: 'Failed to fetch lost & found items' });
   }
 });
-router.post('/', authenticateToken, requireRole('student', 'faculty', 'admin', 'guest'), uploadLostFound.array('images', 5), async (req, res) => {
-  const client = await pool.connect();
-  let hydratedItem = null;
-  let autoMatch = null;
+
+// ── POST /api/lost-found ────────────────────────────────────────────────────
+router.post('/', authenticateToken, uploadLostFound.array('images', 5), async (req, res) => {
+  const client = await pool.getConnection();
   try {
-    const { type, item_name, description, category, location_found, contact_info, date_lost_found } = req.body;
-    if (!type || !item_name || !description || !date_lost_found || !contact_info || !contact_info.trim()) {
-      return res.status(400).json({ error: 'Type, item name, description, contact information, and date lost/found are required' });
+    const { item_name, description, category, location_found, type, contact_info, date_lost_found } = req.body;
+    if (!item_name || !description || !type || !date_lost_found || !contact_info || !contact_info.trim()) {
+      client.release();
+      return res.status(400).json({ error: 'Item name, description, contact info, type, and date are required' });
+    }
+
+    const actualRole = req.user.actualRole || req.user.role;
+    const isAdminUser = actualRole === 'admin' || actualRole === 'superadmin';
+    if (isAdminUser && type === 'found') {
+      const hasLFModule = actualRole === 'superadmin' || (Array.isArray(req.user.modules) && req.user.modules.includes('lost_found'));
+      if (!hasLFModule) {
+        client.release();
+        return res.status(403).json({ error: 'You do not have access to the Lost & Found module' });
+      }
     }
 
     const isGuest = req.user.role === 'guest';
     const approvedVal = !isGuest;
+    const newId = uuidv4();
 
-    await client.query('BEGIN');
-
-    const result = await client.query(
-      `INSERT INTO lost_found (reporter_id, type, item_name, description, category, location_found, contact_info, approved, date_lost_found)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [req.user.id, type, item_name, description, category || null, location_found || null, contact_info || null, approvedVal, date_lost_found]
+    await client.beginTransaction();
+    await client.query(
+      `INSERT INTO lost_found (id, reporter_id, type, item_name, description, category, location_found, contact_info, approved, date_lost_found)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [newId, req.user.id, type, item_name, description, category || null, location_found || null, contact_info || null, approvedVal, date_lost_found]
     );
-
-    const item = result.rows[0];
 
     if (req.files && req.files.length > 0) {
       for (let i = 0; i < Math.min(req.files.length, 5); i++) {
-        const imageUrl = `/uploads/lostfound/${req.files[i].filename}`;
         await client.query(
-          `INSERT INTO lost_found_images (lost_found_id, image_url, display_order) VALUES ($1, $2, $3)`,
-          [item.id, imageUrl, i]
+          'INSERT INTO lost_found_images (id, lost_found_id, image_url, display_order) VALUES (?, ?, ?, ?)',
+          [uuidv4(), newId, `/uploads/lostfound/${req.files[i].filename}`, i]
         );
       }
     }
 
-    hydratedItem = await fetchLostFoundItemWithImages(client, item.id);
+    const hydratedItem = await fetchLostFoundItemWithImages(client, newId);
     hydratedItem.image_fingerprints = parseImageFingerprints(req.body.image_fingerprints);
-    autoMatch = await maybeQueueAutoMatch(client, hydratedItem);
+    const autoMatch = await maybeQueueAutoMatch(client, hydratedItem);
 
-    await client.query('COMMIT');
+    await client.commit();
 
     if (autoMatch?.matched) {
       await safeNotify('lost-found auto match', async () => {
         const partner = await fetchLostFoundItemWithImages(pool, autoMatch.partner_id);
-        const reporterIds = [hydratedItem.reporter_id, partner?.reporter_id];
-
-        await notifyUsers(pool, reporterIds, {
+        await notifyUsers(pool, [hydratedItem.reporter_id, partner?.reporter_id], {
           title: 'Possible lost & found match found',
           message: `"${itemLabel(hydratedItem)}" may match another report and is waiting for office review.`,
           type: 'lostfound',
           link: 'page:lostfound',
         });
-
         await notifyAdmins(pool, {
-          title: 'Lost & found review needed',
-          message: `AI suggested a match between "${itemLabel(hydratedItem)}" and "${itemLabel(partner)}".`,
+          title: 'Match review needed',
+          message: `A possible match between "${itemLabel(hydratedItem)}" and "${itemLabel(partner)}" is ready for review.`,
           type: 'lostfound',
           link: 'page:lostfound',
         });
       });
     }
 
-    res.status(201).json({ message: 'Item reported', item: hydratedItem, autoMatch });
+    res.status(201).json(hydratedItem);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
-    console.error('Report item error:', err);
-    res.status(500).json({ error: 'Failed to report item' });
+    try { await client.rollback(); } catch (_) {}
+    console.error('Create lost-found error:', err);
+    res.status(500).json({ error: 'Failed to create report' });
   } finally {
     client.release();
   }
 });
 
-router.patch('/:id/status', authenticateToken, async (req, res) => {
-  try {
-    const { status } = req.body;
-    if (!VALID_STATUSES.includes(status)) {
-      return res.status(400).json({ error: `Status must be one of: ${VALID_STATUSES.join(', ')}` });
-    }
-
-    const check = await pool.query('SELECT reporter_id, type FROM lost_found WHERE id = $1', [req.params.id]);
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    const item = check.rows[0];
-    if (item.reporter_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    if (status === 'resolved' && item.type !== 'found') {
-      return res.status(400).json({ error: 'Only found items can be marked as resolved' });
-    }
-
-    await pool.query(
-      'UPDATE lost_found SET status = $1, updated_at = NOW() WHERE id = $2',
-      [status, req.params.id]
-    );
-    res.json({ message: 'Status updated' });
-  } catch (err) {
-    console.error('Update status error:', err);
-    res.status(500).json({ error: 'Failed to update status' });
-  }
-});
-
+// ── GET /api/lost-found/matches/all ─────────────────────────────────────────
 router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   try {
-    // 1. Fetch Existing Matches (Approved or Pending Review)
-    const existingResult = await pool.query(`
-      SELECT f.*, uf.first_name || ' ' || uf.last_name as reporter_name,
-        COALESCE((
-          SELECT json_agg(json_build_object('id', fi.id, 'image_url', fi.image_url) ORDER BY fi.display_order)
+    const [existingResult] = await pool.query(`
+      SELECT f.*, CONCAT(uf.first_name, ' ', uf.last_name) as reporter_name,
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
           FROM lost_found_images fi
           WHERE fi.lost_found_id = f.id
-        ), '[]'::json) as images,
-        json_build_object(
+        ), ''), ']') as images,
+        JSON_OBJECT(
           'id', p.id,
           'item_name', p.item_name,
           'description', p.description,
           'category', p.category,
           'location_found', p.location_found,
           'contact_info', p.contact_info,
-          'reporter_name', COALESCE(up.first_name || ' ' || up.last_name, 'Unknown'),
-          'images', COALESCE((
-            SELECT json_agg(json_build_object('id', pi.id, 'image_url', pi.image_url) ORDER BY pi.display_order)
+          'reporter_name', COALESCE(CONCAT(up.first_name, ' ', up.last_name), 'Unknown'),
+          'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+            SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
             FROM lost_found_images pi
             WHERE pi.lost_found_id = p.id
-          ), '[]'::json),
+          ), ''), ']'), '$'),
           'match_review_status', p.match_review_status,
           'status', p.status
         ) as partner
@@ -325,90 +303,85 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
       ORDER BY f.updated_at DESC
     `);
 
-    const matches = existingResult.rows.map(row => ({
-      match_score: row.match_score ? (row.match_score > 1 ? row.match_score / 100 : row.match_score) : 0,
-      lost_item: { ...row.partner, id: row.matched_with },
-      found_item: { ...row, partner: undefined }
-    }));
+    (existingResult || []).forEach(row => {
+      normalizeLfImages(row);
+      if (typeof row.partner === 'string') {
+        row.partner = safeJsonParse(row.partner, null);
+      }
+      if (row.partner) normalizeLfImages(row.partner);
+    });
 
-    // 2. Discover New Potential Matches among 'open' items
-    const openFound = await pool.query(`
-      SELECT lf.*, u.first_name || ' ' || u.last_name as reporter_name,
-        COALESCE((
-          SELECT json_agg(json_build_object('id', fi.id, 'image_url', fi.image_url) ORDER BY fi.display_order)
-          FROM lost_found_images fi
-          WHERE fi.lost_found_id = lf.id
-        ), '[]'::json) as images
+    const matches = (existingResult || []).map(row => {
+      let score = row.match_score ? (Number(row.match_score) > 1 ? Number(row.match_score) / 100 : Number(row.match_score)) : 0;
+      if (!score || score <= 0) score = computeHeuristicMatchScore(row, row.partner) / 100;
+      return {
+        match_score: score,
+        lost_item: { ...row.partner, id: row.matched_with },
+        found_item: { ...row, partner: undefined }
+      };
+    });
+
+    const [openFound] = await pool.query(`
+      SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
+          FROM lost_found_images fi WHERE fi.lost_found_id = lf.id
+        ), ''), ']') as images
       FROM lost_found lf
       LEFT JOIN users u ON lf.reporter_id = u.id
       WHERE lf.type = 'found' AND lf.status = 'open' AND (lf.matched_with IS NULL OR lf.match_review_status = 'rejected')
     `);
 
-    const openLost = await pool.query(`
-      SELECT lf.*, u.first_name || ' ' || u.last_name as reporter_name,
-        COALESCE((
-          SELECT json_agg(json_build_object('id', fi.id, 'image_url', fi.image_url) ORDER BY fi.display_order)
-          FROM lost_found_images fi
-          WHERE fi.lost_found_id = lf.id
-        ), '[]'::json) as images
+    const [openLost] = await pool.query(`
+      SELECT lf.*, CONCAT(u.first_name, ' ', u.last_name) as reporter_name,
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
+          FROM lost_found_images fi WHERE fi.lost_found_id = lf.id
+        ), ''), ']') as images
       FROM lost_found lf
       LEFT JOIN users u ON lf.reporter_id = u.id
       WHERE lf.type = 'lost' AND lf.status = 'open' AND (lf.matched_with IS NULL OR lf.match_review_status = 'rejected')
     `);
 
-    // Track which lost item IDs have already been matched (to avoid double-matching)
+    (openFound || []).forEach(normalizeLfImages);
+    (openLost || []).forEach(normalizeLfImages);
+
     const matchedLostIds = new Set(matches.map(m => String(m.lost_item?.id)).filter(Boolean));
 
-    if (openFound.rows.length > 0 && openLost.rows.length > 0) {
-      for (const fItem of openFound.rows) {
+    if (openFound.length > 0 && openLost.length > 0) {
+      for (const fItem of openFound) {
         try {
-          // Filter out already-matched lost items and prevent re-matching rejected pairs
-          const availableLost = openLost.rows.filter(l => {
+          const availableLost = openLost.filter(l => {
             if (matchedLostIds.has(String(l.id))) return false;
             if (fItem.match_review_status === 'rejected' && String(l.id) === String(fItem.matched_with)) return false;
             if (l.match_review_status === 'rejected' && String(fItem.id) === String(l.matched_with)) return false;
             return true;
           });
-          if (availableLost.length === 0) continue;
+          if (!availableLost.length) continue;
 
-          const ranked = await rankLostFoundCandidates(fItem, availableLost, { minScore: 20 });
-          if (ranked.length === 0) continue;
+          const ranked = await rankLostFoundCandidates(fItem, availableLost, { minScore: 35 });
+          if (!ranked.length) continue;
 
-          // Only take the BEST match for each found item
           const best = ranked[0];
-
-          // Persist the discovered match to the database so the approve route can find it
           try {
             await pool.query(
               `UPDATE lost_found
-               SET matched_with = CASE
-                     WHEN id = $1 THEN $2
-                     WHEN id = $2 THEN $1
-                     ELSE matched_with
-                   END,
+               SET matched_with = CASE WHEN id = ? THEN ? WHEN id = ? THEN ? ELSE matched_with END,
                    match_review_status = 'pending',
-                   match_score = $3,
+                   match_score = ?,
                    updated_at = NOW()
-               WHERE id IN ($1, $2)`,
-              [fItem.id, best.id, best.match_score_raw]
+               WHERE id IN (?, ?)`,
+              [fItem.id, best.id, best.id, fItem.id, best.match_score_raw, fItem.id, best.id]
             );
-          } catch (persistErr) {
-            console.warn(`Failed to persist discovered match (found=${fItem.id}, lost=${best.id}):`, persistErr.message);
-          }
+          } catch (_) {}
 
-          // Mark the lost item as taken so it won't be matched again
           matchedLostIds.add(String(best.id));
-
-          const updatedLostItem = { ...best, match_review_status: 'pending' };
-          const updatedFoundItem = { ...fItem, match_review_status: 'pending' };
           matches.push({
             match_score: best.match_score_raw,
-            lost_item: updatedLostItem,
-            found_item: updatedFoundItem
+            lost_item: { ...best, match_review_status: 'pending' },
+            found_item: { ...fItem, match_review_status: 'pending' }
           });
-        } catch (matchErr) {
-          console.warn(`Failed to discover matches for found item ${fItem.id}:`, matchErr.message);
-        }
+        } catch (_) {}
       }
     }
 
@@ -420,28 +393,27 @@ router.get('/matches/all', authenticateToken, requireRole('admin', 'superadmin')
   }
 });
 
+// ── GET /api/lost-found/review/pending ───────────────────────────────────────
 router.get('/review/pending', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT f.*, uf.first_name || ' ' || uf.last_name as reporter_name,
-        COALESCE((
-          SELECT json_agg(json_build_object('id', fi.id, 'image_url', fi.image_url) ORDER BY fi.display_order)
-          FROM lost_found_images fi
-          WHERE fi.lost_found_id = f.id
-        ), '[]'::json) as images,
-        json_build_object(
+    const [rows] = await pool.query(`
+      SELECT f.*, CONCAT(uf.first_name, ' ', uf.last_name) as reporter_name,
+        CONCAT('[', COALESCE((
+          SELECT GROUP_CONCAT(JSON_OBJECT('id', fi.id, 'image_url', fi.image_url) SEPARATOR ',')
+          FROM lost_found_images fi WHERE fi.lost_found_id = f.id
+        ), ''), ']') as images,
+        JSON_OBJECT(
           'id', p.id,
           'item_name', p.item_name,
           'description', p.description,
           'category', p.category,
           'location_found', p.location_found,
           'contact_info', p.contact_info,
-          'reporter_name', COALESCE(up.first_name || ' ' || up.last_name, 'Unknown'),
-          'images', COALESCE((
-            SELECT json_agg(json_build_object('id', pi.id, 'image_url', pi.image_url) ORDER BY pi.display_order)
-            FROM lost_found_images pi
-            WHERE pi.lost_found_id = p.id
-          ), '[]'::json)
+          'reporter_name', COALESCE(CONCAT(up.first_name, ' ', up.last_name), 'Unknown'),
+          'images', JSON_EXTRACT(CONCAT('[', COALESCE((
+            SELECT GROUP_CONCAT(JSON_OBJECT('id', pi.id, 'image_url', pi.image_url) SEPARATOR ',')
+            FROM lost_found_images pi WHERE pi.lost_found_id = p.id
+          ), ''), ']'), '$')
         ) as partner
       FROM lost_found f
       LEFT JOIN users uf ON uf.id = f.reporter_id
@@ -453,131 +425,75 @@ router.get('/review/pending', authenticateToken, requireRole('admin', 'superadmi
       ORDER BY f.updated_at DESC
     `);
 
-    res.json(result.rows);
+    (rows || []).forEach(r => {
+      normalizeLfImages(r);
+      if (typeof r.partner === 'string') {
+        r.partner = safeJsonParse(r.partner, null);
+      }
+      if (r.partner) normalizeLfImages(r.partner);
+    });
+
+    res.json(rows || []);
   } catch (err) {
     console.error('Pending LF review error:', err);
     res.status(500).json({ error: 'Failed to fetch pending match reviews' });
   }
 });
 
+// ── PATCH /api/lost-found/review/:id ────────────────────────────────────────
 router.patch('/review/:id', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
-  const client = await pool.connect();
-  let reviewItems = [];
-  let decision = null;
+  const client = await pool.getConnection();
   try {
-    decision = req.body?.decision;
+    const decision = req.body?.decision;
     const { lostId } = req.body;
     if (!['approve', 'reject'].includes(decision)) {
+      client.release();
       return res.status(400).json({ error: 'Decision must be approve or reject' });
     }
 
-    await client.query('BEGIN');
-    
-    // First try to find existing match pending review in the DB
-    let reviewResult = await client.query(
-      'SELECT id, matched_with, match_score FROM lost_found WHERE id = $1 AND match_review_status = $2',
-      [req.params.id, 'pending']
-    );
-
-    let review = reviewResult.rows[0];
-    let matchedWithId = review?.matched_with || lostId;
-    let dynamicScore = 95;
-
-    // If no pending review found but lostId was provided, look up the found item by ID alone
-    // This handles the case where the match was just discovered and DB may not have been updated yet
-    if (!review && lostId) {
-      const fallbackResult = await client.query(
-        'SELECT id, matched_with, match_score FROM lost_found WHERE id = $1',
-        [req.params.id]
-      );
-      if (fallbackResult.rows.length > 0) {
-        review = fallbackResult.rows[0];
-        matchedWithId = lostId; // Use the lostId provided by the frontend
-        dynamicScore = review.match_score ? Math.round(Number(review.match_score) * 100) : 95;
-      }
+    await client.beginTransaction();
+    const [reviewRows] = await client.query('SELECT id, matched_with, match_score FROM lost_found WHERE id = ?', [req.params.id]);
+    if (!reviewRows.length) {
+      await client.rollback();
+      client.release();
+      return res.status(404).json({ error: 'Item not found' });
     }
 
+    const review = reviewRows[0];
+    const matchedWithId = review.matched_with || lostId;
     if (!matchedWithId) {
-      // Dynamic fallback matching safety net (perfect for cached frontend browsers)
-      const foundItemRes = await client.query('SELECT * FROM lost_found WHERE id = $1 AND type = $2 AND status = $3', [req.params.id, 'found', 'open']);
-      if (foundItemRes.rows.length > 0) {
-        const openLostRes = await client.query("SELECT * FROM lost_found WHERE type = 'lost' AND status = 'open' AND matched_with IS NULL");
-        if (openLostRes.rows.length > 0) {
-          const ranked = await rankLostFoundCandidates(foundItemRes.rows[0], openLostRes.rows);
-          if (ranked.length > 0) {
-            matchedWithId = ranked[0].id;
-            dynamicScore = Math.round((ranked[0].match_score_raw || 0.95) * 100);
-          }
-        }
-      }
+      await client.rollback();
+      client.release();
+      return res.status(404).json({ error: 'Matched item link not found' });
     }
 
-    if (!matchedWithId) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Pending review or lost item link not found' });
-    }
-
-    // If it's a new potential match, we want to set matched_with and status first
-    if (!review) {
-      // Create/initialize match in DB for both items so they are linked
-      const itemsRes = await client.query('SELECT id, reporter_id, item_name, type FROM lost_found WHERE id IN ($1, $2)', [req.params.id, matchedWithId]);
-      if (itemsRes.rows.length !== 2) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'One or both items not found' });
-      }
-      
-      const foundItemInDb = itemsRes.rows.find(r => r.type === 'found');
-      const lostItemInDb = itemsRes.rows.find(r => r.type === 'lost');
-      if (!foundItemInDb || !lostItemInDb) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Must match a lost item with a found item' });
-      }
-
-      reviewItems = itemsRes.rows;
-      review = {
-        id: foundItemInDb.id,
-        matched_with: lostItemInDb.id,
-        match_score: dynamicScore
-      };
-    } else {
-      const reviewItemsResult = await client.query(
-        `SELECT id, reporter_id, item_name, type
-         FROM lost_found
-         WHERE id = ANY($1::uuid[])`,
-        [[review.id, matchedWithId]]
-      );
-      reviewItems = reviewItemsResult.rows;
-    }
+    const [itemsRes] = await client.query('SELECT id, reporter_id, item_name, type FROM lost_found WHERE id IN (?, ?)', [review.id, matchedWithId]);
 
     if (decision === 'approve') {
       await client.query(
         `UPDATE lost_found
-         SET status = 'matched',
-             match_review_status = 'approved',
-             matched_with = CASE WHEN id = $1 THEN $2 WHEN id = $2 THEN $1 ELSE matched_with END,
-             match_score = COALESCE(match_score, $3),
+         SET status = 'matched', match_review_status = 'approved',
+             matched_with = CASE WHEN id = ? THEN ? WHEN id = ? THEN ? ELSE matched_with END,
              updated_at = NOW()
-         WHERE id IN ($1, $2)`,
-        [review.id, matchedWithId, review.match_score]
+         WHERE id IN (?, ?)`,
+        [review.id, matchedWithId, matchedWithId, review.id, review.id, matchedWithId]
       );
     } else {
       await client.query(
         `UPDATE lost_found
-         SET status = 'open',
-             matched_with = CASE WHEN id = $1 THEN $2::uuid ELSE $1::uuid END,
-             match_review_status = 'rejected',
-             match_score = NULL,
+         SET status = 'open', match_review_status = 'rejected',
+             matched_with = CASE WHEN id = ? THEN ? ELSE ? END,
              updated_at = NOW()
-         WHERE id IN ($1, $2)`,
-        [review.id, matchedWithId]
+         WHERE id IN (?, ?)`,
+        [review.id, matchedWithId, review.id, review.id, matchedWithId]
       );
     }
 
-    await client.query('COMMIT');
+    await client.commit();
 
     await safeNotify('lost-found review decision', async () => {
-      const lostItem = reviewItems.find((item) => item.type === 'lost');
-      const foundItem = reviewItems.find((item) => item.type === 'found');
+      const lostItem = itemsRes.find(item => item.type === 'lost');
+      const foundItem = itemsRes.find(item => item.type === 'found');
 
       if (decision === 'approve') {
         if (lostItem) {
@@ -588,12 +504,8 @@ router.patch('/review/:id', authenticateToken, requireRole('admin', 'superadmin'
             link: 'page:lostfound',
           });
         }
-        
-        const otherReporters = reviewItems
-          .filter((item) => item.type !== 'lost')
-          .map((item) => item.reporter_id);
-          
-        if (otherReporters.length > 0) {
+        const otherReporters = itemsRes.filter(item => item.type !== 'lost').map(item => item.reporter_id);
+        if (otherReporters.length) {
           await notifyUsers(pool, otherReporters, {
             title: 'Lost & found match approved',
             message: `The reported match involving "${itemLabel(foundItem)}" was approved. Please coordinate with the office.`,
@@ -602,22 +514,18 @@ router.patch('/review/:id', authenticateToken, requireRole('admin', 'superadmin'
           });
         }
       } else {
-        await notifyUsers(
-          pool,
-          reviewItems.map((item) => item.reporter_id),
-          {
-            title: 'Lost & found match rejected',
-            message: `The proposed match involving "${itemLabel(reviewItems[0])}" was not approved after review.`,
-            type: 'lostfound',
-            link: 'page:lostfound',
-          }
-        );
+        await notifyUsers(pool, itemsRes.map(item => item.reporter_id), {
+          title: 'Lost & found match rejected',
+          message: `The proposed match involving "${itemLabel(itemsRes[0])}" was not approved after review.`,
+          type: 'lostfound',
+          link: 'page:lostfound',
+        });
       }
     });
 
     res.json({ message: decision === 'approve' ? 'Match approved' : 'Match rejected' });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('LF review decision error:', err);
     res.status(500).json({ error: 'Failed to update match review' });
   } finally {
@@ -625,42 +533,25 @@ router.patch('/review/:id', authenticateToken, requireRole('admin', 'superadmin'
   }
 });
 
+// ── MATCH ACTION SHORTCUTS ──────────────────────────────────────────────────
 router.post('/match/approve', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   const { lostId, foundId } = req.body;
-  if (!lostId || !foundId) {
-    return res.status(400).json({ error: 'Lost ID and Found ID are required' });
-  }
+  if (!lostId || !foundId) return res.status(400).json({ error: 'Lost ID and Found ID are required' });
 
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
-    await client.query('BEGIN');
+    await client.beginTransaction();
+    const [itemsRes] = await client.query('SELECT * FROM lost_found WHERE id IN (?, ?)', [lostId, foundId]);
+    if (!itemsRes || itemsRes.length !== 2) throw new Error('One or both items not found');
 
-    // 1. Get both items
-    const itemsRes = await client.query('SELECT * FROM lost_found WHERE id IN ($1, $2)', [lostId, foundId]);
-    if (itemsRes.rows.length !== 2) {
-      throw new Error('One or both items not found');
-    }
+    const lostItem = itemsRes.find(r => r.type === 'lost');
+    if (!lostItem) throw new Error('Must match a lost item with a found item');
 
-    const lostItem = itemsRes.rows.find(r => r.type === 'lost');
-    const foundItem = itemsRes.rows.find(r => r.type === 'found');
-
-    if (!lostItem || !foundItem) {
-      throw new Error('Must match a lost item with a found item');
-    }
-
-    // 2. Mark both items as approved match
     await client.query(
-      `UPDATE lost_found 
-       SET updated_at = NOW(), 
-           matched_with = CASE WHEN id = $1 THEN $2 ELSE $1 END,
-           match_review_status = 'approved',
-           status = 'matched'
-       WHERE id IN ($1, $2)`,
-      [lostId, foundId]
+      `UPDATE lost_found SET updated_at = NOW(), matched_with = CASE WHEN id = ? THEN ? ELSE ? END, match_review_status = 'approved', status = 'matched' WHERE id IN (?, ?)`,
+      [lostId, foundId, lostId, lostId, foundId]
     );
 
-    const { notifyUser } = require('../services/notifications');
-    // 3. Notify the lost item reporter
     await notifyUser(pool, lostItem.reporter_id, {
       title: 'Item Found!',
       message: `Great news! Your lost item "${lostItem.item_name}" has been found and is being held at the OSAS office.`,
@@ -668,11 +559,10 @@ router.post('/match/approve', authenticateToken, requireRole('admin', 'superadmi
       link: 'page:lostfound',
     });
 
-    await client.query('COMMIT');
+    await client.commit();
     res.json({ message: 'Match approved and reporter notified' });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Approve match error:', err);
+    try { await client.rollback(); } catch (_) {}
     res.status(500).json({ error: err.message || 'Failed to approve match' });
   } finally {
     client.release();
@@ -681,62 +571,27 @@ router.post('/match/approve', authenticateToken, requireRole('admin', 'superadmi
 
 router.post('/match/claim', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   const { lostId, foundId } = req.body;
-  if (!lostId || !foundId) {
-    return res.status(400).json({ error: 'Lost ID and Found ID are required' });
-  }
-
-  const client = await pool.connect();
+  if (!lostId || !foundId) return res.status(400).json({ error: 'Lost ID and Found ID are required' });
   try {
-    await client.query('BEGIN');
-
-    await client.query(
-      `UPDATE lost_found 
-       SET status = 'claimed', 
-           updated_at = NOW() 
-       WHERE id IN ($1, $2)`,
-      [lostId, foundId]
-    );
-
-    await client.query('COMMIT');
+    await pool.query("UPDATE lost_found SET status = 'claimed', updated_at = NOW() WHERE id IN (?, ?)", [lostId, foundId]);
     res.json({ message: 'Items marked as claimed' });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Claim match error:', err);
     res.status(500).json({ error: 'Failed to claim items' });
-  } finally {
-    client.release();
   }
 });
 
 router.post('/match/unclaim', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   const { lostId, foundId } = req.body;
-  if (!lostId || !foundId) {
-    return res.status(400).json({ error: 'Lost ID and Found ID are required' });
-  }
-
-  const client = await pool.connect();
+  if (!lostId || !foundId) return res.status(400).json({ error: 'Lost ID and Found ID are required' });
   try {
-    await client.query('BEGIN');
-
-    await client.query(
-      `UPDATE lost_found 
-       SET status = 'matched', 
-           updated_at = NOW() 
-       WHERE id IN ($1, $2)`,
-      [lostId, foundId]
-    );
-
-    await client.query('COMMIT');
+    await pool.query("UPDATE lost_found SET status = 'matched', updated_at = NOW() WHERE id IN (?, ?)", [lostId, foundId]);
     res.json({ message: 'Items unmarked as claimed' });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Unclaim match error:', err);
     res.status(500).json({ error: 'Failed to unclaim items' });
-  } finally {
-    client.release();
   }
 });
 
+// ── GET /api/lost-found/:id/matches ─────────────────────────────────────────
 router.get('/:id/matches', authenticateToken, async (req, res) => {
   try {
     const target = await fetchLostFoundItemWithImages(pool, req.params.id);
@@ -754,65 +609,44 @@ router.get('/:id/matches', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to find matches' });
   }
 });
+
+// ── PATCH /api/lost-found/:id ───────────────────────────────────────────────
 router.patch('/:id', authenticateToken, uploadLostFound.array('images', 5), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const { id } = req.params;
     const { item_name, description, category, location_found, type, contact_info, date_lost_found } = req.body;
     if (!item_name || !description || !type || !date_lost_found || !contact_info || !contact_info.trim()) {
-      return res.status(400).json({ error: 'Item name, description, contact information, type, and date lost/found are required' });
+      client.release();
+      return res.status(400).json({ error: 'Item name, description, contact info, type, and date are required' });
     }
 
-    const check = await client.query('SELECT reporter_id FROM lost_found WHERE id = $1', [id]);
-    if (check.rows.length === 0) {
+    const [check] = await client.query('SELECT reporter_id FROM lost_found WHERE id = ?', [id]);
+    if (!check?.length) {
       client.release();
       return res.status(404).json({ error: 'Item not found' });
     }
-    if (check.rows[0].reporter_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+    if (check[0].reporter_id !== req.user.id && !['admin', 'superadmin'].includes(req.user.role)) {
       client.release();
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    await client.query('BEGIN');
-
-    // Reset previous matches for this item
+    await client.beginTransaction();
+    await client.query("UPDATE lost_found SET matched_with = NULL, match_review_status = 'none', match_score = NULL, updated_at = NOW() WHERE matched_with = ?", [id]);
     await client.query(
       `UPDATE lost_found
-       SET matched_with = NULL,
-           match_review_status = 'none',
-           match_score = NULL,
-           updated_at = NOW()
-       WHERE matched_with = $1`,
-      [id]
-    );
-
-    // Update item details
-    const result = await client.query(
-      `UPDATE lost_found
-       SET item_name = $1,
-           description = $2,
-           category = $3,
-           location_found = $4,
-           type = $5,
-           contact_info = $6,
-           date_lost_found = $7,
-           matched_with = NULL,
-           match_review_status = 'none',
-           match_score = NULL,
-           updated_at = NOW()
-       WHERE id = $8
-       RETURNING *`,
+       SET item_name = ?, description = ?, category = ?, location_found = ?, type = ?, contact_info = ?, date_lost_found = ?,
+           matched_with = NULL, match_review_status = 'none', match_score = NULL, updated_at = NOW()
+       WHERE id = ?`,
       [item_name, description, category || null, location_found || null, type, contact_info || null, date_lost_found, id]
     );
 
-    // Handle new images upload replacement
     if (req.files && req.files.length > 0) {
-      await client.query('DELETE FROM lost_found_images WHERE lost_found_id = $1', [id]);
+      await client.query('DELETE FROM lost_found_images WHERE lost_found_id = ?', [id]);
       for (let i = 0; i < Math.min(req.files.length, 5); i++) {
-        const imageUrl = `/uploads/lostfound/${req.files[i].filename}`;
         await client.query(
-          `INSERT INTO lost_found_images (lost_found_id, image_url, display_order) VALUES ($1, $2, $3)`,
-          [id, imageUrl, i]
+          'INSERT INTO lost_found_images (id, lost_found_id, image_url, display_order) VALUES (?, ?, ?, ?)',
+          [uuidv4(), id, `/uploads/lostfound/${req.files[i].filename}`, i]
         );
       }
     }
@@ -823,10 +657,10 @@ router.patch('/:id', authenticateToken, uploadLostFound.array('images', 5), asyn
       await maybeQueueAutoMatch(client, hydratedItem);
     }
 
-    await client.query('COMMIT');
-    res.json(hydratedItem || result.rows[0]);
+    await client.commit();
+    res.json(hydratedItem);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Update lost-found error:', err);
     res.status(500).json({ error: 'Failed to update item' });
   } finally {
@@ -834,32 +668,36 @@ router.patch('/:id', authenticateToken, uploadLostFound.array('images', 5), asyn
   }
 });
 
+// ── DELETE /api/lost-found/:id ──────────────────────────────────────────────
 router.delete('/:id', authenticateToken, async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const { id } = req.params;
-    const check = await client.query('SELECT reporter_id FROM lost_found WHERE id = $1 AND status != \'deleted\'', [id]);
-    if (check.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    if (check.rows[0].reporter_id !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'superadmin') {
+    const [check] = await client.query('SELECT reporter_id, status FROM lost_found WHERE id = ?', [id]);
+    if (!check?.length) {
+      client.release();
+      return res.status(404).json({ error: 'Item not found' });
+    }
+    if (check[0].reporter_id !== req.user.id && !['admin', 'superadmin'].includes(req.user.role)) {
+      client.release();
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    await client.query('BEGIN');
-    await client.query(
-      `UPDATE lost_found
-       SET matched_with = NULL,
-           match_review_status = 'none',
-           match_score = NULL,
-           updated_at = NOW()
-       WHERE matched_with = $1`,
-      [id]
-    );
-    await client.query("UPDATE lost_found SET status = 'deleted', updated_at = NOW() WHERE id = $1", [id]);
-    await client.query('COMMIT');
+    const isPermanent = req.query.permanent === 'true' || check[0].status === 'deleted';
+    await client.beginTransaction();
+    await client.query("UPDATE lost_found SET matched_with = NULL, match_review_status = 'none', match_score = NULL, updated_at = NOW() WHERE matched_with = ?", [id]);
 
-    res.json({ message: 'Item deleted' });
+    if (isPermanent) {
+      await client.query('DELETE FROM lost_found_images WHERE lost_found_id = ?', [id]);
+      await client.query('DELETE FROM lost_found WHERE id = ?', [id]);
+    } else {
+      await client.query("UPDATE lost_found SET status = 'deleted', updated_at = NOW() WHERE id = ?", [id]);
+    }
+
+    await client.commit();
+    res.json({ message: isPermanent ? 'Item permanently deleted' : 'Item deleted' });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Delete lost-found error:', err);
     res.status(500).json({ error: 'Failed to delete item' });
   } finally {
@@ -867,17 +705,16 @@ router.delete('/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// ── PATCH /api/lost-found/:id/approve-guest ─────────────────────────────────
 router.patch('/:id/approve-guest', authenticateToken, requireRole('admin', 'superadmin'), requireLostFound, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await pool.query(
-      `UPDATE lost_found SET approved = true, updated_at = NOW() WHERE id = $1 RETURNING *`,
-      [id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Item not found' });
-    }
-    res.json({ message: 'Guest report approved and is now live.', item: result.rows[0] });
+    const [check] = await pool.query('SELECT * FROM lost_found WHERE id = ?', [id]);
+    if (!check?.length) return res.status(404).json({ error: 'Item not found' });
+
+    await pool.query('UPDATE lost_found SET approved = true, updated_at = NOW() WHERE id = ?', [id]);
+    const [updatedRows] = await pool.query('SELECT * FROM lost_found WHERE id = ?', [id]);
+    res.json({ message: 'Guest report approved and is now live.', item: updatedRows[0] });
   } catch (err) {
     console.error('Approve guest report error:', err);
     res.status(500).json({ error: 'Failed to approve report' });

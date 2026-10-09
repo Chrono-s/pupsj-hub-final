@@ -6,14 +6,15 @@ const { authenticateToken } = require('../middleware/auth');
 // ── Auto-provision: create table + index if they don't exist ──────
 pool.query(`
   CREATE TABLE IF NOT EXISTS notifications (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    message TEXT,
-    type VARCHAR(50) DEFAULT 'general',
-    is_read BOOLEAN DEFAULT FALSE,
-    link VARCHAR(500),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    id          CHAR(36)     PRIMARY KEY,
+    user_id     CHAR(36),
+    title       VARCHAR(255) NOT NULL,
+    message     TEXT,
+    type        VARCHAR(50)  DEFAULT 'general',
+    is_read     TINYINT(1)   DEFAULT 0,
+    link        VARCHAR(500),
+    created_at  DATETIME     DEFAULT NOW(),
+    CONSTRAINT fk_notif_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )
 `).then(() =>
   pool.query(`
@@ -26,18 +27,18 @@ pool.query(`
 
 router.get('/summary', authenticateToken, async (req, res) => {
   try {
-    const [totalResult, typeResult] = await Promise.all([
+    const [[totalResult], [typeRows]] = await Promise.all([
       pool.query(
-        `SELECT COUNT(*)::int AS unread_count
+        `SELECT COUNT(*) AS unread_count
          FROM notifications
-         WHERE user_id = $1
+         WHERE user_id = ?
            AND is_read = FALSE`,
         [req.user.id]
       ),
       pool.query(
-        `SELECT type, COUNT(*)::int AS count
+        `SELECT type, COUNT(*) AS count
          FROM notifications
-         WHERE user_id = $1
+         WHERE user_id = ?
            AND is_read = FALSE
          GROUP BY type`,
         [req.user.id]
@@ -45,12 +46,12 @@ router.get('/summary', authenticateToken, async (req, res) => {
     ]);
 
     const types = {};
-    typeResult.rows.forEach(r => {
-      types[r.type] = r.count;
+    typeRows.forEach(r => {
+      types[r.type] = parseInt(r.count, 10);
     });
 
     res.json({
-      unread_count: totalResult.rows[0]?.unread_count || 0,
+      unread_count: parseInt(totalResult[0]?.unread_count, 10) || 0,
       types: types
     });
   } catch (err) {
@@ -66,27 +67,27 @@ router.get('/', authenticateToken, async (req, res) => {
       ? Math.min(Math.max(parsedLimit, 1), 100)
       : 50;
 
-    const [notificationsResult, unreadResult] = await Promise.all([
+    const [[notificationsRows], [unreadRows]] = await Promise.all([
       pool.query(
         `SELECT id, title, message, type, is_read, link, created_at
          FROM notifications
-         WHERE user_id = $1
+         WHERE user_id = ?
          ORDER BY created_at DESC
-         LIMIT $2`,
+         LIMIT ?`,
         [req.user.id, limit]
       ),
       pool.query(
-        `SELECT COUNT(*)::int AS unread_count
+        `SELECT COUNT(*) AS unread_count
          FROM notifications
-         WHERE user_id = $1
+         WHERE user_id = ?
            AND is_read = FALSE`,
         [req.user.id]
       ),
     ]);
 
     res.json({
-      notifications: notificationsResult.rows,
-      unread_count: unreadResult.rows[0]?.unread_count || 0,
+      notifications: notificationsRows,
+      unread_count: parseInt(unreadRows[0]?.unread_count, 10) || 0,
     });
   } catch (err) {
     console.error('Notifications list error:', err);
@@ -96,18 +97,17 @@ router.get('/', authenticateToken, async (req, res) => {
 
 router.patch('/read-all', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
+    const [result] = await pool.query(
       `UPDATE notifications
        SET is_read = TRUE
-       WHERE user_id = $1
-         AND is_read = FALSE
-       RETURNING id`,
+       WHERE user_id = ?
+         AND is_read = FALSE`,
       [req.user.id]
     );
 
     res.json({
       message: 'Notifications marked as read',
-      updated: result.rowCount,
+      updated: result.affectedRows,
     });
   } catch (err) {
     console.error('Read-all notifications error:', err);
@@ -118,19 +118,18 @@ router.patch('/read-all', authenticateToken, async (req, res) => {
 router.patch('/read-type/:type', authenticateToken, async (req, res) => {
   try {
     const { type } = req.params;
-    const result = await pool.query(
+    const [result] = await pool.query(
       `UPDATE notifications
        SET is_read = TRUE
-       WHERE user_id = $1
-         AND type = $2
-         AND is_read = FALSE
-       RETURNING id`,
+       WHERE user_id = ?
+         AND type = ?
+         AND is_read = FALSE`,
       [req.user.id, type]
     );
 
     res.json({
       message: `Notifications of type ${type} marked as read`,
-      updated: result.rowCount,
+      updated: result.affectedRows,
     });
   } catch (err) {
     console.error('Read-type notifications error:', err);
@@ -140,22 +139,27 @@ router.patch('/read-type/:type', authenticateToken, async (req, res) => {
 
 router.patch('/:id/read', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
+    const [result] = await pool.query(
       `UPDATE notifications
        SET is_read = TRUE
-       WHERE id = $1
-         AND user_id = $2
-         RETURNING id, title, message, type, is_read, link, created_at`,
+       WHERE id = ?
+         AND user_id = ?`,
       [req.params.id, req.user.id]
     );
 
-    if (!result.rows.length) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Notification not found' });
     }
 
+    const [fetchRows] = await pool.query(
+      `SELECT id, title, message, type, is_read, link, created_at
+       FROM notifications WHERE id = ?`,
+      [req.params.id]
+    );
+
     res.json({
       message: 'Notification updated',
-      notification: result.rows[0],
+      notification: fetchRows[0],
     });
   } catch (err) {
     console.error('Read notification error:', err);

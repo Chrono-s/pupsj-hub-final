@@ -3,9 +3,10 @@
  * Uses Nodemailer with Gmail SMTP, or logs emails locally in development.
  */
 
+require('dotenv').config();
 const nodemailer = require('nodemailer');
 
-const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+const APP_URL = (process.env.APP_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const FROM = process.env.EMAIL_FROM || 'PUPSJ HUB <noreply@pupsj.edu.ph>';
 const EMAIL_HOST = process.env.EMAIL_HOST || 'smtp.gmail.com';
 const EMAIL_PORT = parseInt(process.env.EMAIL_PORT || '587', 10);
@@ -47,7 +48,7 @@ if (devMode) {
   });
 }
 
-async function sendMail({ to, subject, html, text }) {
+async function sendMail({ to, subject, html, text, headers = {} }) {
   if (devMode) {
     console.log('\n========================================');
     console.log(`[Email DEV] TO: ${to}`);
@@ -61,8 +62,23 @@ async function sendMail({ to, subject, html, text }) {
     throw new Error('Email delivery is not configured. Set EMAIL_USER and EMAIL_PASS in the environment.');
   }
 
+  // Explicitly disable link wrapping/tracking proxy headers used by Brevo (Sendinblue) and other relays
+  const defaultHeaders = {
+    'X-Mailin-Track': '0',
+    'X-Sib-Track': '0',
+    'X-Mailin-Tag': 'transactional',
+    'X-Auto-Response-Suppress': 'All',
+  };
+
   try {
-    const info = await transporter.sendMail({ from: FROM, to, subject, html, text });
+    const info = await transporter.sendMail({
+      from: FROM,
+      to,
+      subject,
+      html,
+      text,
+      headers: { ...defaultHeaders, ...headers }
+    });
     console.log(`[Email] Sent to ${to}: ${info.messageId}`);
     return { success: true, messageId: info.messageId };
   } catch (error) {
@@ -79,18 +95,21 @@ function baseLayout(body) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-      body { margin:0; padding:0; background:#f5f0eb; font-family:'Segoe UI',Arial,sans-serif; }
+      body { margin:0; padding:0; background:#f5f0eb; font-family:'Segoe UI',Arial,sans-serif; -webkit-font-smoothing:antialiased; }
       .wrap { max-width:560px; margin:40px auto; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,0.08); }
       .hdr  { background:#800000; padding:28px 32px; text-align:center; }
       .hdr h1 { color:#fff; margin:0; font-size:22px; font-weight:800; letter-spacing:-0.5px; }
-      .hdr p  { color:rgba(255,255,255,0.7); margin:4px 0 0; font-size:13px; }
+      .hdr p  { color:rgba(255,255,255,0.75); margin:4px 0 0; font-size:13px; }
       .body { padding:32px; color:#1a1a1a; line-height:1.6; }
       .body p { margin:0 0 16px; font-size:15px; }
       .btn-wrap { text-align:center; margin:28px 0; }
-      .btn { display:inline-block; background:#800000; color:#fff !important; text-decoration:none;
+      .btn { display:inline-block; background:#800000; color:#ffffff !important; text-decoration:none;
              padding:13px 32px; border-radius:8px; font-weight:700; font-size:15px;
              letter-spacing:0.2px; }
-      .fallback { font-size:12px; color:#888; word-break:break-all; margin-top:12px; }
+      .code-box { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:16px; margin:20px 0; text-align:center; }
+      .code-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; color:#64748b; margin-bottom:8px; }
+      .code-val { font-family:Consolas,Monaco,'Courier New',monospace; font-size:15px; font-weight:700; color:#800000; word-break:break-all; background:#ffffff; border:1px dashed #cbd5e1; border-radius:6px; padding:8px 12px; display:inline-block; }
+      .fallback { font-size:12px; color:#888; word-break:break-all; margin-top:16px; }
       .ftr { background:#f5f0eb; padding:18px 32px; text-align:center; font-size:12px; color:#999; }
     </style>
   </head>
@@ -110,37 +129,57 @@ function baseLayout(body) {
 }
 
 async function sendVerificationEmail(toEmail, firstName, token) {
-  const link = `${APP_URL}/?verify=${token}`;
+  const cleanToken = encodeURIComponent(String(token).trim());
+  const link = `${APP_URL}/?verify=${cleanToken}&email=${encodeURIComponent(toEmail)}`;
   await sendMail({
     to: toEmail,
-    subject: 'Verify your PUPSJ HUB account',
-    text: `Hello ${firstName},\n\nPlease verify your email by visiting:\n${link}\n\nThis link expires in 24 hours.\n\nIf you did not register, ignore this email.`,
+    subject: `Your PUPSJ HUB Verification Code is ${token}`,
+    text: `Hello ${firstName},\n\nWelcome to PUPSJ HUB!\n\nYour 6-digit verification code is: ${token}\n\nEnter this code in PUPSJ HUB to activate your account.\n\nAlternatively, click or paste this link into your browser:\n${link}\n\nThis verification code expires in 24 hours.\n\nIf you did not register for an account, please ignore this email.`,
     html: baseLayout(`
       <p>Hi <strong>${firstName}</strong>,</p>
-      <p>Welcome to <strong>PUPSJ HUB</strong>! Please verify your email address to activate your account.</p>
-      <div class="btn-wrap">
-        <a class="btn" href="${link}">Verify Email Address</a>
+      <p>Welcome to <strong>PUPSJ HUB</strong>! Use the 6-digit verification code below to activate your account and access campus services:</p>
+      
+      <div style="background:#fff5f5; border:2px dashed #800000; border-radius:12px; padding:24px 16px; margin:24px 0; text-align:center;">
+        <div style="font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:1.5px; color:#800000; margin-bottom:8px;">Your 6-Digit Verification Code</div>
+        <div style="font-family:Consolas, Monaco, 'Courier New', monospace; font-size:36px; font-weight:900; letter-spacing:10px; color:#800000; padding:6px 0;">${token}</div>
+        <div style="font-size:13px; color:#64748b; margin-top:8px;">Enter this code on the PUPSJ HUB verification screen.</div>
       </div>
-      <p class="fallback">Can't click the button? Copy and paste this link into your browser:<br>${link}</p>
-      <p>This link expires in <strong>24 hours</strong>. If you did not create an account, you can safely ignore this email.</p>
+
+      <div class="btn-wrap">
+        <a class="btn" href="${link}" target="_blank" rel="noopener noreferrer">Verify Account Online</a>
+      </div>
+
+      <p class="fallback">
+        Can't click the button? Copy and paste this link into your browser:<br>
+        <a href="${link}" style="color:#800000; word-break:break-all;">${link}</a>
+      </p>
+      <p style="font-size:12px; color:#64748b; margin-top:20px;">This code expires in <strong>24 hours</strong>. If you did not create an account, you can safely ignore this email.</p>
     `),
   });
 }
 
 async function sendPasswordResetEmail(toEmail, firstName, token) {
-  const link = `${APP_URL}/?reset=${token}`;
+  const cleanToken = encodeURIComponent(String(token).trim());
+  const link = `${APP_URL}/?reset=${cleanToken}`;
   await sendMail({
     to: toEmail,
     subject: 'Reset your PUPSJ HUB password',
-    text: `Hello ${firstName},\n\nReset your password by visiting:\n${link}\n\nThis link expires in 1 hour.\n\nIf you did not request a reset, ignore this email.`,
+    text: `Hello ${firstName},\n\nWe received a request to reset your PUPSJ HUB password.\n\nReset Link:\n${link}\n\nPassword Reset Token:\n${token}\n\nThis link expires in 1 hour.\n\nIf you did not request a password reset, please ignore this email.`,
     html: baseLayout(`
       <p>Hi <strong>${firstName}</strong>,</p>
       <p>We received a request to reset your <strong>PUPSJ HUB</strong> password. Click the button below to set a new password.</p>
       <div class="btn-wrap">
-        <a class="btn" href="${link}">Reset Password</a>
+        <a class="btn" href="${link}" target="_blank" rel="noopener noreferrer">Reset Password</a>
       </div>
-      <p class="fallback">Can't click the button? Copy and paste this link into your browser:<br>${link}</p>
-      <p>This link expires in <strong>1 hour</strong>. If you did not request a password reset, you can safely ignore this email.</p>
+      <div class="code-box">
+        <div class="code-title">Password Reset Token</div>
+        <div class="code-val">${token}</div>
+      </div>
+      <p class="fallback">
+        Can't click the button? Copy and paste this link into your browser:<br>
+        <a href="${link}" style="color:#800000; word-break:break-all;">${link}</a>
+      </p>
+      <p style="font-size:12px; color:#64748b; margin-top:20px;">This link expires in <strong>1 hour</strong>. If you did not request a password reset, you can safely ignore this email.</p>
     `),
   });
 }

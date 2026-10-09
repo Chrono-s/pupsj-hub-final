@@ -26,6 +26,14 @@ const BLACKLISTED_IPS = new Set(
     .filter(Boolean)
 );
 
+// ─── Trusted / whitelisted IPs (bypass all firewall checks) ─
+const ALLOWED_IPS = new Set(
+  (process.env.ALLOWED_IPS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
 // ─── Suspicious paths that scanners/bots probe ─────────────
 const BLOCKED_PATHS = [
   /\/\.env/i,
@@ -81,8 +89,14 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+function isLocalIP(ip) {
+  return !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost' || ip === '::' || ip.startsWith('127.') || ip.startsWith('::ffff:127.');
+}
+
 // ─── Track errors for auto-ban ──────────────────────────────
 function trackError(ip) {
+  if (isLocalIP(ip)) return;
+
   const now = Date.now();
   const entry = errorCounts.get(ip);
 
@@ -102,6 +116,16 @@ function trackError(ip) {
 // ─── Main firewall middleware ───────────────────────────────
 function firewall(req, res, next) {
   const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+
+  // Always allow loopback / localhost (never auto-ban local development or server)
+  if (isLocalIP(ip)) {
+    return next();
+  }
+
+  // 0. Check whitelist — trusted IPs bypass ALL firewall rules
+  if (ALLOWED_IPS.has(ip)) {
+    return next();
+  }
 
   // 1. Check manual blacklist
   if (BLACKLISTED_IPS.has(ip)) {
@@ -137,10 +161,11 @@ function firewall(req, res, next) {
     }
   }
 
-  // 5. Track 4xx/5xx responses for auto-ban
+  // 5. Track attack responses for auto-ban (403 forbidden attacks, 429 rate abuse, and 5xx server crashes)
+  // Do NOT track normal 401 (unauthenticated/expired session) or 404 (missing resource)
   const originalEnd = res.end;
   res.end = function (...args) {
-    if (res.statusCode >= 400) {
+    if (res.statusCode === 403 || res.statusCode === 429 || res.statusCode >= 500) {
       trackError(ip);
     }
     originalEnd.apply(res, args);
@@ -155,6 +180,7 @@ function getFirewallStats() {
     bannedIPs: bannedIPs.size,
     trackedIPs: errorCounts.size,
     blacklistedIPs: BLACKLISTED_IPS.size,
+    whitelistedIPs: ALLOWED_IPS.size,
     bans: Array.from(bannedIPs.entries()).map(([ip, until]) => ({
       ip,
       remainingSeconds: Math.max(0, Math.round((until - Date.now()) / 1000))

@@ -1,28 +1,22 @@
 const pool = require('../src/config/database');
 
 async function runMigration() {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
-    console.log('🔄 Starting database migration for guest accounts...');
-    await client.query('BEGIN');
+    console.log('🔄 Checking database schema for guest accounts and lost_found...');
+    await client.beginTransaction();
 
-    // 1. Drop existing role constraint on users table
-    console.log('🔄 Dropping users_role_check constraint...');
-    await client.query('ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check');
+    // Ensure role column on users allows guest
+    await client.query("ALTER TABLE users MODIFY COLUMN role ENUM('student', 'faculty', 'admin', 'superadmin', 'guest') NOT NULL DEFAULT 'student'").catch(() => {});
 
-    // 2. Add new role constraint on users table to allow 'guest' role
-    console.log('🔄 Adding updated users_role_check constraint...');
-    await client.query("ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('student', 'faculty', 'admin', 'guest'))");
+    // Ensure approved column exists on lost_found
+    await client.query('ALTER TABLE lost_found ADD COLUMN approved BOOLEAN DEFAULT TRUE').catch(() => {});
 
-    // 3. Add approved column to lost_found table
-    console.log('🔄 Adding approved column to lost_found table...');
-    await client.query('ALTER TABLE lost_found ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT TRUE');
-
-    await client.query('COMMIT');
-    console.log('✅ Database migration completed successfully.');
+    await client.commit();
+    console.log('✅ Migration check completed successfully.');
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await client.rollback();
     } catch (_) {}
     console.error('❌ Migration failed:', err);
     process.exit(1);

@@ -1,20 +1,20 @@
 const pool = require('../src/config/database');
 
 async function runMigration() {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     console.log('🔄 Starting database migration for system settings...');
-    await client.query('BEGIN');
+    await client.beginTransaction();
 
     // 1. Create system_settings table
     console.log('🔄 Creating system_settings table...');
     await client.query(`
       CREATE TABLE IF NOT EXISTS system_settings (
-        key VARCHAR(255) PRIMARY KEY,
-        value TEXT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      )
+        \`key\` VARCHAR(255) PRIMARY KEY,
+        \`value\` TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
 
     // 2. Seed default values
@@ -30,17 +30,16 @@ async function runMigration() {
 
     for (const [key, val] of defaultSettings) {
       await client.query(`
-        INSERT INTO system_settings (key, value)
-        VALUES ($1, $2)
-        ON CONFLICT (key) DO NOTHING
+        INSERT IGNORE INTO system_settings (\`key\`, \`value\`)
+        VALUES (?, ?)
       `, [key, val]);
     }
 
-    await client.query('COMMIT');
+    await client.commit();
     console.log('✅ Database migration completed successfully.');
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await client.rollback();
     } catch (_) {}
     console.error('❌ Migration failed:', err);
     process.exit(1);

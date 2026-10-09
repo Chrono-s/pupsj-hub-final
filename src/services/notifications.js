@@ -1,3 +1,5 @@
+const { v4: uuidv4 } = require('uuid');
+
 const GLOBAL_SCOPES = new Set(['GENERAL', 'CAMPUS']);
 
 function uniqueIds(userIds) {
@@ -18,55 +20,59 @@ async function createNotifications(db, userIds, payload) {
   const ids = uniqueIds(userIds);
   if (!ids.length || !payload?.title) return 0;
 
+  const values = ids.map((id) => [
+    uuidv4(),
+    id,
+    payload.title,
+    payload.message || null,
+    payload.type || 'general',
+    payload.link || null,
+  ]);
+
+  const placeholders = values.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+  const flatParams = values.flat();
+
   await db.query(
-    `INSERT INTO notifications (user_id, title, message, type, link)
-     SELECT user_id, $2, $3, $4, $5
-     FROM unnest($1::uuid[]) AS user_id`,
-    [
-      ids,
-      payload.title,
-      payload.message || null,
-      payload.type || 'general',
-      payload.link || null,
-    ]
+    `INSERT INTO notifications (id, user_id, title, message, type, link) VALUES ${placeholders}`,
+    flatParams
   );
 
   return ids.length;
 }
 
 async function getAdminUserIds(db) {
-  const result = await db.query(
+  const [rows] = await db.query(
     `SELECT id
      FROM users
      WHERE role IN ('admin', 'superadmin')
        AND is_active = TRUE`
   );
-  return result.rows.map((row) => row.id);
+  return (rows || []).map((row) => row.id);
 }
 
 async function getAudienceUserIds(db, department) {
   const scope = normalizeDepartment(department);
 
   if (GLOBAL_SCOPES.has(scope.toUpperCase())) {
-    const result = await db.query(
+    const [rows] = await db.query(
       `SELECT id
        FROM users
        WHERE is_active = TRUE`
     );
-    return result.rows.map((row) => row.id);
+    return (rows || []).map((row) => row.id);
   }
 
-  const result = await db.query(
+  const [rows] = await db.query(
     `SELECT id
      FROM users
      WHERE is_active = TRUE
        AND (
          role IN ('admin', 'faculty')
-         OR department = $1
+         OR department = ?
        )`,
     [scope]
   );
-  return result.rows.map((row) => row.id);
+  return (rows || []).map((row) => row.id);
 }
 
 async function notifyUser(db, userId, payload) {

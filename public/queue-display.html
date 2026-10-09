@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Queue Display · PUPSJ CIAS</title>
+  <link rel="stylesheet" href="/vendor/fontawesome/css/all.min.css">
+  <style>
+    :root {
+      --maroon: #880808;
+      --maroon-dark: #620404;
+      --maroon-deep: #460202;
+      --maroon-light: #fff3f3;
+      --gold: #f59e0b;
+      --gold-light: #fef3c7;
+      --gold-dark: #b45309;
+      --bg: #f8fafc;
+      --card-bg: #ffffff;
+      --border: #e2e8f0;
+      --border-light: #edf2f7;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --text-light: #94a3b8;
+      --blue: #2563eb;
+      --blue-light: #eff6ff;
+      --shadow-md: 0 10px 25px -3px rgba(136, 8, 8, 0.07), 0 4px 12px -2px rgba(15, 23, 42, 0.04);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text-main);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── Top Header ────────────────────────────────────────── */
+    .top-header {
+      background: linear-gradient(135deg, var(--maroon-deep) 0%, var(--maroon) 55%, #a61212 100%);
+      color: #fff;
+      padding: 24px clamp(20px, 5vw, 64px);
+      box-shadow: 0 4px 20px rgba(70, 2, 2, 0.25);
+    }
+    .header-content {
+      max-width: 1700px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 20px;
+    }
+    .header-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #ffd4d4;
+    }
+    .live-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.35);
+      animation: pulse-dot 2s infinite;
+    }
+    @keyframes pulse-dot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.25); opacity: 0.8; }
+    }
+    .header-title {
+      font-size: clamp(26px, 3.8vw, 48px);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin: 3px 0;
+    }
+    .header-meta {
+      font-size: 14px;
+      color: #ffe6e6;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .header-clock {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight: 600;
+      background: rgba(0, 0, 0, 0.22);
+      padding: 4px 10px;
+      border-radius: 6px;
+    }
+    .btn-header {
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      transition: all 0.2s;
+    }
+    .btn-header:hover {
+      background: rgba(255, 255, 255, 0.25);
+    }
+
+    /* ── Main Layout ───────────────────────────────────────── */
+    main {
+      max-width: 1700px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 36px clamp(20px, 4vw, 64px) 50px;
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(400px, 1fr) minmax(500px, 1.45fr);
+      gap: 28px;
+      align-items: stretch;
+    }
+
+    .monitor-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      box-shadow: var(--shadow-md);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Left: Now Serving ─────────────────────────────────── */
+    .card-serving {
+      border-top: 7px solid var(--maroon);
+      padding: 40px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 520px;
+      text-align: center;
+    }
+    .serving-kicker {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .serving-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--maroon);
+      background: var(--maroon-light);
+      border: 1px solid rgba(136, 8, 8, 0.15);
+      padding: 7px 16px;
+      border-radius: 999px;
+    }
+    .serving-tags {
+      display: flex;
+      gap: 8px;
+    }
+    .source-tag {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 5px 12px;
+      border-radius: 999px;
+    }
+    .source-tag.appointment { background: var(--blue-light); color: var(--blue); border: 1px solid #bfdbfe; }
+    .source-tag.walk_in { background: #fff7ed; color: #ea580c; border: 1px solid #fed7aa; }
+    .priority-tag {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      padding: 5px 12px;
+      border-radius: 999px;
+      background: var(--gold-light);
+      color: var(--gold-dark);
+      border: 1px solid #fde68a;
+    }
+
+    .serving-main {
+      margin: 40px 0;
+    }
+    .ticket-prefix {
+      font-size: clamp(20px, 2.2vw, 30px);
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+    .ticket-number {
+      font-size: clamp(90px, 12vw, 190px);
+      font-weight: 900;
+      line-height: 0.9;
+      letter-spacing: -0.03em;
+      color: var(--maroon);
+      text-shadow: 0 6px 24px rgba(136, 8, 8, 0.14);
+    }
+    .ticket-empty {
+      color: var(--text-light);
+      font-size: clamp(70px, 9vw, 130px);
+    }
+    .serving-purpose {
+      margin-top: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px 24px;
+      background: #f1f5f9;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-main);
+      max-width: 90%;
+    }
+    .serving-purpose i { color: var(--maroon); }
+
+    .serving-footer {
+      border-top: 1px solid var(--border-light);
+      padding-top: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* ── Right: Up Next Card ───────────────────────────────── */
+    .card-up-next {
+      padding: 28px 32px 32px;
+      display: flex;
+      flex-direction: column;
+    }
+    .up-next-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border-light);
+    }
+    .up-next-title-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .up-next-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      background: var(--maroon-light);
+      color: var(--maroon);
+      display: grid;
+      place-items: center;
+      font-size: 18px;
+    }
+    .up-next-title {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text-main);
+    }
+    .up-next-subtitle {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    /* ── Side-by-Side Columns ──────────────────────────────── */
+    .side-by-side-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 20px;
+      flex: 1;
+    }
+    .queue-col {
+      background: #fafbfc;
+      border: 1px solid var(--border-light);
+      border-radius: 16px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+    }
+    .queue-col-scheduled { border-top: 4px solid var(--blue); }
+    .queue-col-walkin { border-top: 4px solid #f97316; }
+
+    .col-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 14px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .col-title {
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .queue-col-scheduled .col-title { color: #1e40af; }
+    .queue-col-walkin .col-title { color: #c2410c; }
+
+    .col-count-pill {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 999px;
+    }
+    .queue-col-scheduled .col-count-pill { background: var(--blue-light); color: var(--blue); }
+    .queue-col-walkin .col-count-pill { background: #fff7ed; color: #ea580c; }
+
+    .queue-items-list {
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      flex: 1;
+      overflow-y: auto;
+      max-height: 480px;
+      padding-right: 4px;
+    }
+    .queue-items-list::-webkit-scrollbar { width: 5px; }
+    .queue-items-list::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 99px; }
+
+    .ticket-card-row {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 13px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .ticket-card-row.is-priority {
+      background: linear-gradient(135deg, #fffbeb 0%, #fff 100%);
+      border-color: #fde68a;
+    }
+    .row-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .row-position {
+      width: 28px;
+      height: 28px;
+      flex: 0 0 28px;
+      border-radius: 50%;
+      background: #f1f5f9;
+      color: var(--text-muted);
+      display: grid;
+      place-items: center;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .ticket-card-row.is-priority .row-position {
+      background: var(--gold-light);
+      color: var(--gold-dark);
+    }
+    .row-number {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text-main);
+    }
+    .row-purpose {
+      font-size: 12px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 220px;
+    }
+
+    .empty-queue-box {
+      margin: auto 0;
+      padding: 44px 20px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+    .empty-queue-box i {
+      font-size: 32px;
+      color: var(--text-light);
+      margin-bottom: 12px;
+      display: block;
+    }
+    .empty-queue-box p { font-size: 14px; line-height: 1.45; }
+
+    .bottom-footer {
+      text-align: center;
+      padding: 16px;
+      font-size: 12px;
+      color: var(--text-light);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+      .side-by-side-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <header class="top-header">
+    <div class="header-content">
+      <div>
+        <div class="header-eyebrow">
+          <span class="live-dot"></span>
+          PUPSJ CIAS · Live Queue Display
+        </div>
+        <h1 class="header-title" id="office">Office Queue</h1>
+        <div class="header-meta">
+          <span class="header-clock" id="clock">00:00:00</span>
+          <span>·</span>
+          <span id="dateDisplay">Today</span>
+        </div>
+      </div>
+      <div>
+        <button id="fullscreen" class="btn-header" type="button">
+          <i class="fas fa-expand"></i>
+          <span>Full screen</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left: Now Calling / Serving Card -->
+    <section class="monitor-card card-serving">
+      <div class="serving-kicker">
+        <div class="serving-badge" id="servingBadge">
+          <i class="fas fa-bullhorn" id="servingBadgeIcon"></i>
+          <span id="servingBadgeText">Now Calling</span>
+        </div>
+        <div class="serving-tags" id="servingTags"></div>
+      </div>
+
+      <div class="serving-main">
+        <div class="ticket-prefix" id="prefix">—</div>
+        <div class="ticket-number" id="now">—</div>
+      </div>
+
+      <div class="serving-footer">
+        <span id="servingStatusText"></span>
+        <span id="ticketCountSummary">0 in queue</span>
+      </div>
+    </section>
+
+    <!-- Right: Up Next Card with Side-by-Side Appointments and Walk-in -->
+    <aside class="monitor-card card-up-next">
+      <div class="up-next-header">
+        <div class="up-next-title-group">
+          <div class="up-next-icon">
+            <i class="fas fa-users-viewfinder"></i>
+          </div>
+          <div>
+            <h2 class="up-next-title">Up Next in Queue</h2>
+            <p class="up-next-subtitle">Please proceed when your number is called</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="side-by-side-grid">
+        <!-- Appointments Column -->
+        <div class="queue-col queue-col-scheduled">
+          <div class="col-header">
+            <div class="col-title">
+              <i class="fas fa-calendar-check"></i>
+              Appointments
+            </div>
+            <span class="col-count-pill" id="schedPill">0 waiting</span>
+          </div>
+          <div class="queue-items-list" id="scheduledList">
+            <div class="empty-queue-box">
+              <i class="far fa-calendar"></i>
+              <p>No scheduled appointments<br>in queue right now</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Walk-in Column -->
+        <div class="queue-col queue-col-walkin">
+          <div class="col-header">
+            <div class="col-title">
+              <i class="fas fa-person-walking"></i>
+              Walk-in
+            </div>
+            <span class="col-count-pill" id="walkinPill">0 waiting</span>
+          </div>
+          <div class="queue-items-list" id="walkInList">
+            <div class="empty-queue-box">
+              <i class="fas fa-ticket-simple"></i>
+              <p>No walk-in tickets<br>waiting right now</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="bottom-footer">
+    <i class="fas fa-rotate"></i> Updates automatically in real time
+  </footer>
+
+  <script>
+    const code = location.pathname.split('/').pop();
+    let data = null;
+    let lastServingNumber = null;
+
+    function updateClock() {
+      const now = new Date();
+      document.getElementById('clock').textContent = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+      document.getElementById('dateDisplay').textContent = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    function playChime() {
+      try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+        const playTone = (freq, start, duration) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, start);
+          gain.gain.setValueAtTime(0, start);
+          gain.gain.linearRampToValueAtTime(0.25, start + 0.04);
+          gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(start);
+          osc.stop(start + duration);
+        };
+        const now = ctx.currentTime;
+        playTone(1046.5, now, 0.45);
+        playTone(783.99, now + 0.18, 0.65);
+      } catch (_) {}
+    }
+
+    const splitTicket = value => {
+      const raw = String(value || '').trim();
+      const parts = raw.split('-');
+      if (parts.length > 1) {
+        let prefix = parts.slice(0, -1).join('-');
+        prefix = prefix.replace(/^OFFICEOFSTUD/i, 'OSA').replace(/^REGISTRAR/i, 'REG');
+        return { prefix, number: parts[parts.length - 1] };
+      }
+      return { prefix: 'Ticket', number: raw || '—' };
+    };
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = value ?? '';
+      return div.innerHTML;
+    }
+
+    function render() {
+      if (!data) return;
+      document.getElementById('office').textContent = (data.office?.name || 'Office') + ' Queue';
+
+      const nowServing = data.now_serving;
+      const prefixEl = document.getElementById('prefix');
+      const nowEl = document.getElementById('now');
+      const serviceWrapper = document.getElementById('serviceWrapper');
+      const serviceEl = document.getElementById('service');
+      const tagsEl = document.getElementById('servingTags');
+      const statusTextEl = document.getElementById('servingStatusText');
+      const badgeIconEl = document.getElementById('servingBadgeIcon');
+      const badgeTextEl = document.getElementById('servingBadgeText');
+
+      if (nowServing && nowServing.ticket_number) {
+        const split = splitTicket(nowServing.ticket_number);
+        prefixEl.textContent = split.prefix;
+        nowEl.textContent = split.number;
+        nowEl.classList.remove('ticket-empty');
+
+        const isServing = nowServing.status === 'serving';
+        if (badgeIconEl && badgeTextEl) {
+          badgeIconEl.className = isServing ? 'fas fa-user-check' : 'fas fa-bullhorn';
+          badgeTextEl.textContent = isServing ? 'Now Serving' : 'Now Calling';
+        }
+
+        let tagsHtml = '';
+        if (nowServing.source === 'appointment') {
+          tagsHtml += `<span class="source-tag appointment"><i class="fas fa-calendar-check"></i> Appointment</span>`;
+        } else {
+          tagsHtml += `<span class="source-tag walk_in"><i class="fas fa-person-walking"></i> Walk-in</span>`;
+        }
+        if (nowServing.is_priority) {
+          tagsHtml += `<span class="priority-tag"><i class="fas fa-star"></i> Priority${nowServing.priority_type ? ' · ' + escapeHtml(nowServing.priority_type) : ''}</span>`;
+        }
+        tagsEl.innerHTML = tagsHtml;
+
+        statusTextEl.innerHTML = isServing
+          ? `<i class="fas fa-user-check" style="color:#16a34a;margin-right:4px;"></i> Transaction in progress at the office counter`
+          : `<i class="fas fa-bullhorn" style="color:var(--maroon);margin-right:4px;"></i> Ticket called · Please proceed to the office counter`;
+
+        if (lastServingNumber !== nowServing.ticket_number) {
+          playChime();
+          lastServingNumber = nowServing.ticket_number;
+        }
+      } else {
+        if (badgeIconEl && badgeTextEl) {
+          badgeIconEl.className = 'fas fa-circle-check';
+          badgeTextEl.textContent = 'Counter Available';
+        }
+        prefixEl.textContent = 'Office Counter';
+        nowEl.textContent = '—';
+        nowEl.classList.add('ticket-empty');
+        tagsEl.innerHTML = '';
+        statusTextEl.innerHTML = '';
+      }
+
+      const schedItems = data.scheduled || [];
+      const walkItems = data.walk_ins || [];
+      const schedCount = data.scheduled_count ?? schedItems.length;
+      const walkCount = data.walk_ins_count ?? walkItems.length;
+
+      document.getElementById('schedPill').textContent = `${schedCount} waiting`;
+      document.getElementById('walkinPill').textContent = `${walkCount} waiting`;
+      document.getElementById('ticketCountSummary').textContent = `${schedCount + walkCount} in queue`;
+
+      const renderList = (items, isFull, emptyText, emptyIcon) => {
+        if (isFull) return `<div class="empty-queue-box"><i class="fas fa-ban" style="color:#ef4444;"></i><p>Limit reached for today</p></div>`;
+        if (!items.length) return `<div class="empty-queue-box"><i class="${emptyIcon}"></i><p>${emptyText}</p></div>`;
+        return items.map((item, index) => {
+          const split = splitTicket(item.ticket_number);
+          return `
+            <div class="ticket-card-row ${item.is_priority ? 'is-priority' : ''}">
+              <div class="row-left">
+                <span class="row-position">#${index + 1}</span>
+                <div>
+                  <div class="row-number">${escapeHtml(split.number)}</div>
+                </div>
+              </div>
+              <div>
+                ${item.is_priority ? `<span class="priority-tag"><i class="fas fa-star"></i> Priority${item.priority_type ? ' · ' + escapeHtml(item.priority_type) : ''}</span>` : ''}
+              </div>
+            </div>
+          `;
+        }).join('');
+      };
+
+      document.getElementById('scheduledList').innerHTML = renderList(schedItems, data.scheduled_full, 'No scheduled appointments<br>in queue right now', 'far fa-calendar');
+      document.getElementById('walkInList').innerHTML = renderList(walkItems, data.walk_ins_full, 'No walk-in tickets<br>waiting right now', 'fas fa-ticket-simple');
+    }
+
+    async function load() {
+      try {
+        const response = await fetch('/api/queueing/display/' + encodeURIComponent(code));
+        if (!response.ok) return;
+        data = await response.json();
+        render();
+      } catch (_) {}
+    }
+
+    const fullscreenBtn = document.getElementById('fullscreen');
+    fullscreenBtn.onclick = async () => {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    };
+    document.addEventListener('fullscreenchange', () => {
+      fullscreenBtn.innerHTML = document.fullscreenElement
+        ? '<i class="fas fa-compress"></i><span>Exit Full</span>'
+        : '<i class="fas fa-expand"></i><span>Full screen</span>';
+    });
+
+    load();
+    const eventSource = new EventSource('/api/queueing/stream/' + encodeURIComponent(code));
+    eventSource.addEventListener('queue-update', load);
+  </script>
+</body>
+</html>

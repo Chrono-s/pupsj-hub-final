@@ -6,13 +6,13 @@ const { authenticateToken } = require('../middleware/auth');
 // List all active faculty users
 router.get('/list', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
+    const [rows] = await pool.query(
       `SELECT id, first_name, last_name, department
        FROM users
        WHERE role = 'faculty' AND is_active = TRUE AND is_verified = TRUE
        ORDER BY last_name ASC, first_name ASC`
     );
-    res.json(result.rows);
+    res.json(rows);
   } catch (err) {
     console.error('Faculty list error:', err);
     res.status(500).json({ error: 'Failed to fetch faculty list' });
@@ -25,7 +25,7 @@ router.get('/list', authenticateToken, async (req, res) => {
 // back to 'unavailable' for display purposes.
 router.get('/locations', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const [rows] = await pool.query(`
       SELECT
         u.id AS faculty_id,
         u.first_name,
@@ -66,11 +66,14 @@ router.get('/locations', authenticateToken, async (req, res) => {
         u.last_name ASC, u.first_name ASC
     `);
 
-    const timeResult = await pool.query(`SELECT (NOW() AT TIME ZONE 'Asia/Manila')::text AS now_manila`);
+    // MySQL equivalent of (NOW() AT TIME ZONE 'Asia/Manila') — use CONVERT_TZ
+    const [timeRows] = await pool.query(
+      `SELECT CAST(CONVERT_TZ(NOW(), '+00:00', '+08:00') AS CHAR) AS now_manila`
+    );
 
     res.json({
-      locations: result.rows,
-      server_time: timeResult.rows[0].now_manila,
+      locations: rows,
+      server_time: timeRows[0].now_manila,
     });
   } catch (err) {
     console.error('Faculty locations error:', err);

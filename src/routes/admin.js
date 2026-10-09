@@ -1,9 +1,13 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/database');
 const { authenticateToken, requireRole, ALL_MODULES } = require('../middleware/auth');
-const { uploadCsv } = require('../middleware/upload');
+const { uploadCsv, uploadSystem } = require('../middleware/upload');
 const { getFirewallStats } = require('../middleware/firewall');
+const { sendPasswordResetEmail, sendWelcomeAdminEmail } = require('../services/email');
 
 const VALID_DEPARTMENTS = ['BSIT', 'DIT', 'BSENTREP', 'BSPSYCH', 'BSEDUC', 'BSHM', 'BSFM'];
 const STUDENT_ID_REGEX = /^\d{4}-\d{5}-SJ-\d$/;
@@ -32,30 +36,32 @@ async function releaseStaleAllowedRegistrations(db) {
 }
 
 async function purgeUserOwnedContent(db, userId) {
-  // Remove references from other lost/found rows before deleting the owner's rows.
   await db.query(
     `UPDATE lost_found
      SET matched_with = NULL, updated_at = NOW()
-     WHERE matched_with IN (SELECT id FROM lost_found WHERE reporter_id = $1)`,
+     WHERE matched_with IN (SELECT id FROM lost_found WHERE reporter_id = ?)`,
     [userId]
   );
-
-  await db.query("UPDATE announcements SET status = 'deleted', updated_at = NOW() WHERE author_id = $1", [userId]);
-  await db.query("UPDATE events SET status = 'deleted', updated_at = NOW() WHERE author_id = $1", [userId]);
-  await db.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE uploaded_by = $1", [userId]);
-  await db.query("UPDATE document_categories SET status = 'deleted', updated_at = NOW() WHERE created_by = $1", [userId]);
+  await db.query("UPDATE announcements SET status = 'deleted', updated_at = NOW() WHERE author_id = ?", [userId]);
+  await db.query("UPDATE events SET status = 'deleted', updated_at = NOW() WHERE author_id = ?", [userId]);
+  await db.query("UPDATE document_templates SET status = 'deleted', updated_at = NOW() WHERE uploaded_by = ?", [userId]);
+  await db.query("UPDATE document_categories SET status = 'deleted', updated_at = NOW() WHERE created_by = ?", [userId]);
   await db.query(
     `UPDATE document_templates
      SET status = 'deleted', updated_at = NOW()
-     WHERE category_id IN (SELECT id FROM document_categories WHERE created_by = $1)`,
+     WHERE category_id IN (SELECT id FROM document_categories WHERE created_by = ?)`,
     [userId]
   );
-  await db.query('DELETE FROM feedback WHERE user_id = $1', [userId]);
-  await db.query('DELETE FROM chatbot_logs WHERE user_id = $1', [userId]);
-  await db.query('DELETE FROM lost_found WHERE reporter_id = $1', [userId]);
+  await db.query('DELETE FROM feedback WHERE user_id = ?', [userId]);
+  await db.query('DELETE FROM chatbot_logs WHERE user_id = ?', [userId]);
+  await db.query('DELETE FROM lost_found WHERE reporter_id = ?', [userId]);
 }
 
-// Get all users (superadmin only)
+// ──────────────────────────────────────────────
+//  USER MANAGEMENT (Superadmin)
+// ──────────────────────────────────────────────
+
+// Get all users
 router.get('/users', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     const { status } = req.query;
@@ -71,116 +77,154 @@ router.get('/users', authenticateToken, requireRole('superadmin'), async (req, r
     }
 
     query += ' ORDER BY created_at DESC';
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows || []);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch users' });
   }
 });
 
-// Verify user (superadmin only)
+// Verify user
 router.patch('/users/:id/verify', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
-    await pool.query('UPDATE users SET is_verified = true, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET is_verified = true, updated_at = NOW() WHERE id = ?', [req.params.id]);
     res.json({ message: 'User verified' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to verify user' });
   }
 });
 
-// Deactivate user (superadmin only)
+// Deactivate user
 router.patch('/users/:id/deactivate', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
-    await pool.query('UPDATE users SET is_active = false, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET is_active = false, updated_at = NOW() WHERE id = ?', [req.params.id]);
     res.json({ message: 'User deactivated' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to deactivate user' });
   }
 });
 
-// Activate user (superadmin only)
+// Activate user
 router.patch('/users/:id/activate', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
-    await pool.query('UPDATE users SET is_active = true, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    await pool.query('UPDATE users SET is_active = true, updated_at = NOW() WHERE id = ?', [req.params.id]);
     res.json({ message: 'User activated' });
   } catch (err) {
     res.status(500).json({ error: 'Failed to activate user' });
   }
 });
 
-// Delete user (superadmin only)
-router.delete('/users/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const client = await pool.connect();
+// Send password reset email
+router.post('/users/:id/reset-password', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
-    await client.query('BEGIN');
+    const [userRows] = await pool.query('SELECT id, first_name, email, is_active FROM users WHERE id = ?', [req.params.id]);
+    if (userRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const user = userRows[0];
 
-    const userResult = await client.query(
-      'SELECT student_number, role FROM users WHERE id = $1',
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetExpires = new Date(Date.now() + 60 * 60 * 1000);
+    await pool.query(
+      `UPDATE users SET password_reset_token = ?, password_reset_expires = ?, updated_at = NOW() WHERE id = ?`,
+      [resetToken, resetExpires, user.id]
+    );
+
+    await sendPasswordResetEmail(user.email, user.first_name, resetToken);
+    res.json({ message: `Password reset link sent to ${user.email}` });
+  } catch (err) {
+    console.error('Admin reset password error:', err);
+    res.status(500).json({ error: 'Failed to send password reset email: ' + err.message });
+  }
+});
+
+// Delete user
+router.delete('/users/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  const client = await pool.getConnection();
+  try {
+    await client.beginTransaction();
+
+    const [userRows] = await client.query(
+      'SELECT student_number, role FROM users WHERE id = ?',
       [req.params.id]
     );
-    if (userResult.rows.length === 0) {
-      await client.query('ROLLBACK');
+    if (userRows.length === 0) {
+      await client.rollback();
       return res.status(404).json({ error: 'User not found' });
     }
-    if (userResult.rows[0].role === 'superadmin') {
-      await client.query('ROLLBACK');
+    if (userRows[0].role === 'superadmin') {
+      await client.rollback();
       return res.status(403).json({ error: 'Cannot delete superadmin account' });
     }
 
-    const studentNumber = userResult.rows[0].student_number;
+    const studentNumber = userRows[0].student_number;
     await purgeUserOwnedContent(client, req.params.id);
-    await client.query('DELETE FROM users WHERE id = $1', [req.params.id]);
+    await client.query('DELETE FROM users WHERE id = ?', [req.params.id]);
     if (studentNumber) {
       await client.query(
-        'UPDATE allowed_registrations SET is_used = false WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($1))',
+        'UPDATE allowed_registrations SET is_used = false WHERE UPPER(TRIM(id_number)) = UPPER(TRIM(?))',
         [studentNumber]
       );
     }
     await releaseStaleAllowedRegistrations(client);
 
-    await client.query('COMMIT');
+    await client.commit();
     res.json({ message: 'User deleted' });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     res.status(500).json({ error: 'Failed to delete user' });
   } finally {
     client.release();
   }
 });
 
-// Dashboard stats
+// ──────────────────────────────────────────────
+//  DASHBOARD & MONITORING STATS (Admin)
+// ──────────────────────────────────────────────
+
 router.get('/stats', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
-    const [users, announcements, events, lostFound, allowedRegs] = await Promise.all([
-      pool.query("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE is_verified = false) as pending FROM users WHERE role != 'admin'"),
-      pool.query("SELECT COUNT(*) FILTER (WHERE status = 'active') as total, COUNT(*) FILTER (WHERE status = 'pending') as pending FROM announcements"),
-      pool.query("SELECT COUNT(*) FILTER (WHERE status = 'active') as total, COUNT(*) FILTER (WHERE status = 'pending') as pending FROM events"),
-      pool.query("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status = 'open') as open FROM lost_found"),
-      pool.query("SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE is_used = false) as unused FROM allowed_registrations")
+    const [[usersRows], [announcementsRows], [eventsRows], [lostFoundRows], [allowedRegsRows]] = await Promise.all([
+      pool.query(`SELECT
+        COUNT(*) as total,
+        SUM(IF(is_verified = false, 1, 0)) as pending
+        FROM users WHERE role != 'admin'`),
+      pool.query(`SELECT
+        SUM(IF(status = 'active', 1, 0)) as total,
+        SUM(IF(status = 'pending', 1, 0)) as pending
+        FROM announcements`),
+      pool.query(`SELECT
+        SUM(IF(status = 'active', 1, 0)) as total,
+        SUM(IF(status = 'pending', 1, 0)) as pending
+        FROM events`),
+      pool.query(`SELECT
+        COUNT(*) as total,
+        SUM(IF(status = 'open', 1, 0)) as \`open\`
+        FROM lost_found`),
+      pool.query(`SELECT
+        COUNT(*) as total,
+        SUM(IF(is_used = false, 1, 0)) as unused
+        FROM allowed_registrations`)
     ]);
 
     res.json({
-      users: { total: parseInt(users.rows[0].total), pending: parseInt(users.rows[0].pending) },
-      announcements: { total: parseInt(announcements.rows[0].total), pending: parseInt(announcements.rows[0].pending) },
-      events: { total: parseInt(events.rows[0].total), pending: parseInt(events.rows[0].pending) },
-      lostFound: { total: parseInt(lostFound.rows[0].total), open: parseInt(lostFound.rows[0].open) },
-      allowedRegistrations: { total: parseInt(allowedRegs.rows[0].total), unused: parseInt(allowedRegs.rows[0].unused) }
+      users: { total: parseInt(usersRows[0]?.total || 0, 10), pending: parseInt(usersRows[0]?.pending || 0, 10) },
+      announcements: { total: parseInt(announcementsRows[0]?.total || 0, 10), pending: parseInt(announcementsRows[0]?.pending || 0, 10) },
+      events: { total: parseInt(eventsRows[0]?.total || 0, 10), pending: parseInt(eventsRows[0]?.pending || 0, 10) },
+      lostFound: { total: parseInt(lostFoundRows[0]?.total || 0, 10), open: parseInt(lostFoundRows[0]?.open || 0, 10) },
+      allowedRegistrations: { total: parseInt(allowedRegsRows[0]?.total || 0, 10), unused: parseInt(allowedRegsRows[0]?.unused || 0, 10) }
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
 
-// Firewall stats (admin monitoring)
 router.get('/firewall', authenticateToken, requireRole('admin'), (req, res) => {
   res.json(getFirewallStats());
 });
 
-// ════════════════════════════════════════════
-//  ALLOWED REGISTRATIONS
-// ════════════════════════════════════════════
+// ──────────────────────────────────────────────
+//  ALLOWED REGISTRATIONS (Superadmin)
+// ──────────────────────────────────────────────
 
-// List allowed registrations (superadmin only)
 router.get('/allowed-registrations', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     await releaseStaleAllowedRegistrations(pool);
@@ -191,7 +235,7 @@ router.get('/allowed-registrations', authenticateToken, requireRole('superadmin'
 
     if (department && VALID_DEPARTMENTS.includes(department)) {
       params.push(department);
-      conditions.push(`department = $${params.length}`);
+      conditions.push(`department = ?`);
     }
     if (status === 'used') {
       conditions.push('is_used = true');
@@ -204,20 +248,18 @@ router.get('/allowed-registrations', authenticateToken, requireRole('superadmin'
     }
     query += ' ORDER BY created_at DESC';
 
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    const [rows] = await pool.query(query, params);
+    res.json(rows || []);
   } catch (err) {
     console.error('List allowed registrations error:', err);
     res.status(500).json({ error: 'Failed to fetch allowed registrations' });
   }
 });
 
-// Add single allowed registration (superadmin only)
 router.post('/allowed-registrations', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     const { id_number } = req.body;
     const role = typeof req.body.role === 'string' ? req.body.role.trim().toLowerCase() : '';
-    // Faculty are institution-wide — department is optional for faculty, required for students
     const department = req.body.department || null;
 
     if (!id_number || !role) {
@@ -239,29 +281,29 @@ router.post('/allowed-registrations', authenticateToken, requireRole('superadmin
       return res.status(400).json({ error: `Invalid ID format for ${role}. Expected format: ${getRoleFormatHint(role)}` });
     }
 
-    const existing = await pool.query('SELECT id FROM allowed_registrations WHERE id_number = $1', [trimmed]);
-    if (existing.rows.length > 0) {
+    const [existingRows] = await pool.query('SELECT id FROM allowed_registrations WHERE id_number = ?', [trimmed]);
+    if (existingRows.length > 0) {
       return res.status(400).json({ error: 'This ID number is already in the allowed list' });
     }
 
-    const result = await pool.query(
-      'INSERT INTO allowed_registrations (id_number, department, role, added_by) VALUES ($1, $2, $3, $4) RETURNING *',
-      [trimmed, department, role, req.user.id]
+    const newId = uuidv4();
+    await pool.query(
+      'INSERT INTO allowed_registrations (id, id_number, department, role, added_by) VALUES (?, ?, ?, ?, ?)',
+      [newId, trimmed, department, role, req.user.id]
     );
-    res.status(201).json(result.rows[0]);
+    const [fetchRows] = await pool.query('SELECT * FROM allowed_registrations WHERE id = ?', [newId]);
+    res.status(201).json(fetchRows[0]);
   } catch (err) {
     console.error('Add allowed registration error:', err);
     res.status(500).json({ error: 'Failed to add allowed registration' });
   }
 });
 
-// CSV upload for allowed registrations (superadmin only)
 router.post('/allowed-registrations/upload', authenticateToken, requireRole('superadmin'), uploadCsv.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No CSV file uploaded' });
 
     const role = typeof req.body.role === 'string' ? req.body.role.trim().toLowerCase() : '';
-    // Faculty are institution-wide — department is optional for faculty, required for students
     const department = req.body.department || null;
 
     if (!VALID_ALLOWED_ROLES.includes(role)) {
@@ -277,7 +319,6 @@ router.post('/allowed-registrations/upload', authenticateToken, requireRole('sup
     const csvText = req.file.buffer.toString('utf-8');
     const lines = csvText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-    // Skip header if it looks like one
     let startIdx = 0;
     if (lines.length > 0 && /id.number|student.number|id_number/i.test(lines[0])) {
       startIdx = 1;
@@ -288,10 +329,8 @@ router.post('/allowed-registrations/upload', authenticateToken, requireRole('sup
     const errors = [];
 
     for (let i = startIdx; i < lines.length; i++) {
-      // Each line should contain an ID number (first column if CSV has multiple)
       const cols = lines[i].split(',').map(c => c.trim().replace(/^["']|["']$/g, ''));
       const idNum = (cols[0] || '').toUpperCase();
-
       if (!idNum) continue;
 
       const expectedRegex = getExpectedIdRegex(role);
@@ -305,15 +344,16 @@ router.post('/allowed-registrations/upload', authenticateToken, requireRole('sup
       }
 
       try {
-        const existing = await pool.query('SELECT 1 FROM allowed_registrations WHERE id_number = $1', [idNum]);
-        if (existing.rows.length > 0) {
+        const [existingRows] = await pool.query('SELECT 1 FROM allowed_registrations WHERE id_number = ?', [idNum]);
+        if (existingRows.length > 0) {
           skipped.push(idNum);
           continue;
         }
 
+        const newId = uuidv4();
         await pool.query(
-          'INSERT INTO allowed_registrations (id_number, department, role, added_by) VALUES ($1, $2, $3, $4)',
-          [idNum, department, role, req.user.id]
+          'INSERT INTO allowed_registrations (id, id_number, department, role, added_by) VALUES (?, ?, ?, ?, ?)',
+          [newId, idNum, department, role, req.user.id]
         );
         added.push(idNum);
       } catch (dbErr) {
@@ -334,48 +374,45 @@ router.post('/allowed-registrations/upload', authenticateToken, requireRole('sup
   }
 });
 
-// Bulk delete allowed registrations (superadmin only)
 router.delete('/allowed-registrations', authenticateToken, requireRole('superadmin'), async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'ids must be a non-empty array' });
   }
 
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
-    await client.query('BEGIN');
+    await client.beginTransaction();
 
     let removedCount = 0;
     let deletedUsersCount = 0;
 
     for (const id of ids) {
-      const regResult = await client.query(
-        'SELECT id_number FROM allowed_registrations WHERE id = $1', [id]
-      );
-      if (regResult.rows.length === 0) continue; // skip already-gone entries
+      const [regRows] = await client.query('SELECT id_number FROM allowed_registrations WHERE id = ?', [id]);
+      if (regRows.length === 0) continue;
 
-      const idNumber = regResult.rows[0].id_number;
-      const linkedUsers = await client.query(
-        'SELECT id FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM($1))', [idNumber]
+      const idNumber = regRows[0].id_number;
+      const [linkedUsersRows] = await client.query(
+        'SELECT id FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM(?))', [idNumber]
       );
-      for (const user of linkedUsers.rows) {
+      for (const user of linkedUsersRows) {
         await purgeUserOwnedContent(client, user.id);
       }
-      const deleted = await client.query(
-        'DELETE FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM($1)) RETURNING id', [idNumber]
+      const [deleteResult] = await client.query(
+        'DELETE FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM(?))', [idNumber]
       );
-      await client.query('DELETE FROM allowed_registrations WHERE id = $1', [id]);
+      await client.query('DELETE FROM allowed_registrations WHERE id = ?', [id]);
       removedCount++;
-      deletedUsersCount += deleted.rowCount;
+      deletedUsersCount += deleteResult.affectedRows;
     }
 
-    await client.query('COMMIT');
+    await client.commit();
     res.json({
       message: `${removedCount} ID${removedCount !== 1 ? 's' : ''} removed` +
                (deletedUsersCount > 0 ? `, ${deletedUsersCount} account${deletedUsersCount !== 1 ? 's' : ''} deleted` : '')
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Bulk delete allowed-registrations error:', err);
     res.status(500).json({ error: 'Failed to bulk-remove IDs' });
   } finally {
@@ -383,85 +420,81 @@ router.delete('/allowed-registrations', authenticateToken, requireRole('superadm
   }
 });
 
-// Delete allowed registration (superadmin only)
 router.delete('/allowed-registrations/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
-    await client.query('BEGIN');
+    await client.beginTransaction();
 
-    const regResult = await client.query(
-      'SELECT id_number FROM allowed_registrations WHERE id = $1',
-      [req.params.id]
-    );
-    if (regResult.rows.length === 0) {
-      await client.query('ROLLBACK');
+    const [regRows] = await client.query('SELECT id_number FROM allowed_registrations WHERE id = ?', [req.params.id]);
+    if (regRows.length === 0) {
+      await client.rollback();
       return res.status(404).json({ error: 'Allowed ID not found' });
     }
 
-    const idNumber = regResult.rows[0].id_number;
-    const linkedUsers = await client.query(
-      'SELECT id FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM($1))',
-      [idNumber]
+    const idNumber = regRows[0].id_number;
+    const [linkedUsersRows] = await client.query(
+      'SELECT id FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM(?))', [idNumber]
     );
-    for (const user of linkedUsers.rows) {
+    for (const user of linkedUsersRows) {
       await purgeUserOwnedContent(client, user.id);
     }
-    const deletedUsers = await client.query(
-      'DELETE FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM($1)) RETURNING id',
-      [idNumber]
+    const [deleteUsersResult] = await client.query(
+      'DELETE FROM users WHERE UPPER(TRIM(student_number)) = UPPER(TRIM(?))', [idNumber]
     );
-    await client.query('DELETE FROM allowed_registrations WHERE id = $1', [req.params.id]);
+    await client.query('DELETE FROM allowed_registrations WHERE id = ?', [req.params.id]);
 
-    await client.query('COMMIT');
+    await client.commit();
     res.json({
-      message: deletedUsers.rowCount > 0
+      message: deleteUsersResult.affectedRows > 0
         ? 'Removed from allowed list and deleted matching registered account'
         : 'Removed from allowed list'
     });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     res.status(500).json({ error: 'Failed to remove allowed registration' });
   } finally {
     client.release();
   }
 });
 
-// Get allowed registrations stats (superadmin only)
 router.get('/allowed-registrations/stats', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     await releaseStaleAllowedRegistrations(pool);
-    const result = await pool.query(`
+    const [rows] = await pool.query(`
       SELECT department,
              COUNT(*) as total,
-             COUNT(*) FILTER (WHERE is_used = true) as used,
-             COUNT(*) FILTER (WHERE is_used = false) as unused
+             SUM(IF(is_used = true, 1, 0)) as used,
+             SUM(IF(is_used = false, 1, 0)) as unused
       FROM allowed_registrations
       GROUP BY department
       ORDER BY department
     `);
-    res.json(result.rows);
+    res.json(rows || []);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch stats' });
   }
 });
 
-// Schedules Overview (Admin)
+// ──────────────────────────────────────────────
+//  SCHEDULES OVERVIEW (Admin)
+// ──────────────────────────────────────────────
+
 router.get('/schedules-overview', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const query = `
        SELECT * FROM (
          SELECT 
-           cs.id::TEXT, 
-           COALESCE(cs.subject_code, '')::TEXT AS subject_code, 
-           COALESCE(cs.subject_name, '')::TEXT AS subject_name, 
-           COALESCE(cs.day_of_week, '')::TEXT AS day_of_week,
-           cs.start_time::TEXT, 
-           cs.end_time::TEXT, 
-           COALESCE(cs.room, 'TBA')::TEXT AS room,
-           COALESCE(u.first_name || ' ' || u.last_name, cs.instructor, 'N/A')::TEXT AS instructor,
-           COALESCE(cs.department, '')::TEXT AS department, 
-           COALESCE(cs.section, '')::TEXT AS section, 
-           COALESCE(cs.year_level, '')::TEXT AS year_level, 
+           CAST(cs.id AS CHAR) AS id, 
+           COALESCE(cs.subject_code, '') AS subject_code, 
+           COALESCE(cs.subject_name, '') AS subject_name, 
+           COALESCE(cs.day_of_week, '') AS day_of_week,
+           CAST(cs.start_time AS CHAR) AS start_time, 
+           CAST(cs.end_time AS CHAR) AS end_time, 
+           COALESCE(cs.room, 'TBA') AS room,
+           COALESCE(CONCAT(u.first_name, ' ', u.last_name), cs.instructor, 'N/A') AS instructor,
+           COALESCE(cs.department, '') AS department, 
+           COALESCE(cs.section, '') AS section, 
+           COALESCE(cs.year_level, '') AS year_level, 
            cs.created_at,
            'OFFICIAL' AS source
          FROM class_schedules cs
@@ -470,17 +503,17 @@ router.get('/schedules-overview', authenticateToken, requireRole('admin'), async
          UNION ALL
 
          SELECT 
-           fs.id::TEXT, 
-           COALESCE(fs.subject_code, '')::TEXT AS subject_code, 
-           COALESCE(fs.subject_name, '')::TEXT AS subject_name, 
-           COALESCE(fs.day_of_week, '')::TEXT AS day_of_week,
-           fs.start_time::TEXT, 
-           fs.end_time::TEXT, 
-           COALESCE(fs.room, 'TBA')::TEXT AS room,
-           (COALESCE(f.first_name, '') || ' ' || COALESCE(f.last_name, ''))::TEXT AS instructor,
-           COALESCE(fs.department, '')::TEXT AS department, 
-           COALESCE(fs.section, '')::TEXT AS section, 
-           COALESCE(fs.year_level, '')::TEXT AS year_level, 
+           CAST(fs.id AS CHAR) AS id, 
+           COALESCE(fs.subject_code, '') AS subject_code, 
+           COALESCE(fs.subject_name, '') AS subject_name, 
+           COALESCE(fs.day_of_week, '') AS day_of_week,
+           CAST(fs.start_time AS CHAR) AS start_time, 
+           CAST(fs.end_time AS CHAR) AS end_time, 
+           COALESCE(fs.room, 'TBA') AS room,
+           CONCAT(COALESCE(f.first_name, ''), ' ', COALESCE(f.last_name, '')) AS instructor,
+           COALESCE(fs.department, '') AS department, 
+           COALESCE(fs.section, '') AS section, 
+           COALESCE(fs.year_level, '') AS year_level, 
            fs.created_at,
            'FACULTY' AS source
          FROM faculty_schedules fs
@@ -488,25 +521,23 @@ router.get('/schedules-overview', authenticateToken, requireRole('admin'), async
        ) AS overview
        ORDER BY department ASC, year_level ASC, section ASC, day_of_week ASC, start_time ASC`;
 
-    const result = await pool.query(query);
-    res.json(result.rows);
+    const [rows] = await pool.query(query);
+    res.json(rows || []);
   } catch (err) {
-    console.error('[Admin] Schedules overview error:', err.message, err.stack);
+    console.error('[Admin] Schedules overview error:', err.message);
     res.status(500).json({ error: 'Failed to fetch schedules overview detail: ' + err.message });
   }
 });
 
+// ──────────────────────────────────────────────
+//  SYSTEM SETTINGS & ASSETS (Admin)
+// ──────────────────────────────────────────────
 
-// ════════════════════════════════════════════
-//  SYSTEM MAINTENANCE / SETTINGS (Admin Only)
-// ════════════════════════════════════════════
-
-// Admin: Get all system settings
 router.get('/system-settings', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
-    const result = await pool.query('SELECT key, value FROM system_settings');
+    const [rows] = await pool.query('SELECT `key`, `value` FROM system_settings');
     const settings = {};
-    result.rows.forEach(row => {
+    (rows || []).forEach(row => {
       settings[row.key] = row.value;
     });
     res.json(settings);
@@ -516,41 +547,34 @@ router.get('/system-settings', authenticateToken, requireRole('admin'), async (r
   }
 });
 
-// Admin: Update system settings
 router.post('/system-settings', authenticateToken, requireRole('admin'), async (req, res) => {
-  try {
-    const settings = req.body;
-    if (!settings || typeof settings !== 'object') {
-      return res.status(400).json({ error: 'Settings object is required' });
-    }
+  const settings = req.body;
+  if (!settings || typeof settings !== 'object') {
+    return res.status(400).json({ error: 'Settings object is required' });
+  }
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      for (const [key, value] of Object.entries(settings)) {
-        await client.query(`
-          INSERT INTO system_settings (key, value, updated_at)
-          VALUES ($1, $2, NOW())
-          ON CONFLICT (key) DO UPDATE
-          SET value = EXCLUDED.value, updated_at = NOW()
-        `, [key, String(value)]);
-      }
-      await client.query('COMMIT');
-      res.json({ message: 'System settings updated successfully' });
-    } catch (dbErr) {
-      await client.query('ROLLBACK');
-      throw dbErr;
-    } finally {
-      client.release();
+  const client = await pool.getConnection();
+  try {
+    await client.beginTransaction();
+    for (const [key, value] of Object.entries(settings)) {
+      await client.query(`
+        INSERT INTO system_settings (\`key\`, value, updated_at)
+        VALUES (?, ?, NOW())
+        ON DUPLICATE KEY UPDATE
+        value = VALUES(value), updated_at = NOW()
+      `, [key, String(value)]);
     }
+    await client.commit();
+    res.json({ message: 'System settings updated successfully' });
   } catch (err) {
+    try { await client.rollback(); } catch (_) {}
     console.error('Update system settings error:', err);
     res.status(500).json({ error: 'Failed to update system settings' });
+  } finally {
+    client.release();
   }
 });
 
-const { uploadSystem } = require('../middleware/upload');
-// Admin: Upload system images (logo or landing hero)
 router.post('/system-settings/upload', authenticateToken, requireRole('admin'), uploadSystem.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -564,16 +588,14 @@ router.post('/system-settings/upload', authenticateToken, requireRole('admin'), 
   }
 });
 
+// ──────────────────────────────────────────────
+//  ADMIN CREATION & PERMISSIONS (Superadmin)
+// ──────────────────────────────────────────────
 
-const bcrypt = require('bcryptjs');
-const { sendWelcomeAdminEmail } = require('../services/email');
-
-// Superadmin: Create new admin account (with module permissions)
 router.post('/create-admin', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const { first_name, email, password, department, position } = req.body;
-    // Which admin modules this account may access. Unknown modules are ignored.
     const modules = Array.isArray(req.body.modules)
       ? req.body.modules.filter(m => ALL_MODULES.includes(m))
       : [];
@@ -583,41 +605,44 @@ router.post('/create-admin', authenticateToken, requireRole('superadmin'), async
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
-    if (existing.rows.length > 0) {
+    const [existingRows] = await pool.query('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
+    if (existingRows.length > 0) {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    // Generate unique student_number to satisfy check constraint
-    const dummyId = `ADM-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    const dummyId = `ADM-${Math.random().toString(36).substring(2, 11).toUpperCase()}`;
+    const newAdminId = uuidv4();
 
-    await client.query('BEGIN');
-    const result = await client.query(`
-      INSERT INTO users (student_number, email, password_hash, first_name, last_name, role, department, position, is_verified, is_active)
-      VALUES ($1, $2, $3, $4, 'Admin', 'admin', $5, $6, true, true)
-      RETURNING id, email, first_name, role, department, position, is_active, created_at
-    `, [dummyId, normalizedEmail, passwordHash, first_name.trim(), department || null, position || null]);
-    const newAdmin = result.rows[0];
+    await client.beginTransaction();
+    await client.query(`
+      INSERT INTO users (id, student_number, email, password_hash, first_name, last_name, role, department, position, is_verified, is_active)
+      VALUES (?, ?, ?, ?, ?, 'Admin', 'admin', ?, ?, true, true)
+    `, [newAdminId, dummyId, normalizedEmail, passwordHash, first_name.trim(), department || null, position || null]);
+
+    const [newAdminRows] = await client.query(
+      'SELECT id, email, first_name, role, department, position, is_active, created_at FROM users WHERE id = ?',
+      [newAdminId]
+    );
+    const newAdmin = newAdminRows[0];
 
     if (modules.length) {
-      await client.query(
-        `INSERT INTO admin_permissions (user_id, module, granted_by)
-         SELECT $1, m, $2 FROM unnest($3::text[]) AS m
-         ON CONFLICT (user_id, module) DO NOTHING`,
-        [newAdmin.id, req.user.id, modules]
-      );
+      for (const m of modules) {
+        await client.query(
+          `INSERT IGNORE INTO admin_permissions (user_id, module, granted_by) VALUES (?, ?, ?)`,
+          [newAdmin.id, m, req.user.id]
+        );
+      }
     }
-    await client.query('COMMIT');
+    await client.commit();
 
-    // Send welcome email asynchronously
     sendWelcomeAdminEmail(normalizedEmail, first_name.trim(), password).catch(err => {
       console.error('[Admin] Failed to send welcome email to new admin:', err.message);
     });
 
     res.status(201).json({ ...newAdmin, modules });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Create admin error:', err);
     res.status(500).json({ error: 'Failed to create admin account' });
   } finally {
@@ -625,16 +650,15 @@ router.post('/create-admin', authenticateToken, requireRole('superadmin'), async
   }
 });
 
-// Superadmin: list available modules + a given admin's current grants
 router.get('/admins/:id/modules', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
-    const u = await pool.query("SELECT role FROM users WHERE id = $1", [req.params.id]);
-    if (u.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const granted = await pool.query('SELECT module FROM admin_permissions WHERE user_id = $1', [req.params.id]);
+    const [uRows] = await pool.query("SELECT role FROM users WHERE id = ?", [req.params.id]);
+    if (uRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const [grantedRows] = await pool.query('SELECT module FROM admin_permissions WHERE user_id = ?', [req.params.id]);
     res.json({
       all_modules: ALL_MODULES,
-      modules: granted.rows.map(r => r.module),
-      is_superadmin: u.rows[0].role === 'superadmin',
+      modules: grantedRows.map(r => r.module),
+      is_superadmin: uRows[0].role === 'superadmin',
     });
   } catch (err) {
     console.error('Get admin modules error:', err);
@@ -642,32 +666,33 @@ router.get('/admins/:id/modules', authenticateToken, requireRole('superadmin'), 
   }
 });
 
-// Superadmin: replace an admin's module grants
 router.put('/admins/:id/modules', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const client = await pool.connect();
+  const client = await pool.getConnection();
   try {
     const modules = Array.isArray(req.body.modules)
       ? [...new Set(req.body.modules.filter(m => ALL_MODULES.includes(m)))]
       : [];
-    const u = await pool.query("SELECT role FROM users WHERE id = $1", [req.params.id]);
-    if (u.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    if (u.rows[0].role !== 'admin') {
+    const [uRows] = await pool.query("SELECT role FROM users WHERE id = ?", [req.params.id]);
+    if (uRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (uRows[0].role !== 'admin') {
       return res.status(400).json({ error: 'Only admin accounts have module permissions' });
     }
 
-    await client.query('BEGIN');
-    await client.query('DELETE FROM admin_permissions WHERE user_id = $1', [req.params.id]);
+    await client.beginTransaction();
+    await client.query('DELETE FROM admin_permissions WHERE user_id = ?', [req.params.id]);
     if (modules.length) {
-      await client.query(
-        `INSERT INTO admin_permissions (user_id, module, granted_by)
-         SELECT $1, m, $2 FROM unnest($3::text[]) AS m`,
-        [req.params.id, req.user.id, modules]
-      );
+      for (const m of modules) {
+        const permId = uuidv4();
+        await client.query(
+          `INSERT INTO admin_permissions (id, user_id, module, granted_by) VALUES (?, ?, ?, ?)`,
+          [permId, req.params.id, m, req.user.id]
+        );
+      }
     }
-    await client.query('COMMIT');
+    await client.commit();
     res.json({ modules });
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    try { await client.rollback(); } catch (_) {}
     console.error('Update admin modules error:', err);
     res.status(500).json({ error: 'Failed to update modules' });
   } finally {
@@ -675,19 +700,16 @@ router.put('/admins/:id/modules', authenticateToken, requireRole('superadmin'), 
   }
 });
 
-// Superadmin: Promote admin to superadmin
 router.patch('/users/:id/promote', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     const { id } = req.params;
-    const checkUser = await pool.query('SELECT role FROM users WHERE id = $1', [id]);
-    if (checkUser.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    if (checkUser.rows[0].role !== 'admin') {
+    const [checkRows] = await pool.query('SELECT role FROM users WHERE id = ?', [id]);
+    if (checkRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (checkRows[0].role !== 'admin') {
       return res.status(400).json({ error: 'Only admin accounts can be promoted to superadmin' });
     }
 
-    await pool.query("UPDATE users SET role = 'superadmin', updated_at = NOW() WHERE id = $1", [id]);
+    await pool.query("UPDATE users SET role = 'superadmin', updated_at = NOW() WHERE id = ?", [id]);
     res.json({ message: 'Admin account promoted to superadmin successfully' });
   } catch (err) {
     console.error('Promote admin error:', err);
@@ -699,22 +721,16 @@ router.patch('/users/:id/promote', authenticateToken, requireRole('superadmin'),
 router.patch('/users/:id/id-number', authenticateToken, requireRole('superadmin'), async (req, res) => {
   try {
     const { id_number } = req.body;
-    if (!id_number) {
-      return res.status(400).json({ error: 'ID number is required' });
-    }
+    if (!id_number) return res.status(400).json({ error: 'ID number is required' });
     const trimmed = id_number.trim().toUpperCase();
 
-    // Fetch the target user's role and current ID number
-    const userRes = await pool.query('SELECT role, student_number, department FROM users WHERE id = $1', [req.params.id]);
-    if (userRes.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    const targetUser = userRes.rows[0];
+    const [userRows] = await pool.query('SELECT role, student_number, department FROM users WHERE id = ?', [req.params.id]);
+    if (userRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const targetUser = userRows[0];
     if (targetUser.role === 'superadmin') {
       return res.status(403).json({ error: 'Cannot modify superadmin ID' });
     }
 
-    // Format validation checks (faculty vs student formats)
     if (targetUser.role !== 'admin') {
       const expectedRegex = getExpectedIdRegex(targetUser.role);
       if (!expectedRegex.test(trimmed)) {
@@ -722,41 +738,39 @@ router.patch('/users/:id/id-number', authenticateToken, requireRole('superadmin'
       }
     }
 
-    // Check if duplicate ID exists for a different user
-    const dupRes = await pool.query('SELECT id FROM users WHERE student_number = $1 AND id != $2', [trimmed, req.params.id]);
-    if (dupRes.rows.length > 0) {
+    const [dupRows] = await pool.query('SELECT id FROM users WHERE student_number = ? AND id != ?', [trimmed, req.params.id]);
+    if (dupRows.length > 0) {
       return res.status(400).json({ error: 'This ID number is already registered to another user' });
     }
 
-    const client = await pool.connect();
+    const client = await pool.getConnection();
     try {
-      await client.query('BEGIN');
+      await client.beginTransaction();
+      await client.query('UPDATE users SET student_number = ?, updated_at = NOW() WHERE id = ?', [trimmed, req.params.id]);
 
-      // Update the user's ID
-      await client.query('UPDATE users SET student_number = $1, updated_at = NOW() WHERE id = $2', [trimmed, req.params.id]);
-
-      // Sync with allowed_registrations
       if (targetUser.student_number) {
-        const allowedCheck = await client.query('SELECT id FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($1))', [targetUser.student_number]);
-        if (allowedCheck.rows.length > 0) {
-          await client.query('UPDATE allowed_registrations SET id_number = $1, is_used = true WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($2))', [trimmed, targetUser.student_number]);
+        const [allowedCheckRows] = await client.query('SELECT id FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM(?))', [targetUser.student_number]);
+        if (allowedCheckRows.length > 0) {
+          await client.query('UPDATE allowed_registrations SET id_number = ?, is_used = true WHERE UPPER(TRIM(id_number)) = UPPER(TRIM(?))', [trimmed, targetUser.student_number]);
         } else {
+          const newAllowedId = uuidv4();
           await client.query(
-            'INSERT INTO allowed_registrations (id_number, department, role, is_used, added_by) VALUES ($1, $2, $3, true, $4) ON CONFLICT (id_number) DO UPDATE SET is_used = true',
-            [trimmed, targetUser.department || null, targetUser.role, req.user.id]
+            'INSERT INTO allowed_registrations (id, id_number, department, role, is_used, added_by) VALUES (?, ?, ?, ?, true, ?) ON DUPLICATE KEY UPDATE is_used = true',
+            [newAllowedId, trimmed, targetUser.department || null, targetUser.role, req.user.id]
           );
         }
       } else {
+        const newAllowedId = uuidv4();
         await client.query(
-          'INSERT INTO allowed_registrations (id_number, department, role, is_used, added_by) VALUES ($1, $2, $3, true, $4) ON CONFLICT (id_number) DO UPDATE SET is_used = true',
-          [trimmed, targetUser.department || null, targetUser.role, req.user.id]
+          'INSERT INTO allowed_registrations (id, id_number, department, role, is_used, added_by) VALUES (?, ?, ?, ?, true, ?) ON DUPLICATE KEY UPDATE is_used = true',
+          [newAllowedId, trimmed, targetUser.department || null, targetUser.role, req.user.id]
         );
       }
 
-      await client.query('COMMIT');
+      await client.commit();
       res.json({ message: 'User ID number updated successfully' });
     } catch (dbErr) {
-      await client.query('ROLLBACK');
+      await client.rollback();
       throw dbErr;
     } finally {
       client.release();
@@ -767,6 +781,79 @@ router.patch('/users/:id/id-number', authenticateToken, requireRole('superadmin'
   }
 });
 
+// Promote student year levels batch
+router.post('/promote-year-levels', authenticateToken, requireRole('admin', 'superadmin'), async (req, res) => {
+  const client = await pool.getConnection();
+  try {
+    await client.beginTransaction();
+
+    const [breakdownRows] = await client.query(`
+      SELECT year_level, CAST(COUNT(*) AS UNSIGNED) AS count
+      FROM users
+      WHERE role = 'student' AND year_level IN ('1st', '2nd', '3rd', '4th')
+      GROUP BY year_level
+    `);
+
+    const [updateResult] = await client.query(`
+      UPDATE users
+      SET year_level = CASE year_level
+        WHEN '1st' THEN '2nd'
+        WHEN '2nd' THEN '3rd'
+        WHEN '3rd' THEN '4th'
+        WHEN '4th' THEN 'Graduated'
+        ELSE year_level
+      END,
+      updated_at = NOW()
+      WHERE role = 'student' AND year_level IN ('1st', '2nd', '3rd', '4th')
+    `);
+
+    await client.commit();
+    res.json({
+      message: `Semester updated successfully! ${updateResult.affectedRows} students advanced to the next level.`,
+      updatedCount: updateResult.affectedRows,
+      breakdown: breakdownRows
+    });
+  } catch (err) {
+    try { await client.rollback(); } catch (_) {}
+    console.error('Promote year levels error:', err);
+    res.status(500).json({ error: 'Failed to update semester and promote year levels: ' + err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Update a specific student's year level manually
+router.patch('/users/:id/year-level', authenticateToken, requireRole('admin', 'superadmin'), async (req, res) => {
+  try {
+    const { year_level } = req.body;
+    const allowed = ['1st', '2nd', '3rd', '4th', 'Graduated'];
+    if (!allowed.includes(year_level)) {
+      return res.status(400).json({ error: `Invalid year level. Allowed values: ${allowed.join(', ')}` });
+    }
+
+    const [checkRows] = await pool.query('SELECT id, first_name, last_name, role FROM users WHERE id = ?', [req.params.id]);
+    if (checkRows.length === 0) return res.status(404).json({ error: 'User not found' });
+    if (checkRows[0].role !== 'student') {
+      return res.status(400).json({ error: 'Year level can only be assigned to students' });
+    }
+
+    await pool.query(
+      'UPDATE users SET year_level = ?, updated_at = NOW() WHERE id = ?',
+      [year_level, req.params.id]
+    );
+    const [fetchRows] = await pool.query(
+      'SELECT id, student_number, first_name, last_name, year_level FROM users WHERE id = ?',
+      [req.params.id]
+    );
+
+    res.json({
+      message: `Updated year level to ${year_level} for ${checkRows[0].first_name} ${checkRows[0].last_name}`,
+      user: fetchRows[0]
+    });
+  } catch (err) {
+    console.error('Update student year level error:', err);
+    res.status(500).json({ error: 'Failed to update student year level: ' + err.message });
+  }
+});
 
 module.exports = router;
-

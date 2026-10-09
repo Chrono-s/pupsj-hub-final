@@ -3,29 +3,88 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
 const pool = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, ALL_MODULES } = require('../middleware/auth');
 const { uploadProfile } = require('../middleware/upload');
 const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
+const { normalizeEmail } = require('../utils/helpers');
 
 const VALID_YEAR_LEVELS = ['1st', '2nd', '3rd', '4th'];
 const VALID_STUDENT_TYPES = ['regular', 'irregular'];
+const VALID_EMPLOYMENT_TYPES = ['part_time', 'full_time'];
+const VALID_FACULTY_STATUSES = ['in_class', 'in_office', 'available', 'unavailable'];
 const FACULTY_NUMBER_REGEX = /^F-\d{4}$/;
+
+const EMBED_HOST_ALLOWLIST = [
+  /^(docs|sheets|calendar|drive)\.google\.com$/i,
+  /^(www\.)?canva\.com$/i,
+  /^onedrive\.live\.com$/i,
+  /^(view|embed|sway)\.office\.com$/i,
+  /^1drv\.ms$/i,
+  /^(www\.)?office\.com$/i,
+  /^(www\.)?sway\.cloud\.microsoft$/i,
+];
+
+function generateVerificationCode() {
+  return String(crypto.randomInt(100000, 999999));
+}
 
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-function normalizeEmail(email) {
-  return typeof email === 'string' ? email.trim().toLowerCase() : '';
+function isAllowedEmbedUrl(raw) {
+  if (!raw) return true;
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && EMBED_HOST_ALLOWLIST.some((rx) => rx.test(u.hostname));
+  } catch (_) {
+    return false;
+  }
 }
 
-// Register
+function signUserToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      first_name: user.first_name,
+      middle_initial: user.middle_initial,
+      last_name: user.last_name,
+      department: user.department,
+      section: user.section,
+      year_level: user.year_level,
+      student_type: user.student_type,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN || '4h' }
+  );
+}
+
+/**
+ * Standardized auth error handler with database connection failure detection
+ */
+function handleAuthError(err, res, defaultMsg = 'Operation failed', status = 500) {
+  if (pool.isDbConnectionError && pool.isDbConnectionError(err)) {
+    console.error(`[AUTH DATABASE ERROR] ${defaultMsg}:`, err.message || err.code);
+    return res.status(503).json({
+      error: 'Database service is temporarily unavailable. Please verify MySQL is running.',
+      code: 'DATABASE_UNAVAILABLE',
+    });
+  }
+  console.error(`[AUTH ERROR] ${defaultMsg}:`, err.message || err);
+  return res.status(status).json({ error: defaultMsg });
+}
+
+// ── Register ─────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
     const { student_number, email, password, first_name, middle_initial, last_name, section } = req.body;
     const year_level = typeof req.body.year_level === 'string' ? req.body.year_level.trim() : '';
     const student_type = typeof req.body.student_type === 'string' ? req.body.student_type.trim().toLowerCase() : '';
+    const employment_type = typeof req.body.employment_type === 'string' ? req.body.employment_type.trim().toLowerCase() : '';
     const registrationRole = typeof req.body.registration_role === 'string' ? req.body.registration_role.trim().toLowerCase() : '';
     const normalizedEmail = normalizeEmail(email);
 
@@ -37,69 +96,109 @@ router.post('/register', async (req, res) => {
     }
 
     const trimmedId = student_number.trim().toUpperCase();
-
-    const allowed = await pool.query(
-      'SELECT * FROM allowed_registrations WHERE id_number = $1',
-      [trimmedId]
-    );
-    if (allowed.rows.length === 0) {
+    const [allowedRows] = await pool.query('SELECT * FROM allowed_registrations WHERE id_number = ?', [trimmedId]);
+    if (!allowedRows.length) {
       return res.status(403).json({ error: 'Your ID number is not authorized to register. Please contact your admin.' });
     }
 
-    const allowedEntry = allowed.rows[0];
+    const allowedEntry = allowedRows[0];
     if (registrationRole && registrationRole !== allowedEntry.role) {
       return res.status(400).json({ error: `This ID is approved for ${allowedEntry.role} registration.` });
     }
-    if (allowedEntry.is_used) {
-      const existingById = await pool.query(
-        'SELECT id FROM users WHERE student_number = $1',
-        [trimmedId]
-      );
-      if (existingById.rows.length === 0) {
-        await pool.query(
-          'UPDATE allowed_registrations SET is_used = false WHERE id = $1',
-          [allowedEntry.id]
-        );
-        allowedEntry.is_used = false;
-      } else {
-        return res.status(400).json({ error: 'This ID number has already been used to register' });
-      }
-    }
+    const isStudent = allowedEntry.role === 'student';
+    const isFaculty = allowedEntry.role === 'faculty';
 
-    const existing = await pool.query(
-      'SELECT id FROM users WHERE email = $1 OR student_number = $2',
-      [normalizedEmail, trimmedId]
-    );
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Email or ID Number already registered' });
-    }
-
-    const password_hash = await bcrypt.hash(password, 12);
-    const normalizedSection = typeof section === 'string' ? section.trim() : '';
-    const isStudentRegistration = allowedEntry.role === 'student';
-    if (!isStudentRegistration && !FACULTY_NUMBER_REGEX.test(trimmedId)) {
+    if (!isStudent && !FACULTY_NUMBER_REGEX.test(trimmedId)) {
       return res.status(400).json({ error: 'Faculty number must follow the format F-0000.' });
     }
-    if (isStudentRegistration) {
+    if (isFaculty) {
+      if (!employment_type) return res.status(400).json({ error: 'Employment type is required for faculty registration' });
+      if (!VALID_EMPLOYMENT_TYPES.includes(employment_type)) return res.status(400).json({ error: 'Invalid employment type. Must be part time or full time.' });
+    }
+    if (isStudent) {
+      const normalizedSection = typeof section === 'string' ? section.trim() : '';
       if (!normalizedSection || !year_level || !student_type) {
         return res.status(400).json({ error: 'Section, year level, and student type are required for student registration' });
       }
-      if (!VALID_YEAR_LEVELS.includes(year_level)) {
-        return res.status(400).json({ error: 'Invalid year level. Must be 1st, 2nd, 3rd, or 4th.' });
-      }
-      if (!VALID_STUDENT_TYPES.includes(student_type)) {
-        return res.status(400).json({ error: 'Invalid student type. Must be regular or irregular.' });
-      }
+      if (!VALID_YEAR_LEVELS.includes(year_level)) return res.status(400).json({ error: 'Invalid year level. Must be 1st, 2nd, 3rd, or 4th.' });
+      if (!VALID_STUDENT_TYPES.includes(student_type)) return res.status(400).json({ error: 'Invalid student type. Must be regular or irregular.' });
     }
 
-    const verificationToken = generateToken();
-    const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const [existingUsers] = await pool.query(
+      'SELECT id, is_verified, email, student_number FROM users WHERE email = ? OR student_number = ?',
+      [normalizedEmail, trimmedId]
+    );
 
-    const result = await pool.query(
-      `INSERT INTO users (student_number, email, password_hash, first_name, middle_initial, last_name, role, department, section, year_level, student_type, is_verified, email_verification_token, email_verification_expires)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13)
-       RETURNING id, first_name, middle_initial, last_name, role, department, section, year_level, student_type`,
+    const verificationToken = generateVerificationCode();
+    const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const password_hash = await bcrypt.hash(password, 12);
+
+    if (existingUsers.length > 0) {
+      const existing = existingUsers[0];
+      if (existing.is_verified) {
+        return res.status(400).json({ error: 'This Email or ID Number is already registered and verified. Please log in.' });
+      }
+
+      // Existing unverified account: update record and resend new verification code
+      await pool.query(
+        `UPDATE users SET
+           student_number = ?,
+           email = ?,
+           password_hash = ?,
+           first_name = ?,
+           middle_initial = ?,
+           last_name = ?,
+           role = ?,
+           department = ?,
+           section = ?,
+           year_level = ?,
+           student_type = ?,
+           employment_type = ?,
+           email_verification_token = ?,
+           email_verification_expires = ?,
+           updated_at = NOW()
+         WHERE id = ?`,
+        [
+          trimmedId,
+          normalizedEmail,
+          password_hash,
+          first_name.trim(),
+          middle_initial ? middle_initial.trim().substring(0, 10) : null,
+          last_name.trim(),
+          allowedEntry.role,
+          allowedEntry.department,
+          isStudent ? (typeof section === 'string' ? section.trim() : null) : null,
+          isStudent ? year_level : null,
+          isStudent ? student_type : null,
+          isFaculty ? employment_type : null,
+          verificationToken,
+          verificationExpires,
+          existing.id
+        ]
+      );
+
+      await pool.query('UPDATE allowed_registrations SET is_used = true WHERE id = ?', [allowedEntry.id]);
+
+      try {
+        await sendVerificationEmail(normalizedEmail, first_name.trim(), verificationToken);
+      } catch (e) {
+        console.error('[Auth] Failed to send verification email:', e.message);
+      }
+
+      return res.status(201).json({
+        message: 'Registration updated! A 6-digit verification code has been sent to your email.',
+        requiresEmailVerification: true,
+        email: normalizedEmail
+      });
+    }
+
+    const newUserId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO users (id, student_number, email, password_hash, first_name, middle_initial, last_name, role, department, section, year_level, student_type, employment_type, is_verified, email_verification_token, email_verification_expires)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?)`,
       [
+        newUserId,
         trimmedId,
         normalizedEmail,
         password_hash,
@@ -108,15 +207,21 @@ router.post('/register', async (req, res) => {
         last_name.trim(),
         allowedEntry.role,
         allowedEntry.department,
-        isStudentRegistration ? normalizedSection : null,
-        isStudentRegistration ? year_level : null,
-        isStudentRegistration ? student_type : null,
+        isStudent ? (typeof section === 'string' ? section.trim() : null) : null,
+        isStudent ? year_level : null,
+        isStudent ? student_type : null,
+        isFaculty ? employment_type : null,
         verificationToken,
         verificationExpires
       ]
     );
 
-    await pool.query('UPDATE allowed_registrations SET is_used = true WHERE id = $1', [allowedEntry.id]);
+    const [createdUserRows] = await pool.query(
+      'SELECT id, first_name, middle_initial, last_name, role, department, section, year_level, student_type, employment_type FROM users WHERE id = ?',
+      [newUserId]
+    );
+
+    await pool.query('UPDATE allowed_registrations SET is_used = true WHERE id = ?', [allowedEntry.id]);
 
     try {
       await sendVerificationEmail(normalizedEmail, first_name.trim(), verificationToken);
@@ -126,45 +231,42 @@ router.post('/register', async (req, res) => {
         message: 'Registration successful, but we were unable to send the verification email. Please try resending it from the login screen or contact support.',
         requiresEmailVerification: true,
         emailSendError: true,
-        user: result.rows[0]
+        user: createdUserRows[0],
+        email: normalizedEmail
       });
     }
 
     res.status(201).json({
-      message: 'Registration successful! Please check your email to verify your account before logging in.',
+      message: 'Registration successful! A 6-digit verification code has been sent to your email.',
       requiresEmailVerification: true,
-      user: result.rows[0]
+      user: createdUserRows[0],
+      email: normalizedEmail
     });
   } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: 'Registration failed' });
+    return handleAuthError(err, res, 'Registration failed');
   }
 });
 
-// Login
+// ── Login ────────────────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     const normalizedEmail = normalizeEmail(email);
 
-    const result = await pool.query(
-      'SELECT * FROM users WHERE email = $1 AND is_active = true',
-      [normalizedEmail]
-    );
-
-    if (result.rows.length === 0) {
+    const [rows] = await pool.query('SELECT * FROM users WHERE email = ? AND is_active = true', [normalizedEmail]);
+    if (!rows.length) {
       console.warn(`[AUTH] Failed login - unknown email: ${normalizedEmail} | IP: ${req.ip}`);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const user = result.rows[0];
+    const user = rows[0];
 
     if (user.role !== 'admin' && user.role !== 'superadmin') {
-      const allowed = await pool.query(
-        'SELECT 1 FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM($1))',
+      const [allowedRows] = await pool.query(
+        'SELECT 1 FROM allowed_registrations WHERE UPPER(TRIM(id_number)) = UPPER(TRIM(?))',
         [user.student_number]
       );
-      if (allowed.rows.length === 0) {
+      if (!allowedRows.length) {
         console.warn(`[AUTH] Login blocked - removed from allowed registrations: ${normalizedEmail} | IP: ${req.ip}`);
         return res.status(403).json({ error: 'Your ID is no longer authorized. Please contact your admin.' });
       }
@@ -184,24 +286,16 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        first_name: user.first_name,
-        middle_initial: user.middle_initial,
-        last_name: user.last_name,
-        department: user.department,
-        section: user.section,
-        year_level: user.year_level,
-        student_type: user.student_type
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '4h' }
-    );
-
+    const token = signUserToken(user);
     console.log(`[AUTH] Successful login: ${normalizedEmail} (${user.role}) | IP: ${req.ip}`);
+
+    let modules = [];
+    if (user.role === 'superadmin') {
+      modules = ALL_MODULES;
+    } else if (user.role === 'admin') {
+      const [permsRows] = await pool.query('SELECT module FROM admin_permissions WHERE user_id = ?', [user.id]);
+      modules = permsRows.map(r => r.module);
+    }
 
     res.json({
       message: 'Login successful',
@@ -216,27 +310,28 @@ router.post('/login', async (req, res) => {
         section: user.section,
         year_level: user.year_level,
         student_type: user.student_type,
-        profile_image: user.profile_image
+        employment_type: user.employment_type || null,
+        profile_image: user.profile_image,
+        modules
       },
       token
     });
   } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Login failed' });
+    return handleAuthError(err, res, 'Login failed');
   }
 });
 
-// Logout
+// ── Logout ───────────────────────────────────────────────────────────────
 router.post('/logout', (req, res) => {
   res.json({ message: 'Logged out successfully' });
 });
 
-// Get current user
+// ── Get current user ─────────────────────────────────────────────────────
 router.get('/me', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(
+    const [rows] = await pool.query(
       `SELECT id, student_number, email, first_name, middle_initial, last_name, role, department, section,
-              year_level, student_type, profile_image, phone, bio, position, schedule_embed_url,
+              year_level, student_type, employment_type, profile_image, phone, bio, position, schedule_embed_url,
               CASE
                 WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN 'unavailable'
                 ELSE TRIM(COALESCE(faculty_status, 'unavailable'))
@@ -253,29 +348,25 @@ router.get('/me', authenticateToken, async (req, res) => {
                 WHEN faculty_status_until IS NOT NULL AND faculty_status_until < NOW() THEN NULL
                 ELSE faculty_status_until
               END AS faculty_status_until,
-              faculty_status_updated_at, created_at
-       FROM users WHERE id = $1`,
+              faculty_status_updated_at, faculty_credentials, created_at
+       FROM users WHERE id = ?`,
       [req.user.id]
     );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    res.json(result.rows[0]);
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ ...rows[0], modules: req.user.modules || [] });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch user' });
+    return handleAuthError(err, res, 'Failed to fetch user');
   }
 });
 
-// Update profile (text fields)
+// ── Update profile ───────────────────────────────────────────────────────
 router.patch('/me', authenticateToken, async (req, res) => {
   try {
-    let { first_name, middle_initial, last_name, department, section, phone, bio, position } = req.body;
+    let { first_name, middle_initial, last_name, department, section, phone, bio, position, faculty_credentials } = req.body;
     
-    const userQuery = await pool.query('SELECT role, first_name, last_name, department, section FROM users WHERE id = $1', [req.user.id]);
-    if (userQuery.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    const user = userQuery.rows[0];
+    const [userRows] = await pool.query('SELECT role, first_name, last_name, department, section FROM users WHERE id = ?', [req.user.id]);
+    if (!userRows.length) return res.status(404).json({ error: 'User not found' });
+    const user = userRows[0];
 
     if (user.role === 'student' || user.role === 'faculty') {
       first_name = user.first_name;
@@ -289,19 +380,20 @@ router.patch('/me', authenticateToken, async (req, res) => {
     if (!first_name || !last_name) {
       return res.status(400).json({ error: 'First name and last name are required' });
     }
-    const result = await pool.query(
+
+    await pool.query(
       `UPDATE users SET
-         first_name = $1,
-         middle_initial = $2,
-         last_name  = $3,
-         department = COALESCE(NULLIF($4,''), department),
-         section    = COALESCE(NULLIF($5,''), section),
-         phone      = $6,
-         bio        = $7,
-         position   = $8,
+         first_name = ?,
+         middle_initial = ?,
+         last_name  = ?,
+         department = COALESCE(NULLIF(?,''), department),
+         section    = COALESCE(NULLIF(?,''), section),
+         phone      = ?,
+         bio        = ?,
+         position   = ?,
+         faculty_credentials = COALESCE(?, faculty_credentials),
          updated_at = NOW()
-       WHERE id = $9
-       RETURNING id, student_number, email, first_name, middle_initial, last_name, role, department, section, profile_image, phone, bio, position`,
+       WHERE id = ?`,
       [
         first_name.trim(),
         middle_initial ? middle_initial.trim().substring(0, 10) : null,
@@ -311,39 +403,22 @@ router.patch('/me', authenticateToken, async (req, res) => {
         phone || null,
         bio || null,
         position || null,
+        faculty_credentials !== undefined ? JSON.stringify(faculty_credentials) : null,
         req.user.id
       ]
     );
-    res.json(result.rows[0]);
+
+    const [fetchedRows] = await pool.query(
+      'SELECT id, student_number, email, first_name, middle_initial, last_name, role, department, section, profile_image, phone, bio, position, faculty_credentials FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    res.json(fetchedRows[0]);
   } catch (err) {
-    console.error('Update profile error:', err);
-    res.status(500).json({ error: 'Failed to update profile' });
+    return handleAuthError(err, res, 'Failed to update profile');
   }
 });
 
-// Schedule embed URL (Google Docs/Sheets/Calendar, Canva, Microsoft only)
-const EMBED_HOST_ALLOWLIST = [
-  /^(docs|sheets|calendar)\.google\.com$/i,
-  /^drive\.google\.com$/i,
-  /^(www\.)?canva\.com$/i,
-  /^onedrive\.live\.com$/i,
-  /^(view|embed|sway)\.office\.com$/i,
-  /^1drv\.ms$/i,
-  /^(www\.)?office\.com$/i,
-  /^(www\.)?sway\.cloud\.microsoft$/i,
-];
-
-function isAllowedEmbedUrl(raw) {
-  if (!raw) return true;
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== 'https:') return false;
-    return EMBED_HOST_ALLOWLIST.some((rx) => rx.test(u.hostname));
-  } catch (_) {
-    return false;
-  }
-}
-
+// ── Update schedule embed link ───────────────────────────────────────────
 router.patch('/me/schedule', authenticateToken, async (req, res) => {
   try {
     const raw = typeof req.body.schedule_embed_url === 'string' ? req.body.schedule_embed_url.trim() : '';
@@ -352,20 +427,15 @@ router.patch('/me/schedule', authenticateToken, async (req, res) => {
         error: 'Only Google (Docs/Sheets/Calendar/Drive), Canva, or Microsoft (OneDrive/Office/Sway) HTTPS links are allowed.'
       });
     }
-    const result = await pool.query(
-      `UPDATE users SET schedule_embed_url = $1, updated_at = NOW() WHERE id = $2 RETURNING schedule_embed_url`,
-      [raw || null, req.user.id]
-    );
-    res.json(result.rows[0]);
+    await pool.query('UPDATE users SET schedule_embed_url = ?, updated_at = NOW() WHERE id = ?', [raw || null, req.user.id]);
+    const [fetchedRows] = await pool.query('SELECT schedule_embed_url FROM users WHERE id = ?', [req.user.id]);
+    res.json(fetchedRows[0]);
   } catch (err) {
-    console.error('Update schedule embed error:', err);
-    res.status(500).json({ error: 'Failed to update schedule link' });
+    return handleAuthError(err, res, 'Failed to update schedule link');
   }
 });
 
-// Faculty manual status (Professor Locator, Option B)
-const VALID_FACULTY_STATUSES = ['in_class', 'in_office', 'available', 'unavailable'];
-
+// ── Update faculty status ────────────────────────────────────────────────
 router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== 'faculty') {
@@ -375,22 +445,23 @@ router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
     if (!VALID_FACULTY_STATUSES.includes(status)) {
       return res.status(400).json({ error: `Status must be one of: ${VALID_FACULTY_STATUSES.join(', ')}` });
     }
+
     let untilParsed = null;
     if (until) {
       const d = new Date(until);
       if (isNaN(d.getTime())) return res.status(400).json({ error: 'Invalid "until" timestamp' });
       untilParsed = d;
     }
-    const result = await pool.query(
+
+    await pool.query(
       `UPDATE users
-         SET faculty_status = $1,
-             faculty_status_room = $2,
-             faculty_status_note = $3,
-             faculty_status_until = $4,
+         SET faculty_status = ?,
+             faculty_status_room = ?,
+             faculty_status_note = ?,
+             faculty_status_until = ?,
              faculty_status_updated_at = NOW(),
              updated_at = NOW()
-       WHERE id = $5
-       RETURNING TRIM(faculty_status) AS faculty_status, faculty_status_room, faculty_status_note, faculty_status_until, faculty_status_updated_at`,
+       WHERE id = ?`,
       [
         status,
         room ? String(room).trim().substring(0, 100) : null,
@@ -399,76 +470,139 @@ router.patch('/me/faculty-status', authenticateToken, async (req, res) => {
         req.user.id
       ]
     );
-    res.json(result.rows[0]);
+
+    const [fetchedRows] = await pool.query(
+      'SELECT TRIM(faculty_status) AS faculty_status, faculty_status_room, faculty_status_note, faculty_status_until, faculty_status_updated_at FROM users WHERE id = ?',
+      [req.user.id]
+    );
+    res.json(fetchedRows[0]);
   } catch (err) {
-    console.error('Update faculty status error:', err);
-    res.status(500).json({ error: 'Failed to update status' });
+    return handleAuthError(err, res, 'Failed to update status');
   }
 });
 
-// Verify Email
-router.get('/verify-email', async (req, res) => {
+// ── Verify Email ─────────────────────────────────────────────────────────
+router.all('/verify-email', async (req, res) => {
   try {
-    const { token } = req.query;
-    if (!token) return res.status(400).json({ error: 'Verification token is required' });
+    const rawToken = (req.query.token || req.body?.token || req.body?.code || req.headers['x-verify-token'] || '').toString().trim().replace(/\s+/g, '');
+    const userEmail = (req.query.email || req.body?.email || '').toString().trim().toLowerCase();
 
-    const result = await pool.query(
-      `SELECT id, email, first_name, is_verified, email_verification_expires
-       FROM users WHERE email_verification_token = $1`,
-      [token]
-    );
+    // Check if this is a direct browser top-level navigation requesting HTML
+    const isBrowserHtmlNav = req.method === 'GET' &&
+      req.headers.accept &&
+      req.headers.accept.includes('text/html') &&
+      !req.xhr &&
+      !req.headers['x-requested-with'];
 
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid or expired verification link.' });
+    if (!rawToken) {
+      if (isBrowserHtmlNav) {
+        return res.redirect('/?verify_error=' + encodeURIComponent('Verification code or token is missing.'));
+      }
+      return res.status(400).json({ error: 'Verification code is required.' });
     }
 
-    const user = result.rows[0];
+    let rows;
+    if (userEmail) {
+      const [r] = await pool.query(
+        'SELECT * FROM users WHERE (email_verification_token = ? OR email_verification_token = ?) AND email = ?',
+        [rawToken, rawToken.toLowerCase(), userEmail]
+      );
+      rows = r;
+    } else {
+      const [r] = await pool.query(
+        'SELECT * FROM users WHERE email_verification_token = ? OR email_verification_token = ?',
+        [rawToken, rawToken.toLowerCase()]
+      );
+      rows = r;
+    }
 
+    if (!rows || !rows.length) {
+      if (isBrowserHtmlNav) {
+        return res.redirect('/?verify_error=' + encodeURIComponent('Invalid or expired verification code.'));
+      }
+      return res.status(400).json({ error: 'Invalid or expired verification code.' });
+    }
+
+    const user = rows[0];
     if (user.is_verified) {
-      return res.json({ message: 'Email already verified. You can log in.', alreadyVerified: true });
+      if (isBrowserHtmlNav) {
+        return res.redirect('/?verify_success=' + encodeURIComponent('Email is already verified. You can log in.'));
+      }
+      const token = signUserToken(user);
+      return res.json({ message: 'Email already verified. You can log in.', alreadyVerified: true, verified: true, user, token });
     }
 
-    if (new Date() > new Date(user.email_verification_expires)) {
-      return res.status(400).json({ error: 'Verification link has expired. Please re-register or contact your admin.' });
+    if (user.email_verification_expires && new Date() > new Date(user.email_verification_expires)) {
+      if (isBrowserHtmlNav) {
+        return res.redirect('/?verify_error=' + encodeURIComponent('Verification code has expired. Please request a new code.'));
+      }
+      return res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
     }
 
     await pool.query(
-      `UPDATE users
-         SET is_verified = true,
-             email_verification_token = NULL,
-             email_verification_expires = NULL,
-             updated_at = NOW()
-       WHERE id = $1`,
+      'UPDATE users SET is_verified = true, email_verification_token = NULL, email_verification_expires = NULL, updated_at = NOW() WHERE id = ?',
       [user.id]
     );
 
-    console.log(`[Auth] Email verified: ${user.email}`);
-    res.json({ message: 'Email verified successfully! You can now log in.', verified: true });
+    console.log(`[Auth] Email verified successfully for: ${user.email}`);
+
+    if (isBrowserHtmlNav) {
+      return res.redirect('/?verify_success=' + encodeURIComponent('Email verified successfully! You can now log in.'));
+    }
+
+    const token = signUserToken(user);
+
+    let modules = [];
+    if (user.role === 'superadmin') {
+      modules = ALL_MODULES;
+    } else if (user.role === 'admin') {
+      const [permsRows] = await pool.query('SELECT module FROM admin_permissions WHERE user_id = ?', [user.id]);
+      modules = permsRows.map(r => r.module);
+    }
+
+    return res.json({
+      message: 'Email verified successfully! Welcome to PUPSJ HUB.',
+      verified: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        first_name: user.first_name,
+        middle_initial: user.middle_initial,
+        last_name: user.last_name,
+        role: user.role,
+        department: user.department,
+        section: user.section,
+        year_level: user.year_level,
+        student_type: user.student_type,
+        employment_type: user.employment_type || null,
+        profile_image: user.profile_image,
+        modules
+      },
+      token
+    });
   } catch (err) {
-    console.error('Verify email error:', err);
-    res.status(500).json({ error: 'Email verification failed' });
+    return handleAuthError(err, res, 'Email verification failed');
   }
 });
 
-// Forgot Password
+// ── Forgot Password ──────────────────────────────────────────────────────
 router.post('/forgot-password', async (req, res) => {
   try {
-    const { email } = req.body;
-    const normalizedEmail = normalizeEmail(email);
-    if (!normalizedEmail) return res.status(400).json({ error: 'Email is required' });
+    const rawIdentifier = (req.body.email || req.body.identifier || '').trim();
+    if (!rawIdentifier) return res.status(400).json({ error: 'Email or ID number is required' });
 
-    const result = await pool.query(
-      'SELECT id, first_name, email FROM users WHERE email = $1 AND is_active = true',
-      [normalizedEmail]
+    const [rows] = await pool.query(
+      'SELECT id, first_name, email FROM users WHERE (LOWER(TRIM(email)) = ? OR UPPER(TRIM(student_number)) = ?) AND is_active = true',
+      [normalizeEmail(rawIdentifier), rawIdentifier.toUpperCase()]
     );
 
-    if (result.rows.length > 0) {
-      const user = result.rows[0];
+    if (rows.length > 0) {
+      const user = rows[0];
       const resetToken = generateToken();
       const resetExpires = new Date(Date.now() + 60 * 60 * 1000);
 
       await pool.query(
-        `UPDATE users SET password_reset_token = $1, password_reset_expires = $2, updated_at = NOW() WHERE id = $3`,
+        'UPDATE users SET password_reset_token = ?, password_reset_expires = ?, updated_at = NOW() WHERE id = ?',
         [resetToken, resetExpires, user.id]
       );
 
@@ -480,144 +614,115 @@ router.post('/forgot-password', async (req, res) => {
       }
     }
 
-    res.json({ message: 'If that email is registered, a password reset link has been sent.' });
+    res.json({ message: 'If that account is registered, a password reset link has been sent to the registered email.' });
   } catch (err) {
-    console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Failed to process request' });
+    return handleAuthError(err, res, 'Failed to process request');
   }
 });
 
-// Reset Password
+// ── Reset Password ───────────────────────────────────────────────────────
 router.post('/reset-password', async (req, res) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) return res.status(400).json({ error: 'Token and new password are required' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
-    const result = await pool.query(
-      `SELECT id, email, first_name, password_reset_expires
-       FROM users WHERE password_reset_token = $1`,
+    const [rows] = await pool.query(
+      'SELECT id, email, first_name, password_reset_expires FROM users WHERE password_reset_token = ?',
       [token]
     );
+    if (!rows.length) return res.status(400).json({ error: 'Invalid or expired reset link.' });
 
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid or expired reset link.' });
-    }
-
-    const user = result.rows[0];
+    const user = rows[0];
     if (new Date() > new Date(user.password_reset_expires)) {
       return res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
     }
 
     const password_hash = await bcrypt.hash(password, 12);
     await pool.query(
-      `UPDATE users
-         SET password_hash = $1,
-             password_reset_token = NULL,
-             password_reset_expires = NULL,
-             updated_at = NOW()
-       WHERE id = $2`,
+      'UPDATE users SET password_hash = ?, password_reset_token = NULL, password_reset_expires = NULL, updated_at = NOW() WHERE id = ?',
       [password_hash, user.id]
     );
 
     console.log(`[Auth] Password reset successful: ${user.email}`);
     res.json({ message: 'Password reset successfully! You can now log in with your new password.' });
   } catch (err) {
-    console.error('Reset password error:', err);
-    res.status(500).json({ error: 'Failed to reset password' });
+    return handleAuthError(err, res, 'Failed to reset password');
   }
 });
 
-// Resend Verification Email
+// ── Resend Verification Email ────────────────────────────────────────────
 router.post('/resend-verification', async (req, res) => {
   try {
-    const { email } = req.body;
-    const normalizedEmail = normalizeEmail(email);
-    if (!normalizedEmail) return res.status(400).json({ error: 'Email is required' });
+    const rawInput = (req.body.email || req.body.identifier || req.body.student_number || '').trim();
+    if (!rawInput) return res.status(400).json({ error: 'Email or ID number is required' });
 
-    const result = await pool.query(
-      'SELECT id, first_name, email, is_verified FROM users WHERE email = $1',
-      [normalizedEmail]
+    const normalizedEmail = normalizeEmail(rawInput);
+    const upperId = rawInput.toUpperCase();
+
+    const [rows] = await pool.query(
+      'SELECT id, first_name, email, student_number, is_verified FROM users WHERE email = ? OR UPPER(TRIM(student_number)) = ?',
+      [normalizedEmail, upperId]
     );
 
-    if (result.rows.length === 0 || result.rows[0].is_verified) {
-      return res.json({ message: 'If that email needs verification, a new link has been sent.' });
+    if (!rows.length || rows[0].is_verified) {
+      return res.json({ message: 'If that account requires verification, a new 6-digit code has been sent to your email.' });
     }
 
-    const user = result.rows[0];
-    const verificationToken = generateToken();
+    const user = rows[0];
+    const verificationToken = generateVerificationCode();
     const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
     await pool.query(
-      `UPDATE users SET email_verification_token = $1, email_verification_expires = $2, updated_at = NOW() WHERE id = $3`,
+      'UPDATE users SET email_verification_token = ?, email_verification_expires = ?, updated_at = NOW() WHERE id = ?',
       [verificationToken, verificationExpires, user.id]
     );
 
     try {
       await sendVerificationEmail(user.email, user.first_name, verificationToken);
+      console.log(`[Auth] Resent verification code ${verificationToken} to ${user.email}`);
     } catch (e) {
       console.error('[Auth] Failed to resend verification email:', e.message);
-      return res.status(500).json({ error: 'We were unable to send the verification email. Please try again or contact support.' });
+      return res.status(500).json({ error: 'We were unable to send the verification email. Please check your internet connection or try again.' });
     }
 
-    res.json({ message: 'Verification email resent successfully. Please check your inbox.' });
+    res.json({ message: 'A new 6-digit verification code has been sent to your email. Please check your inbox.', email: user.email });
   } catch (err) {
-    console.error('Resend verification error:', err);
-    res.status(500).json({ error: 'Failed to resend verification email' });
+    return handleAuthError(err, res, 'Failed to resend verification email');
   }
 });
 
-// Upload profile picture
+// ── Upload Avatar ────────────────────────────────────────────────────────
 router.post('/me/avatar', authenticateToken, uploadProfile.single('avatar'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const url = `/uploads/profiles/${req.file.filename}`;
-    const result = await pool.query(
-      `UPDATE users SET profile_image = $1, updated_at = NOW() WHERE id = $2 RETURNING profile_image`,
-      [url, req.user.id]
-    );
-    res.json({ profile_image: result.rows[0].profile_image });
+    await pool.query('UPDATE users SET profile_image = ?, updated_at = NOW() WHERE id = ?', [url, req.user.id]);
+    const [fetchedRows] = await pool.query('SELECT profile_image FROM users WHERE id = ?', [req.user.id]);
+    res.json({ profile_image: fetchedRows[0].profile_image });
   } catch (err) {
-    console.error('Upload avatar error:', err);
-    res.status(500).json({ error: 'Failed to upload avatar' });
+    return handleAuthError(err, res, 'Failed to upload avatar');
   }
 });
 
-// Guest Login
+// ── Guest Login ──────────────────────────────────────────────────────────
 router.post('/guest-login', async (req, res) => {
   try {
-    // Check if guest user already exists
-    let result = await pool.query("SELECT * FROM users WHERE email = 'guest@pupsj.edu.ph'");
-    let user;
-    if (result.rows.length === 0) {
-      // Create guest user
-      const guestHash = await bcrypt.hash('guestpassword123', 12);
-      const insertResult = await pool.query(
-        `INSERT INTO users (student_number, email, password_hash, first_name, last_name, role, is_verified, is_active)
-         VALUES ('GUEST-001', 'guest@pupsj.edu.ph', $1, 'Guest', 'User', 'guest', true, true)
-         RETURNING *`,
-        [guestHash]
-      );
-      user = insertResult.rows[0];
-    } else {
-      user = result.rows[0];
-    }
+    const uniqueSuffix = Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
+    const guestStudentNumber = ('GST-' + uniqueSuffix).toUpperCase().substring(0, 20);
+    const guestEmail = `guest_${uniqueSuffix}@pupsj.edu.ph`;
+    const guestHash = '$2b$10$epNz8x74.c6sK5rLg3u/veC1hC8sXnOsqj.r9Q3iJ7.7uVvL0e0c2';
+    const newGuestId = uuidv4();
 
-    const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        department: user.department,
-        section: user.section,
-        year_level: user.year_level,
-        student_type: user.student_type
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '4h' }
+    await pool.query(
+      `INSERT INTO users (id, student_number, email, password_hash, first_name, last_name, role, is_verified, is_active)
+       VALUES (?, ?, ?, ?, 'Guest', 'User', 'guest', true, true)`,
+      [newGuestId, guestStudentNumber, guestEmail, guestHash]
     );
+
+    const [fetchedGuestRows] = await pool.query('SELECT * FROM users WHERE id = ?', [newGuestId]);
+    const user = fetchedGuestRows[0];
+    const token = signUserToken(user);
 
     res.json({
       message: 'Guest login successful',
@@ -636,8 +741,7 @@ router.post('/guest-login', async (req, res) => {
       token
     });
   } catch (err) {
-    console.error('Guest login error:', err);
-    res.status(500).json({ error: 'Guest login failed' });
+    return handleAuthError(err, res, 'Guest login failed');
   }
 });
 
